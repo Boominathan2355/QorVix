@@ -12,6 +12,8 @@ if(Catch2_FOUND)
     cuda_test.cpp
     ops_test.cpp
     dequant_test.cpp
+    model_config_test.cpp
+    text_model_test.cpp
   )
   target_link_libraries(qorvix_tests PRIVATE
     qorvix_core qorvix_gguf qorvix_memory qorvix_cuda qorvix_runtime Catch2::Catch2WithMain)

@@ -13,7 +13,9 @@ management, GpuVram memory tier, scale-kernel + cuBLAS GEMM self-tests). The CUD
 CPU stub by default; the nvcc build is being compile-checked in Docker and is not yet run on a
 GPU.
 
-Phase 5 (text runtime) is in progress, built CPU-first: the numerical foundation — transformer
-CPU ops (RMSNorm/RoPE/attention/SwiGLU/…) and GGUF dequantization (Q4_0…Q6_K → F32) — is done and
-tested. Model loading, the forward pass, tokenizer, and generation loop are next. No end-to-end
-inference yet.
+Phase 5 (text runtime) is in progress, built CPU-first: transformer CPU ops
+(RMSNorm/RoPE/attention/SwiGLU/…), GGUF dequantization (Q4_0…Q6_K → F32), model-config extraction
+(`qorvix model-info`), the weight loader, and the Llama-style forward pass (GQA + KV cache + greedy
+decode) are done and verified on synthetic models. Still to come: BPE tokenizer, full sampling, the
+streaming generation loop, and validation against a real GGUF model. No end-to-end text generation
+from real weights yet.

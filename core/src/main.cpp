@@ -10,6 +10,7 @@
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
+#include "qorvix/runtime/model_config.hpp"
 #include "qorvix/version.hpp"
 
 namespace {
@@ -166,6 +167,37 @@ std::string humanBytes(std::size_t bytes) {
   return out.str();
 }
 
+int cmdModelInfo(const std::string& path) {
+  if (path.empty()) {
+    std::cerr << "usage: qorvix model-info <file.gguf>\n";
+    return 1;
+  }
+  try {
+    const auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    const auto cfg = qorvix::runtime::configFromGguf(file, err);
+    if (!cfg.valid()) {
+      std::cerr << "error: " << (err.empty() ? "could not derive model config" : err) << "\n";
+      return 1;
+    }
+    std::cout << "Architecture:      " << cfg.architecture << "\n"
+              << "Vocab size:        " << cfg.vocabSize << "\n"
+              << "Context length:    " << cfg.contextLength << "\n"
+              << "Embedding (d_model): " << cfg.embeddingLength << "\n"
+              << "Layers:            " << cfg.blockCount << "\n"
+              << "FFN hidden:        " << cfg.feedForwardLength << "\n"
+              << "Attention heads:   " << cfg.headCount << " (kv " << cfg.headCountKv << ", head_dim "
+              << cfg.headDim() << ")\n"
+              << "RoPE:              dim=" << cfg.ropeDimensionCount << " freq_base="
+              << cfg.ropeFreqBase << "\n"
+              << "RMSNorm eps:       " << cfg.normEpsilon << "\n";
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int cmdGpu() {
   if (!qorvix::cuda::builtWithCuda()) {
     std::cout << "CUDA support: not built in.\n"
@@ -205,6 +237,7 @@ int printUsage() {
             << "  scan-models [dir]   Scan a directory for model files (default: models)\n"
             << "  list [dir]          List discovered models (default: models)\n"
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
+            << "  model-info <file>   Derive and print the model config from a GGUF file\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
@@ -229,6 +262,7 @@ int main(int argc, char** argv) {
   if (command == "scan-models") return cmdScanModels(arg1.empty() ? "models" : arg1);
   if (command == "list") return cmdList(arg1.empty() ? "models" : arg1);
   if (command == "gguf-info") return cmdGgufInfo(arg1);
+  if (command == "model-info") return cmdModelInfo(arg1);
   if (command == "gpu") return cmdGpu();
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 

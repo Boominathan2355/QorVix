@@ -98,10 +98,21 @@ This mirrors how llama.cpp itself started.
   with known fp16 scales.
 - Verified locally (standalone harness) and in CI (Catch2).
 
-**Part 2 (next):** model config extraction from GGUF metadata, weight loading, the Llama-style
-forward pass (GQA/MQA attention + KV cache), tokenizer (BPE), sampling
-(top-k/top-p/min-p/temperature/penalties), and the streaming generation loop — the "first real
-token" milestone. Full end-to-end validation will want a real GGUF model dropped in `models/`.
+**Part 2a ✅ — model + forward pass:**
+- `ModelConfig` derived from GGUF metadata (llama/qwen2/mistral/gemma/phi3 families); `qorvix
+  model-info <file>` prints it.
+- `Weights` loader: dequantizes every Llama-convention tensor (token_embd, blk.N.attn_*/ffn_*,
+  output_norm, output; tied-embedding fallback) to F32 from an mmap'd GGUF.
+- `TextModel` forward pass: embedding → per-layer [RMSNorm → QKV → RoPE → GQA/MQA attention over
+  a contiguous KV cache → o-proj → residual → RMSNorm → SwiGLU FFN → residual] → final norm → LM
+  head → logits. Plus a greedy `generateGreedy`.
+- Verified analytically on hand-built synthetic models (residual-identity, zero-Q/K attention =
+  value-average, greedy determinism, GQA head grouping) — locally + Catch2/CI.
+
+**Part 2b (next):** BPE tokenizer (encode/decode from GGUF vocab+merges), full sampling
+(top-k/top-p/min-p/temperature + repetition/frequency/presence penalties), and the streaming
+generation loop + `qorvix generate` CLI. Then load a **real GGUF** (drop one in `models/`) and
+validate generated text against llama.cpp — including confirming the RoPE mode per architecture.
 
 ## Phase 6 — Native Quantization Kernels
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.

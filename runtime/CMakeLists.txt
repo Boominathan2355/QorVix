@@ -1,6 +1,9 @@
 add_library(qorvix_runtime STATIC
   src/ops.cpp
   src/dequant.cpp
+  src/model_config.cpp
+  src/weights.cpp
+  src/text_model.cpp
 )
 
 target_include_directories(qorvix_runtime PUBLIC include)
