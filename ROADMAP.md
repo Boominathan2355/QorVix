@@ -44,10 +44,22 @@ Full GGUF v1/v2/v3 parser in the `gguf` module:
 - Catch2 tests + in-memory `GgufBuilder` fixture generator (run in CI); verified locally via a
   standalone harness against the `quick` preset.
 
-## Phase 3 — Unified Memory Manager
-`MemoryManager`, `TensorRegistry`, `MemoryPool`, `TensorPool`, `KVCacheManager`,
-`DiskCacheManager`. Page system (4/8/16/32/64MB pages) — no direct tensor allocations. Tiered
-storage (VRAM → RAM → mmap'd NVMe), refcounting, shared buffers.
+## Phase 3 — Unified Memory Manager ✅
+`memory` module — page-based, tiered allocation with a global tensor registry:
+- Page system (SPEC 4/8/16/32/64MB; KiB-scale in tests): `MemoryPage` first-fit free list with
+  coalescing, 256B sub-allocation alignment (CUDA-pointer compatible); `PagePool` per tier with
+  first-fit page sharing, smallest-fit growth, bespoke huge pages, byte budgets, `trim()`, and
+  fragmentation stats. No direct tensor allocations — everything goes through pages.
+- Tier backends behind `ISlabAllocator`: `HostSlabAllocator` (page-aligned RAM) and
+  `DiskSlabAllocator` (writable-mmap spool files = the NVMe tier / DiskCacheManager storage).
+  The CUDA VRAM backend drops in behind the same interface in Phase 4.
+- `MemoryManager` + `TensorRef` (the TensorRegistry): named refcounted buffers with RAII pinning,
+  shared buffers via `alias()`, explicit `migrate()` across tiers preserving contents,
+  memory-aware placement (preferred-tier fallback down the chain), and smart eviction — under
+  budget pressure the LRU zero-ref buffer offloads down a tier (VRAM→RAM→disk) instead of dying.
+- Deferred deliberately: KV cache managers build on this in Phase 7; defragmentation is
+  *reported* (largestFreeBlock) but not yet compacted; prefetch/predictive loading arrive with
+  real workloads. Thread safety is one coarse mutex until the scheduler exists to profile it.
 
 ## Phase 4 — CUDA Backend Bring-Up
 Device management, cuBLAS integration, pinned memory, async streams/transfers. Goal: a "hello
@@ -99,6 +111,7 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phase 2 complete. Runtime skeleton + full GGUF parser build and run; `gguf-info`
-reads real files. No inference yet — treat any performance claims in SPEC.md as targets, not
-current capabilities. Next: Phase 3 (unified memory manager).
+**Status:** Phase 3 complete. Runtime skeleton, GGUF parser, and the unified memory manager
+(pages, tiers, eviction) build and pass tests — locally and in the Docker Linux image. No
+inference yet — treat any performance claims in SPEC.md as targets, not current capabilities.
+Next: Phase 4 (CUDA backend bring-up; needs an NVIDIA GPU host).

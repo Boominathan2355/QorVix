@@ -7,8 +7,9 @@ if(Catch2_FOUND)
     model_watcher_test.cpp
     plugin_registry_test.cpp
     gguf_file_test.cpp
+    memory_test.cpp
   )
-  target_link_libraries(qorvix_tests PRIVATE qorvix_core qorvix_gguf Catch2::Catch2WithMain)
+  target_link_libraries(qorvix_tests PRIVATE qorvix_core qorvix_gguf qorvix_memory Catch2::Catch2WithMain)
 
   # The plugin test dlopen's the real example plugin; hand it the built library path and make
   # sure that library is built before the tests run.
