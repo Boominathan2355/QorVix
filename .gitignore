@@ -1,0 +1,48 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+_deps/
+
+# Dependency managers
+vcpkg_installed/
+.conan/
+
+# Editors/IDE
+.vs/
+.vscode/
+*.user
+.idea/
+
+# Node / frontend
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
+# Models and large binary artifacts (never commit these)
+models/*.gguf
+*.safetensors
+*.bin
+
+# Logs, local config, secrets
+*.log
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db

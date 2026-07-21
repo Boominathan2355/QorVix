@@ -1,0 +1,15 @@
+{
+  "name": "qorvix",
+  "version": "0.1.0",
+  "description": "Qorvix AI Core - local multimodal inference runtime",
+  "builtin-baseline": "3ddaad9be959816602453ecb05533f8732464ef4",
+  "dependencies": [
+    "boost-beast",
+    "boost-asio",
+    "nlohmann-json",
+    "spdlog",
+    "cli11",
+    "sqlite3",
+    "catch2"
+  ]
+}
