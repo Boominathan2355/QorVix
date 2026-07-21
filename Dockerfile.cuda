@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1
+#
+# Qorvix AI Core — CUDA-enabled Linux build (OPTIONAL, for Phase 4+).
+#
+# Identical to the CPU Dockerfile except it starts from an NVIDIA CUDA image and
+# configures with -DQORVIX_ENABLE_CUDA=ON.
+#
+# IMPORTANT — current status (as of Phase 1):
+#   * There is NO CUDA source in the tree yet (cuda/ is not added in CMakeLists.txt).
+#     QORVIX_ENABLE_CUDA only makes CMake detect nvcc and enable the CUDA language; with
+#     no .cu files to compile, nothing CUDA is actually built. If the toolkit's host-
+#     compiler check rejects the compiler, top-level CMakeLists.txt degrades to CPU-only
+#     with a warning instead of failing — so this image builds fine today either way.
+#   * BUILD-time needs no GPU. RUN-time needs the NVIDIA Container Toolkit on the host and
+#     `--gpus all` (harmless today, required once real kernels land). See docs/DOCKER.md.
+#
+# Base image: nvidia/cuda:12.6.0-devel-ubuntu24.04  (a current CUDA 12.x devel tag on
+# Ubuntu 24.04; the -devel variant provides nvcc + headers needed to compile CUDA).
+#
+# Build: docker build -f Dockerfile.cuda -t qorvix:cuda .
+# Run:   docker run --rm --gpus all qorvix:cuda version
+
+# ---------------------------------------------------------------------------
+# Stage 1: toolchain — CUDA devel base + GCC 14 + CMake/Ninja + vcpkg
+# ---------------------------------------------------------------------------
+FROM nvidia/cuda:12.6.0-devel-ubuntu24.04 AS toolchain
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Same host toolchain as the CPU image. gcc-13/g++-13 are installed too so nvcc has an
+# officially supported host compiler available (CUDA 12.6 tops out at GCC 13), while the
+# C++23 code itself compiles with gcc-14 — see CUDAHOSTCXX below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc-14 g++-14 \
+      gcc-13 g++-13 \
+      cmake \
+      ninja-build \
+      git \
+      curl \
+      zip \
+      unzip \
+      tar \
+      pkg-config \
+      ca-certificates \
+      linux-libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-14 100
+ENV CC=gcc-14 \
+    CXX=g++-14 \
+    CUDAHOSTCXX=/usr/bin/g++-13
+
+# Bootstrap vcpkg (see Dockerfile for the reproducibility note on builtin-baseline).
+ENV VCPKG_ROOT=/opt/vcpkg
+RUN git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT}" \
+    && "${VCPKG_ROOT}/bootstrap-vcpkg.sh" -disableMetrics
+ENV PATH="${VCPKG_ROOT}:${PATH}"
+
+# ---------------------------------------------------------------------------
+# Stage 2: deps — warm the vcpkg binary cache from the manifest only
+# ---------------------------------------------------------------------------
+FROM toolchain AS deps
+
+WORKDIR /src
+COPY vcpkg.json ./
+RUN vcpkg install --triplet x64-linux \
+      --x-install-root=/tmp/vcpkg_installed \
+      --clean-after-build
+
+# ---------------------------------------------------------------------------
+# Stage 3: builder — configure (CUDA ON), build, and test
+# ---------------------------------------------------------------------------
+FROM deps AS builder
+
+WORKDIR /src
+COPY . .
+
+# Same linux-release preset, but with the CUDA backend requested. If nvcc/host-compiler
+# detection fails, CMakeLists.txt falls back to CPU-only (build still succeeds).
+RUN cmake --preset linux-release -DQORVIX_ENABLE_CUDA=ON \
+    && cmake --build --preset linux-release \
+    && ctest --preset linux-release
+
+# ---------------------------------------------------------------------------
+# Stage 4: runtime — slim CUDA runtime image with the built artifacts
+# ---------------------------------------------------------------------------
+# The CUDA *runtime* base carries the CUDA runtime libraries that Phase 4+ kernels will
+# need. Requires `--gpus all` (NVIDIA Container Toolkit) at run time.
+FROM nvidia/cuda:12.6.0-runtime-ubuntu24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libstdc++6 \
+      ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 qorvix
+
+WORKDIR /opt/qorvix
+
+COPY --from=builder /src/build/linux-release/core/qorvix /usr/local/bin/qorvix
+COPY --from=builder /src/build/linux-release/plugins/example/qorvix_plugin_example.so \
+     /opt/qorvix/plugins/qorvix_plugin_example.so
+
+USER qorvix
+
+ENTRYPOINT ["qorvix"]
+CMD ["help"]

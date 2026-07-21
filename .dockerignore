@@ -1,0 +1,62 @@
+# Docker build-context excludes. Mirrors the spirit of .gitignore: keep the context
+# small so `COPY . .` only ships source the build actually needs. vcpkg.json,
+# CMakeLists.txt, CMakePresets.json and the source trees are intentionally NOT excluded.
+
+# Build outputs
+build/
+out/
+cmake-build-*/
+**/*.o
+**/*.obj
+**/*.exe
+**/*.dll
+**/*.lib
+**/*.pdb
+
+# CMake scratch
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/_deps/
+
+# Dependency managers (vcpkg installs fresh inside the image)
+**/vcpkg_installed/
+.conan/
+
+# VCS / CI metadata — not needed inside the image (vcpkg uses its own clone's git)
+.git/
+.gitignore
+.github/
+
+# Editors / IDE
+.vs/
+.vscode/
+*.user
+.idea/
+
+# Node / frontend (the C++ build never touches these)
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
+# Models and large binary artifacts — never bake these into an image
+models/*.gguf
+*.safetensors
+*.bin
+
+# Logs, local config, secrets
+*.log
+.env
+.env.local
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Docker's own files (no reason to copy them into the build context)
+Dockerfile
+Dockerfile.cuda
+.dockerignore
+docker-compose.yml
+.devcontainer/

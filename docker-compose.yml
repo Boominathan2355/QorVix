@@ -1,0 +1,51 @@
+# Qorvix AI Core — Docker Compose helpers for the Linux CPU build.
+#
+#   docker compose build build      # build the slim runtime image (runs tests during build)
+#   docker compose run --rm build version
+#   docker compose run --rm test    # (re)run the Catch2 suite via ctest
+#   docker compose run --rm dev      # open a shell in the full toolchain, source mounted
+#
+# The CUDA variant (Dockerfile.cuda) is intentionally not wired up here — it needs a GPU
+# host with the NVIDIA Container Toolkit. Build it directly: see docs/DOCKER.md.
+
+services:
+  # Final slim image. `build` runs the whole configure/build/ctest pipeline as part of the
+  # image build, so a green `docker compose build build` also means the tests passed.
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: qorvix:cpu
+    # Default runs `qorvix help`; override on the CLI, e.g. `... run --rm build version`.
+
+  # Re-run the test suite on demand. Targets the builder stage (which already contains the
+  # configured + built tree), so this just re-executes ctest against it.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    image: qorvix:builder
+    working_dir: /src
+    command: ["ctest", "--preset", "linux-release"]
+
+  # Iterative dev container: the full Linux toolchain + a bootstrapped vcpkg, with the host
+  # source mounted at /src. Configure/build/test inside it with the linux-release preset.
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: deps          # toolchain + warmed vcpkg binary cache, no baked build
+    image: qorvix:dev
+    working_dir: /src
+    environment:
+      VCPKG_ROOT: /opt/vcpkg
+    volumes:
+      - ./:/src             # live source from the host
+      - /src/build          # anonymous volume: keep in-container builds off the host tree
+      - vcpkg-cache:/root/.cache/vcpkg   # persist the vcpkg binary cache across runs
+    command: ["sleep", "infinity"]
+
+volumes:
+  vcpkg-cache:

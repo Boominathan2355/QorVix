@@ -60,3 +60,17 @@ cmake --preset linux-release -DQORVIX_ENABLE_CUDA=ON
 
 If no CUDA compiler is found, configuration falls back to CPU-only with a warning rather than
 failing outright.
+
+## Docker
+
+If you don't want to install the Linux toolchain and vcpkg locally (e.g. on Windows), a
+reproducible Docker build environment is provided. It ships GCC 14 + CMake/Ninja + a
+bootstrapped vcpkg and builds/tests with the `linux-release` preset:
+
+```sh
+docker build -f Dockerfile -t qorvix:cpu .   # CPU build (runs the tests during the build)
+docker run --rm qorvix:cpu version
+```
+
+There's also a CUDA variant (`Dockerfile.cuda`, Phase 4+), a `docker-compose.yml`, and a
+VS Code Dev Container. See [DOCKER.md](DOCKER.md) for the full workflow.

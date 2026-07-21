@@ -1,0 +1,32 @@
+// Qorvix AI Core — VS Code Dev Container (Linux CPU toolchain).
+// Gives the full Linux GCC 14 + CMake/Ninja + vcpkg environment described in docs/DOCKER.md.
+// The `deps` target already carries a warmed vcpkg binary cache, so the first configure
+// restores Boost/etc. from cache instead of rebuilding them.
+{
+  "name": "Qorvix (Linux CPU build)",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "target": "deps"
+  },
+  // vcpkg lives at /opt/vcpkg inside the image; the linux-release preset reads VCPKG_ROOT.
+  "containerEnv": {
+    "VCPKG_ROOT": "/opt/vcpkg"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false
+      }
+    }
+  },
+  // Configure the project once the container is up (installs deps from the warmed cache).
+  "postCreateCommand": "cmake --preset linux-release",
+  // The warmed vcpkg binary cache lives under /root; run as root so it's reused.
+  "remoteUser": "root"
+}
