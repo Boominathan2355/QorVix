@@ -84,11 +84,24 @@ Deferred to the CUDA performance pass (Phase 8): pinned host memory, async strea
 transfers, CUDA graphs, FlashAttention, CUTLASS. Bring-up establishes the device + memory tier
 first; the fast paths come once there's a pipeline to profile.
 
-## Phase 5 — Text Runtime, End-to-End (FP16 first)
-RMSNorm, LayerNorm, RoPE, GQA/MQA attention, SwiGLU FFN, residual connections, sampling
-(greedy/top-k/top-p/min-p/temperature/penalties), streaming generation. Target: one reference
-architecture (Llama-style) producing correct tokens end-to-end, unoptimized. This is the
-critical milestone — first real inference.
+## Phase 5 — Text Runtime, End-to-End 🚧 (in progress)
+**Decision:** built as a **CPU reference runtime** first (no GPU on this dev box or CI, so
+GPU-only numerical code couldn't be *run* — only compile-checked, which is worthless for math).
+Compute lives behind a small op layer so the CUDA kernels (Phase 6/8) reproduce the same results.
+This mirrors how llama.cpp itself started.
+
+**Part 1 ✅ — numerical foundation (`runtime` module):**
+- CPU ops (F32, row-major): RMSNorm, LayerNorm, matmul, stable softmax, SiLU/SwiGLU, RoPE
+  (interleaved + NeoX modes), residual add, argmax — each unit-tested against hand-computed values.
+- GGUF dequantization to F32, block layouts mirroring ggml exactly: F16, BF16, Q8_0, Q8_1, Q4_0,
+  Q4_1, Q5_0, Q5_1, and the K-quants Q4_K, Q5_K, Q6_K — tested against hand-constructed blocks
+  with known fp16 scales.
+- Verified locally (standalone harness) and in CI (Catch2).
+
+**Part 2 (next):** model config extraction from GGUF metadata, weight loading, the Llama-style
+forward pass (GQA/MQA attention + KV cache), tokenizer (BPE), sampling
+(top-k/top-p/min-p/temperature/penalties), and the streaming generation loop — the "first real
+token" milestone. Full end-to-end validation will want a real GGUF model dropped in `models/`.
 
 ## Phase 6 — Native Quantization Kernels
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.

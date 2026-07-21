@@ -10,9 +10,11 @@ if(Catch2_FOUND)
     memory_test.cpp
     transfer_test.cpp
     cuda_test.cpp
+    ops_test.cpp
+    dequant_test.cpp
   )
   target_link_libraries(qorvix_tests PRIVATE
-    qorvix_core qorvix_gguf qorvix_memory qorvix_cuda Catch2::Catch2WithMain)
+    qorvix_core qorvix_gguf qorvix_memory qorvix_cuda qorvix_runtime Catch2::Catch2WithMain)
 
   # The plugin test dlopen's the real example plugin; hand it the built library path and make
   # sure that library is built before the tests run.
