@@ -16,11 +16,16 @@ Repo scaffolding, build system, dependency strategy, coding standards, CI skelet
 - Logging, config loading, error handling conventions — established as each module needs them,
   not speculatively up front.
 
-## Phase 1 — Core Runtime Skeleton
-- Process entrypoint (single unified executable)
-- `IPlugin` interface + plugin discovery/hot-load/hot-unload
-- Model directory watcher (auto-detect, no restart)
-- Minimal CLI (`qorvix scan-models`, `qorvix list`)
+## Phase 1 — Core Runtime Skeleton ✅
+- Process entrypoint (single unified executable) — `qorvix` CLI
+- `IPlugin` interface + plugin discovery/hot-load/hot-unload — `PluginRegistry` over a
+  cross-platform `DynamicLibrary` (dlopen/LoadLibrary), C-ABI factory via `QORVIX_REGISTER_PLUGIN`;
+  reference plugin in `plugins/example`
+- Model directory watcher (auto-detect, no restart) — polling-based `ModelWatcher` with
+  add/removed callbacks; `ModelRegistry` for one-shot discovery
+- CLI: `qorvix scan-models [dir]`, `qorvix list [dir]`, `qorvix plugins [dir]`, `version`, `help`
+- Verified locally via the `quick` preset (build + run); Catch2 unit tests cover registry,
+  watcher, and plugin load/unload (run in CI where vcpkg provides Catch2)
 
 ## Phase 2 — GGUF Parser
 Header, metadata, tensor table, tokenizer metadata, RoPE metadata, quant metadata, tensor
@@ -82,5 +87,6 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phase 0 in progress. Nothing beyond directory scaffolding and this roadmap exists
-yet — treat any performance claims in SPEC.md as targets, not current capabilities.
+**Status:** Phase 1 complete. Runtime skeleton (plugin framework, model discovery/watcher, CLI)
+builds and runs. No inference yet — treat any performance claims in SPEC.md as targets, not
+current capabilities. Next: Phase 2 (GGUF parser).

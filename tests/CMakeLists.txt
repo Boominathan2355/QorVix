@@ -1,8 +1,19 @@
 find_package(Catch2 3 CONFIG QUIET)
 
 if(Catch2_FOUND)
-  add_executable(qorvix_tests core_smoke_test.cpp)
+  add_executable(qorvix_tests
+    core_smoke_test.cpp
+    model_registry_test.cpp
+    model_watcher_test.cpp
+    plugin_registry_test.cpp
+  )
   target_link_libraries(qorvix_tests PRIVATE qorvix_core Catch2::Catch2WithMain)
+
+  # The plugin test dlopen's the real example plugin; hand it the built library path and make
+  # sure that library is built before the tests run.
+  add_dependencies(qorvix_tests qorvix_plugin_example)
+  target_compile_definitions(qorvix_tests PRIVATE
+    QORVIX_EXAMPLE_PLUGIN_PATH="$<TARGET_FILE:qorvix_plugin_example>")
 
   include(CTest)
   include(Catch)

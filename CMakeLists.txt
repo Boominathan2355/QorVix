@@ -26,6 +26,7 @@ if(QORVIX_ENABLE_CUDA)
 endif()
 
 add_subdirectory(core)
+add_subdirectory(plugins)
 
 if(QORVIX_BUILD_TESTS)
   enable_testing()
@@ -40,4 +41,3 @@ endif()
 # add_subdirectory(runtime)   # Phase 5
 # add_subdirectory(scheduler) # Phase 7
 # add_subdirectory(api)       # Phase 9
-# add_subdirectory(plugins)   # alongside runtime/vision/audio/image as each lands
