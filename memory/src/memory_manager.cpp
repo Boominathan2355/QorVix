@@ -46,7 +46,9 @@ const std::string& TensorRef::name() const noexcept {
 
 // ---- MemoryManager -------------------------------------------------------------------------
 
-MemoryManager::MemoryManager(std::map<Tier, TierSpec> tiers) {
+MemoryManager::MemoryManager(std::map<Tier, TierSpec> tiers,
+                             std::unique_ptr<ITransferEngine> transfer)
+    : transfer_(transfer ? std::move(transfer) : std::make_unique<HostTransferEngine>()) {
   for (auto& [tier, spec] : tiers) {
     pools_.emplace(tier,
                    std::make_unique<PagePool>(std::move(spec.allocator), std::move(spec.config)));
@@ -221,12 +223,13 @@ Allocation MemoryManager::allocateWithEvictionLocked(Tier tier, std::size_t byte
 }
 
 bool MemoryManager::migrateEntryLocked(const EntryPtr& entry, Tier target) {
+  const Tier source = entry->tier;
   Allocation dst = allocateWithEvictionLocked(target, entry->bytes);
   if (!dst) return false;
 
-  // Both current tiers are host-addressable (see class comment); the GPU tier will route this
-  // through its allocator's transfer ops in Phase 4.
-  std::memcpy(dst.ptr, entry->alloc.ptr, entry->bytes);
+  // The transfer engine picks the right primitive for the (source, target) tier pair — memcpy
+  // for host-addressable tiers, cudaMemcpy H2D/D2H/D2D once a GpuVram tier is present.
+  transfer_->copy(dst.ptr, target, entry->alloc.ptr, source, entry->bytes);
 
   PagePool& src = *pools_.at(entry->tier);
   src.free(entry->alloc);

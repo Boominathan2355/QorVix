@@ -27,6 +27,7 @@ endif()
 
 add_subdirectory(gguf)
 add_subdirectory(memory)
+add_subdirectory(cuda)
 add_subdirectory(core)
 add_subdirectory(plugins)
 

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "qorvix/cuda/backend.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
@@ -151,6 +152,52 @@ int cmdGgufInfo(const std::string& path) {
   }
 }
 
+std::string humanBytes(std::size_t bytes) {
+  constexpr const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+  double value = static_cast<double>(bytes);
+  int unit = 0;
+  while (value >= 1024.0 && unit < 4) {
+    value /= 1024.0;
+    ++unit;
+  }
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(value < 10 && unit > 0 ? 1 : 0) << value << ' '
+      << units[unit];
+  return out.str();
+}
+
+int cmdGpu() {
+  if (!qorvix::cuda::builtWithCuda()) {
+    std::cout << "CUDA support: not built in.\n"
+              << "Rebuild with -DQORVIX_ENABLE_CUDA=ON (needs a CUDA 12+ toolkit) to enable the "
+                 "GPU backend.\n";
+    return 0;
+  }
+
+  const int count = qorvix::cuda::deviceCount();
+  std::cout << "CUDA support: built in.\n" << "Devices: " << count << "\n";
+  if (count == 0) {
+    std::cout << "No CUDA devices detected on this host.\n";
+    return 0;
+  }
+
+  for (const auto& d : qorvix::cuda::enumerateDevices()) {
+    std::cout << "\n  [" << d.index << "] " << d.name << "\n"
+              << "      compute capability : " << d.computeMajor << "." << d.computeMinor << "\n"
+              << "      SMs                : " << d.multiProcessorCount << "\n"
+              << "      memory (free/total): " << humanBytes(d.freeMem) << " / "
+              << humanBytes(d.totalGlobalMem) << "\n";
+  }
+
+  const auto self = qorvix::cuda::selfTest();
+  std::cout << "\nSelf-test (scale kernel): " << (self.passed ? "PASS" : (self.ran ? "FAIL" : "skip"))
+            << " — " << self.message << "\n";
+  const auto gemm = qorvix::cuda::gemmSelfTest();
+  std::cout << "Self-test (cuBLAS GEMM):  " << (gemm.passed ? "PASS" : (gemm.ran ? "FAIL" : "skip"))
+            << " — " << gemm.message << "\n";
+  return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) ? 1 : 0;
+}
+
 int printUsage() {
   std::cout << qorvix::startupBanner() << "\n\n"
             << "Usage: qorvix <command> [args]\n\n"
@@ -158,6 +205,7 @@ int printUsage() {
             << "  scan-models [dir]   Scan a directory for model files (default: models)\n"
             << "  list [dir]          List discovered models (default: models)\n"
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
+            << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
             << "  help                Show this help\n";
@@ -181,6 +229,7 @@ int main(int argc, char** argv) {
   if (command == "scan-models") return cmdScanModels(arg1.empty() ? "models" : arg1);
   if (command == "list") return cmdList(arg1.empty() ? "models" : arg1);
   if (command == "gguf-info") return cmdGgufInfo(arg1);
+  if (command == "gpu") return cmdGpu();
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 
   std::cerr << "Unknown command: " << command << "\n\n";

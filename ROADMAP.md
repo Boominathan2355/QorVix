@@ -61,9 +61,28 @@ Full GGUF v1/v2/v3 parser in the `gguf` module:
   *reported* (largestFreeBlock) but not yet compacted; prefetch/predictive loading arrive with
   real workloads. Thread safety is one coarse mutex until the scheduler exists to profile it.
 
-## Phase 4 — CUDA Backend Bring-Up
-Device management, cuBLAS integration, pinned memory, async streams/transfers. Goal: a "hello
-tensor" test that moves data host↔device and runs one GEMM correctly.
+## Phase 4 — CUDA Backend Bring-Up ✅ (code complete; GPU-run pending hardware)
+New `cuda` module — a backend facade callable from any build, plus the GpuVram memory tier:
+- Device management (enumerate/select, compute capability, SM count, free/total VRAM)
+- "Hello tensor" self-test: host→device→host round-trip through a scale kernel; cuBLAS SGEMM
+  self-test (C = A·B with A = I), both verified on the host
+- `CudaSlabAllocator` (cudaMalloc/cudaFree) behind Phase 3's `ISlabAllocator`, and
+  `CudaTransferEngine` behind the new `ITransferEngine` seam — so the unified MemoryManager gains
+  a real GpuVram tier with H2D/D2H/D2D migration and offload, no changes to pool/manager logic
+- `MemoryManager` now routes migration/eviction copies through an `ITransferEngine`
+  (HostTransferEngine memcpy default; CudaTransferEngine when built with CUDA)
+- Compile-time gating: a CPU **stub** (builds with no toolkit; `builtWithCuda()==false`) vs the
+  real `.cu` (nvcc, links cudart+cublas). `qorvix gpu` CLI reports devices + runs the self-tests.
+- Tests skip device assertions cleanly when `deviceCount()==0`, so CI/GPU-less hosts stay green.
+
+**Verified:** stub path + transfer routing locally (quick preset). The real `.cu`/cuBLAS path is
+being compile-checked under nvcc via `Dockerfile.cuda` (build in progress at commit time; result
+folded in once it lands). **Not yet run on a GPU** — this dev box and CI have no NVIDIA device, so
+even once it compiles, the kernels/GEMM stay execution-unverified until GPU hardware is available.
+
+Deferred to the CUDA performance pass (Phase 8): pinned host memory, async streams/overlapped
+transfers, CUDA graphs, FlashAttention, CUTLASS. Bring-up establishes the device + memory tier
+first; the fast paths come once there's a pipeline to profile.
 
 ## Phase 5 — Text Runtime, End-to-End (FP16 first)
 RMSNorm, LayerNorm, RoPE, GQA/MQA attention, SwiGLU FFN, residual connections, sampling
@@ -111,7 +130,8 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phase 3 complete. Runtime skeleton, GGUF parser, and the unified memory manager
-(pages, tiers, eviction) build and pass tests — locally and in the Docker Linux image. No
-inference yet — treat any performance claims in SPEC.md as targets, not current capabilities.
-Next: Phase 4 (CUDA backend bring-up; needs an NVIDIA GPU host).
+**Status:** Phase 4 code-complete. Runtime skeleton, GGUF parser, unified memory manager, and the
+CUDA backend (device mgmt, GpuVram tier, self-tests) build and pass tests — CPU path locally and
+in Docker, CUDA path compiles under nvcc. GPU *execution* is unverified (no NVIDIA device on this
+box or CI). No inference yet — treat performance claims in SPEC.md as targets, not current
+capabilities. Next: Phase 5 (text runtime, end-to-end — the first real inference).

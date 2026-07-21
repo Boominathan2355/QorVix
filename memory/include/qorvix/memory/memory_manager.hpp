@@ -13,6 +13,7 @@
 
 #include "qorvix/memory/page_pool.hpp"
 #include "qorvix/memory/tier.hpp"
+#include "qorvix/memory/transfer.hpp"
 
 namespace qorvix::memory {
 
@@ -98,7 +99,10 @@ class MemoryManager {
     PoolConfig config;
   };
 
-  explicit MemoryManager(std::map<Tier, TierSpec> tiers);
+  // `transfer` moves bytes during migration/eviction; defaults to HostTransferEngine. A CUDA
+  // build passes a CudaTransferEngine so a GpuVram tier can migrate to/from host tiers.
+  explicit MemoryManager(std::map<Tier, TierSpec> tiers,
+                         std::unique_ptr<ITransferEngine> transfer = nullptr);
   ~MemoryManager() = default;
 
   MemoryManager(const MemoryManager&) = delete;
@@ -145,6 +149,7 @@ class MemoryManager {
 
   mutable std::mutex mutex_;
   std::map<Tier, std::unique_ptr<PagePool>> pools_;
+  std::unique_ptr<ITransferEngine> transfer_;
   std::unordered_map<std::string, EntryPtr> entries_;
   std::uint64_t clock_ = 0;
   std::string lastError_;
