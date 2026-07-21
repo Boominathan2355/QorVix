@@ -27,10 +27,22 @@ Repo scaffolding, build system, dependency strategy, coding standards, CI skelet
 - Verified locally via the `quick` preset (build + run); Catch2 unit tests cover registry,
   watcher, and plugin load/unload (run in CI where vcpkg provides Catch2)
 
-## Phase 2 — GGUF Parser
-Header, metadata, tensor table, tokenizer metadata, RoPE metadata, quant metadata, tensor
-offsets, architecture detection. Unit tests against real GGUF files (F32/F16/BF16/Q4_0/Q4_K/
-Q5_0/Q5_K/Q6_K/Q8_0).
+## Phase 2 — GGUF Parser ✅
+Full GGUF v1/v2/v3 parser in the `gguf` module:
+- Header (magic/version/counts) with version-aware widths
+- Metadata KV parser — all 13 value types incl. arrays, order-preserving, typed widening
+  accessors (`getString/getU64/getF64/getBool`, arch-prefixed `archU64`)
+- Tensor table — name/dims/type/offset, computed element & byte counts from per-type block
+  traits, 32-byte-aligned data-section offset
+- `ggml_type` traits table (F32/F16/BF16, Q4_0…Q8_0, K-quants, IQ-quants) with SPEC-supported flags
+- Architecture detection (`general.architecture`) + `RopeParams` view
+- Bounds-checked, endianness-independent reader; defensive against truncation, bad magic/version,
+  misaligned offsets, block-size mismatches, and OOM-via-huge-array-length
+- `MappedFile` (mmap/CreateFileMapping) so `open()` parses a multi-GB file's header without
+  reading tensor data
+- `qorvix gguf-info <file>` CLI command
+- Catch2 tests + in-memory `GgufBuilder` fixture generator (run in CI); verified locally via a
+  standalone harness against the `quick` preset.
 
 ## Phase 3 — Unified Memory Manager
 `MemoryManager`, `TensorRegistry`, `MemoryPool`, `TensorPool`, `KVCacheManager`,
@@ -87,6 +99,6 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phase 1 complete. Runtime skeleton (plugin framework, model discovery/watcher, CLI)
-builds and runs. No inference yet — treat any performance claims in SPEC.md as targets, not
-current capabilities. Next: Phase 2 (GGUF parser).
+**Status:** Phase 2 complete. Runtime skeleton + full GGUF parser build and run; `gguf-info`
+reads real files. No inference yet — treat any performance claims in SPEC.md as targets, not
+current capabilities. Next: Phase 3 (unified memory manager).

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
 #include "qorvix/version.hpp"
@@ -74,12 +75,89 @@ int cmdPlugins(const std::string& dir) {
   return 0;
 }
 
+std::string metaValuePreview(const qorvix::gguf::GgufValue& v) {
+  using qorvix::gguf::MetaType;
+  if (v.isArray()) {
+    std::ostringstream out;
+    out << "[" << qorvix::gguf::metaTypeName(v.arrayElementType()) << " x " << v.array().size()
+        << "]";
+    return out.str();
+  }
+  if (const std::string* s = v.asString()) {
+    std::string preview = *s;
+    if (preview.size() > 48) preview = preview.substr(0, 45) + "...";
+    return preview;
+  }
+  if (auto b = v.asBool()) return *b ? "true" : "false";
+  if (auto i = v.asI64()) return std::to_string(*i);
+  if (auto f = v.asF64()) {
+    std::ostringstream out;
+    out << *f;
+    return out.str();
+  }
+  return "?";
+}
+
+int cmdGgufInfo(const std::string& path) {
+  if (path.empty()) {
+    std::cerr << "usage: qorvix gguf-info <file.gguf>\n";
+    return 1;
+  }
+  try {
+    const auto file = qorvix::gguf::GgufFile::open(path);
+    const auto& h = file.header();
+    std::cout << "File:         " << path << "\n"
+              << "GGUF version: " << h.version << "\n"
+              << "Architecture: " << (file.architecture().empty() ? "(unknown)" : file.architecture())
+              << "\n";
+    if (auto name = file.name()) std::cout << "Name:         " << *name << "\n";
+    if (auto ft = file.fileType()) std::cout << "File type:    " << *ft << "\n";
+    std::cout << "Alignment:    " << file.alignment() << "\n"
+              << "Data offset:  " << file.dataOffset() << "\n"
+              << "Metadata KVs: " << h.metadataCount << "\n"
+              << "Tensors:      " << h.tensorCount << "\n";
+
+    const auto rope = file.rope();
+    if (rope.dimensionCount || rope.freqBase || rope.scalingType) {
+      std::cout << "RoPE:         ";
+      if (rope.dimensionCount) std::cout << "dim=" << *rope.dimensionCount << " ";
+      if (rope.freqBase) std::cout << "freq_base=" << *rope.freqBase << " ";
+      if (rope.scalingType) std::cout << "scaling=" << *rope.scalingType << " ";
+      std::cout << "\n";
+    }
+
+    std::cout << "\nMetadata:\n";
+    for (const auto& [key, value] : file.metadata()) {
+      std::cout << "  " << std::left << std::setw(40) << key << "  " << metaValuePreview(value)
+                << "\n";
+    }
+
+    std::cout << "\nTensors:\n";
+    for (const auto& t : file.tensors()) {
+      std::ostringstream dims;
+      dims << "[";
+      for (std::size_t i = 0; i < t.dimensions.size(); ++i) {
+        dims << (i ? "," : "") << t.dimensions[i];
+      }
+      dims << "]";
+      std::cout << "  " << std::left << std::setw(40) << t.name << "  " << std::setw(8)
+                << t.typeName() << "  " << std::setw(18) << dims.str() << "  " << t.nBytes
+                << " bytes\n";
+    }
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int printUsage() {
   std::cout << qorvix::startupBanner() << "\n\n"
             << "Usage: qorvix <command> [args]\n\n"
             << "Commands:\n"
             << "  scan-models [dir]   Scan a directory for model files (default: models)\n"
             << "  list [dir]          List discovered models (default: models)\n"
+            << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
             << "  help                Show this help\n";
@@ -102,6 +180,7 @@ int main(int argc, char** argv) {
   }
   if (command == "scan-models") return cmdScanModels(arg1.empty() ? "models" : arg1);
   if (command == "list") return cmdList(arg1.empty() ? "models" : arg1);
+  if (command == "gguf-info") return cmdGgufInfo(arg1);
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 
   std::cerr << "Unknown command: " << command << "\n\n";

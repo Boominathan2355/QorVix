@@ -25,6 +25,7 @@ if(QORVIX_ENABLE_CUDA)
   endif()
 endif()
 
+add_subdirectory(gguf)
 add_subdirectory(core)
 add_subdirectory(plugins)
 
@@ -35,7 +36,6 @@ endif()
 
 # Modules are added here as their roadmap phase begins (see ROADMAP.md) — not before,
 # so the build never carries libraries with no real content behind them.
-# add_subdirectory(gguf)      # Phase 2
 # add_subdirectory(memory)    # Phase 3
 # add_subdirectory(cuda)      # Phase 4 (only meaningful once QORVIX_ENABLE_CUDA works end to end)
 # add_subdirectory(runtime)   # Phase 5
