@@ -30,41 +30,48 @@ __global__ void scaleKernel(float* data, float factor, int n) {
   if (i < n) data[i] = data[i] * factor;
 }
 
-// Native quantized GEMV: out[r] = dot(dequant(Q8_0 row r), x). One block per output row; threads
-// cooperatively dequantize the row's 32-element blocks (fp16 scale * int8 quants) straight into
-// the dot product — the weight stays Q8_0 in VRAM, never expanded to F32. This is the GPU form of
-// the CPU qmatmul; a first correct-and-decent kernel (block-reduce), not yet the tuned form.
+// Native quantized GEMV: out[r] = dot(dequant(Q8_0 row r), x). One WARP per output row; the 32
+// lanes cooperatively process each 32-element block — lane `l` reads quant `l` (so the warp's
+// reads of a block's 32 int8 quants and of x are coalesced, one transaction each) and the fp16
+// scale is broadcast from lane 0. A warp-shuffle reduction sums each block; results accumulate
+// across blocks. The weight stays Q8_0 in VRAM. This replaces the earlier block-per-row kernel,
+// whose per-thread strided 34-byte reads were uncoalesced (~6% of peak bandwidth on a T4).
 constexpr int kQ8Block = 32;
-constexpr int kQ8Bytes = 34;  // fp16 scale (2) + 32 int8
+constexpr int kQ8Bytes = 34;      // fp16 scale (2) + 32 int8
+constexpr int kWarpsPerBlock = 8;  // 256 threads/block
 
 __global__ void qmatmulQ8_0Kernel(float* __restrict__ out, const std::uint8_t* __restrict__ W,
                                   const float* __restrict__ x, int rows, int cols) {
-  const int row = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * kWarpsPerBlock + warp;
   if (row >= rows) return;
+
   const int nBlocks = cols / kQ8Block;
   const std::size_t rowBytes = static_cast<std::size_t>(nBlocks) * kQ8Bytes;
   const std::uint8_t* rowPtr = W + static_cast<std::size_t>(row) * rowBytes;
 
-  float partial = 0.0f;
-  for (int b = threadIdx.x; b < nBlocks; b += blockDim.x) {
+  float sum = 0.0f;
+  for (int b = 0; b < nBlocks; ++b) {
     const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(b) * kQ8Bytes;
-    const unsigned short hbits = blk[0] | (static_cast<unsigned short>(blk[1]) << 8);
-    const float d = __half2float(__ushort_as_half(hbits));
-    const signed char* qs = reinterpret_cast<const signed char*>(blk + 2);
-    const float* xb = x + static_cast<std::size_t>(b) * kQ8Block;
-#pragma unroll
-    for (int i = 0; i < kQ8Block; ++i) partial += d * static_cast<float>(qs[i]) * xb[i];
+    float d = 0.0f;
+    if (lane == 0) {
+      const unsigned short hbits = blk[0] | (static_cast<unsigned short>(blk[1]) << 8);
+      d = __half2float(__ushort_as_half(hbits));
+    }
+    d = __shfl_sync(0xffffffffu, d, 0);  // broadcast the scale to the warp
+    const signed char q = static_cast<signed char>(blk[2 + lane]);       // coalesced across lanes
+    const float xv = x[static_cast<std::size_t>(b) * kQ8Block + lane];   // coalesced across lanes
+    sum += d * static_cast<float>(q) * xv;
   }
 
-  __shared__ float sh[256];
-  sh[threadIdx.x] = partial;
-  __syncthreads();
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) out[row] = sh[0];
+  // Warp-shuffle reduction (no shared memory needed).
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+  if (lane == 0) out[row] = sum;
 }
+
+// Launch geometry for the warp-per-row kernel.
+inline int qmatmulGridBlocks(int rows) { return (rows + kWarpsPerBlock - 1) / kWarpsPerBlock; }
 
 }  // namespace
 
@@ -244,7 +251,7 @@ SelfTestResult qmatmulSelfTest() {
   cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice);
   cudaMemcpy(dX, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice);
 
-  qmatmulQ8_0Kernel<<<rows, 256>>>(dOut, dW, dX, rows, cols);
+  qmatmulQ8_0Kernel<<<qmatmulGridBlocks(rows), kWarpsPerBlock * 32>>>(dOut, dW, dX, rows, cols);
   cudaError_t e = cudaGetLastError();
   if (e == cudaSuccess) e = cudaDeviceSynchronize();
   if (e != cudaSuccess) {
@@ -276,7 +283,8 @@ SelfTestResult qmatmulSelfTest() {
       cudaMalloc(&dbOut, R * sizeof(float)) == cudaSuccess) {
     cudaMemset(dbW, 1, bigW);
     cudaMemset(dbX, 0, C * sizeof(float));
-    qmatmulQ8_0Kernel<<<R, 256>>>(dbOut, dbW, dbX, R, C);  // warm up
+    const int grid = qmatmulGridBlocks(R), threads = kWarpsPerBlock * 32;
+    qmatmulQ8_0Kernel<<<grid, threads>>>(dbOut, dbW, dbX, R, C);  // warm up
     cudaDeviceSynchronize();
 
     cudaEvent_t t0, t1;
@@ -284,7 +292,7 @@ SelfTestResult qmatmulSelfTest() {
     cudaEventCreate(&t1);
     const int iters = 50;
     cudaEventRecord(t0);
-    for (int it = 0; it < iters; ++it) qmatmulQ8_0Kernel<<<R, 256>>>(dbOut, dbW, dbX, R, C);
+    for (int it = 0; it < iters; ++it) qmatmulQ8_0Kernel<<<grid, threads>>>(dbOut, dbW, dbX, R, C);
     cudaEventRecord(t1);
     cudaEventSynchronize(t1);
     float ms = 0.0f;
