@@ -73,6 +73,59 @@ __global__ void qmatmulQ8_0Kernel(float* __restrict__ out, const std::uint8_t* _
 // Launch geometry for the warp-per-row kernel.
 inline int qmatmulGridBlocks(int rows) { return (rows + kWarpsPerBlock - 1) / kWarpsPerBlock; }
 
+// ---- forward-pass elementwise / norm kernels (building blocks for on-GPU inference) --------
+// These match the CPU reference ops (runtime/ops.cpp) so the GPU forward pass reproduces the
+// validated math. Each is verified against a host reference in opsSelfTest().
+
+// RMSNorm over one vector: out[i] = x[i] * rsqrt(mean(x^2)+eps) * w[i]. One block.
+__global__ void rmsnormKernel(float* __restrict__ out, const float* __restrict__ x,
+                              const float* __restrict__ w, int n, float eps) {
+  __shared__ float red[256];
+  __shared__ float scale;
+  float local = 0.0f;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) local += x[i] * x[i];
+  red[threadIdx.x] = local;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) scale = rsqrtf(red[0] / n + eps);
+  __syncthreads();
+  for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = x[i] * scale * w[i];
+}
+
+// RoPE (NeoX: rotate split-half pairs (i, i+head_dim/2)) over a [n_heads*head_dim] vector.
+__global__ void ropeNeoxKernel(float* __restrict__ vec, int n_heads, int head_dim, int pos,
+                               float freqBase) {
+  const int half = head_dim / 2;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // one thread per (head, pair)
+  if (idx >= n_heads * half) return;
+  const int h = idx / half;
+  const int i = idx % half;
+  float* v = vec + static_cast<std::size_t>(h) * head_dim;
+  const float theta = pos * powf(freqBase, -2.0f * i / head_dim);
+  const float c = cosf(theta), s = sinf(theta);
+  const float a = v[i], b = v[i + half];
+  v[i] = a * c - b * s;
+  v[i + half] = a * s + b * c;
+}
+
+// SwiGLU: out[i] = silu(gate[i]) * up[i], silu(z) = z * sigmoid(z).
+__global__ void swigluKernel(float* __restrict__ out, const float* __restrict__ gate,
+                             const float* __restrict__ up, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float g = gate[i];
+  out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
+// Residual add: out[i] += x[i].
+__global__ void addKernel(float* __restrict__ out, const float* __restrict__ x, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] += x[i];
+}
+
 }  // namespace
 
 bool builtWithCuda() noexcept { return true; }
@@ -312,6 +365,108 @@ SelfTestResult qmatmulSelfTest() {
 
   return {true, true, "GPU Q8_0 matmul matches host reference (max err " + std::to_string(maxErr) +
                           ")" + timing};
+}
+
+SelfTestResult opsSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  auto upload = [](const std::vector<float>& v) {
+    float* d = nullptr;
+    cudaMalloc(&d, v.size() * sizeof(float));
+    cudaMemcpy(d, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice);
+    return d;
+  };
+  auto download = [](float* d, std::vector<float>& v) {
+    cudaMemcpy(v.data(), d, v.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  };
+  float maxErr = 0.0f;
+  auto track = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    for (std::size_t i = 0; i < a.size(); ++i) maxErr = std::max(maxErr, std::fabs(a[i] - b[i]));
+  };
+
+  // RMSNorm.
+  {
+    const int n = 512;
+    std::vector<float> x(n), w(n), ref(n), gpu(n);
+    for (int i = 0; i < n; ++i) {
+      x[i] = 0.01f * ((i % 13) - 6);
+      w[i] = 0.5f + 0.001f * i;
+    }
+    double sq = 0.0;
+    for (float v : x) sq += static_cast<double>(v) * v;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(sq / n) + 1e-5f);
+    for (int i = 0; i < n; ++i) ref[i] = x[i] * scale * w[i];
+    float *dx = upload(x), *dw = upload(w), *dout = upload(gpu);
+    rmsnormKernel<<<1, 256>>>(dout, dx, dw, n, 1e-5f);
+    cudaDeviceSynchronize();
+    download(dout, gpu);
+    cudaFree(dx);
+    cudaFree(dw);
+    cudaFree(dout);
+    track(ref, gpu);
+  }
+  // RoPE (NeoX).
+  {
+    const int nH = 4, hd = 8, half = hd / 2, pos = 3, n = nH * hd;
+    const float base = 10000.0f;
+    std::vector<float> v(n), ref(n), gpu(n);
+    for (int i = 0; i < n; ++i) v[i] = 0.1f * ((i % 7) - 3);
+    ref = v;
+    for (int h = 0; h < nH; ++h)
+      for (int i = 0; i < half; ++i) {
+        const float theta = pos * std::pow(base, -2.0f * i / hd);
+        const float c = std::cos(theta), s = std::sin(theta);
+        const float a = ref[h * hd + i], b = ref[h * hd + i + half];
+        ref[h * hd + i] = a * c - b * s;
+        ref[h * hd + i + half] = a * s + b * c;
+      }
+    float* dv = upload(v);
+    ropeNeoxKernel<<<(nH * half + 63) / 64, 64>>>(dv, nH, hd, pos, base);
+    cudaDeviceSynchronize();
+    download(dv, gpu);
+    cudaFree(dv);
+    track(ref, gpu);
+  }
+  // SwiGLU.
+  {
+    const int n = 1000;
+    std::vector<float> g(n), u(n), ref(n), gpu(n);
+    for (int i = 0; i < n; ++i) {
+      g[i] = 0.02f * ((i % 11) - 5);
+      u[i] = 0.03f * ((i % 9) - 4);
+      ref[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+    }
+    float *dg = upload(g), *du = upload(u), *dout = upload(gpu);
+    swigluKernel<<<(n + 255) / 256, 256>>>(dout, dg, du, n);
+    cudaDeviceSynchronize();
+    download(dout, gpu);
+    cudaFree(dg);
+    cudaFree(du);
+    cudaFree(dout);
+    track(ref, gpu);
+  }
+  // Residual add.
+  {
+    const int n = 1000;
+    std::vector<float> a(n), b(n), ref(n), gpu(n);
+    for (int i = 0; i < n; ++i) {
+      a[i] = 0.1f * i;
+      b[i] = -0.05f * i;
+      ref[i] = a[i] + b[i];
+    }
+    float *da = upload(a), *db = upload(b);
+    addKernel<<<(n + 255) / 256, 256>>>(da, db, n);
+    cudaDeviceSynchronize();
+    download(da, gpu);
+    cudaFree(da);
+    cudaFree(db);
+    track(ref, gpu);
+  }
+
+  const bool ok = maxErr < 1e-3f;
+  return {true, ok,
+          (ok ? "rmsnorm/rope/swiglu/add match CPU (max err " : "GPU ops disagree with CPU (max err ") +
+              std::to_string(maxErr) + ")"};
 }
 
 // ---- memory integration --------------------------------------------------------------------

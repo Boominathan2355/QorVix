@@ -454,8 +454,13 @@ int cmdGpu() {
   const auto qmm = qorvix::cuda::qmatmulSelfTest();
   std::cout << "Self-test (Q8_0 matmul):  " << (qmm.passed ? "PASS" : (qmm.ran ? "FAIL" : "skip"))
             << " - " << qmm.message << "\n";
-  return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ? 1
-                                                                                              : 0;
+  const auto ops = qorvix::cuda::opsSelfTest();
+  std::cout << "Self-test (forward ops):  " << (ops.passed ? "PASS" : (ops.ran ? "FAIL" : "skip"))
+            << " - " << ops.message << "\n";
+  return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ||
+                 (ops.ran && !ops.passed)
+             ? 1
+             : 0;
 }
 
 int printUsage() {

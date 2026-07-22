@@ -51,4 +51,8 @@ SelfTestResult gemmSelfTest();
 // host reference on a small matrix, then times a large one; message reports GFLOP/s and GB/s.
 SelfTestResult qmatmulSelfTest();
 
+// GPU forward-pass building blocks (RMSNorm, RoPE, SwiGLU, residual add) checked against a CPU
+// reference — the elementwise/norm ops the on-GPU forward pass is assembled from.
+SelfTestResult opsSelfTest();
+
 }  // namespace qorvix::cuda
