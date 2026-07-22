@@ -109,10 +109,22 @@ This mirrors how llama.cpp itself started.
 - Verified analytically on hand-built synthetic models (residual-identity, zero-Q/K attention =
   value-average, greedy determinism, GQA head grouping) — locally + Catch2/CI.
 
-**Part 2b (next):** BPE tokenizer (encode/decode from GGUF vocab+merges), full sampling
-(top-k/top-p/min-p/temperature + repetition/frequency/presence penalties), and the streaming
-generation loop + `qorvix generate` CLI. Then load a **real GGUF** (drop one in `models/`) and
-validate generated text against llama.cpp — including confirming the RoPE mode per architecture.
+**Part 2b ✅ — generation engine (text out from a GGUF file):**
+- `tokenizer` module: SPM (score-based merges, ▁ marker) and byte-level BPE (merge-rank, GPT-2
+  byte↔unicode alphabet) — encode + byte-aware decode, byte-token fallback, loaded from
+  GGUF `tokenizer.ggml.*` metadata.
+- `Sampler`: temperature, top-k, top-p (nucleus), min-p, repetition/frequency/presence penalties;
+  greedy when temperature ≤ 0; deterministic per seed.
+- `Generator`: tokenize → prefill → streaming sample/decode loop; stops on EOS / maxNewTokens /
+  max seq len. `qorvix generate <file> --prompt "..." [--max --temp --top-k --top-p --seed]`.
+- Verified: tokenizer (SPM+BPE), sampler, and full generation on synthetic models (standalone
+  harness + Catch2), **and end-to-end from a real GGUF on disk** — `generate` loads a built
+  toy model (dequantized F32 weights + BPE vocab) and streams the expected tokens.
+
+**Remaining for Phase 5 — real-model validation:** drop a real GGUF (e.g. TinyLlama/Qwen2-0.5B
+Q4_K_M) in `models/` and validate generated text against llama.cpp, confirming the
+per-architecture RoPE mode (interleaved vs NeoX) and partial-rope handling. That closes Phase 5;
+GPU acceleration of this same path is Phase 6/8.
 
 ## Phase 6 — Native Quantization Kernels
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.

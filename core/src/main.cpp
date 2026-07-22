@@ -10,7 +10,10 @@
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
+#include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
+#include "qorvix/runtime/text_model.hpp"
+#include "qorvix/tokenizer/tokenizer.hpp"
 #include "qorvix/version.hpp"
 
 namespace {
@@ -198,6 +201,57 @@ int cmdModelInfo(const std::string& path) {
   }
 }
 
+// Parses `--flag value` style options after the positional model path. Returns "" if absent.
+std::string flagValue(const std::vector<std::string_view>& args, std::string_view flag) {
+  for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+    if (args[i] == flag) return std::string(args[i + 1]);
+  }
+  return {};
+}
+
+int cmdGenerate(const std::vector<std::string_view>& args) {
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string prompt = flagValue(args, "--prompt");
+  if (path.empty() || prompt.empty()) {
+    std::cerr << "usage: qorvix generate <file.gguf> --prompt \"...\" "
+                 "[--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n";
+    return 1;
+  }
+
+  qorvix::runtime::GenerationConfig cfg;
+  if (auto v = flagValue(args, "--max"); !v.empty()) cfg.maxNewTokens = std::stoi(v);
+  if (auto v = flagValue(args, "--temp"); !v.empty()) cfg.sampling.temperature = std::stof(v);
+  if (auto v = flagValue(args, "--top-k"); !v.empty()) cfg.sampling.topK = std::stoi(v);
+  if (auto v = flagValue(args, "--top-p"); !v.empty()) cfg.sampling.topP = std::stof(v);
+  if (auto v = flagValue(args, "--seed"); !v.empty()) cfg.seed = std::stoull(v);
+
+  try {
+    const auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) {
+      std::cerr << "error: tokenizer: " << err << "\n";
+      return 1;
+    }
+    auto model = qorvix::runtime::TextModel::fromGguf(file, err);
+    if (!model) {
+      std::cerr << "error: model: " << err << "\n";
+      return 1;
+    }
+
+    qorvix::runtime::Generator gen(*model, *tok);
+    std::cout << prompt << std::flush;
+    auto result = gen.generate(prompt, cfg,
+                               [](const std::string& piece) { std::cout << piece << std::flush; });
+    std::cout << "\n\n[" << result.promptTokens << " prompt tokens, " << result.tokens.size()
+              << " generated" << (result.hitEos ? ", eos" : "") << "]\n";
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int cmdGpu() {
   if (!qorvix::cuda::builtWithCuda()) {
     std::cout << "CUDA support: not built in.\n"
@@ -238,6 +292,7 @@ int printUsage() {
             << "  list [dir]          List discovered models (default: models)\n"
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
+            << "  generate <file> --prompt \"...\"   Generate text from a GGUF model\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
@@ -263,6 +318,7 @@ int main(int argc, char** argv) {
   if (command == "list") return cmdList(arg1.empty() ? "models" : arg1);
   if (command == "gguf-info") return cmdGgufInfo(arg1);
   if (command == "model-info") return cmdModelInfo(arg1);
+  if (command == "generate") return cmdGenerate(args);
   if (command == "gpu") return cmdGpu();
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 

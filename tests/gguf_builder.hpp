@@ -78,8 +78,23 @@ class GgufBuilder {
     return *this;
   }
 
-  // Serializes everything, appending `dataBytes` of zero-filled tensor data after the aligned
-  // data offset (so extent validation has something to check).
+  // Registers an F32 tensor with real data, auto-assigning a 32-aligned offset within the data
+  // section. Dims are in ggml order (dimensions[0] fastest). Use build() with no dataBytes after.
+  GgufBuilder& tensorF32(const std::string& name, const std::vector<std::uint64_t>& dims,
+                         const std::vector<float>& values) {
+    const std::uint64_t offset = tensorData_.size();
+    tensor(name, dims, /*type F32=*/0, offset);
+    for (float f : values) {
+      std::uint32_t bits;
+      std::memcpy(&bits, &f, 4);
+      putU32To(tensorData_, bits);
+    }
+    while (tensorData_.size() % 32 != 0) tensorData_.push_back(std::byte{0});
+    return *this;
+  }
+
+  // Serializes everything. Appends any tensorF32() data, then `dataBytes` extra zero bytes after
+  // the aligned data offset (so extent validation has something to check).
   std::vector<std::byte> build(std::uint32_t alignment = 32, std::uint64_t dataBytes = 0) {
     std::vector<std::byte> out;
     putU32To(out, kMagic);
@@ -90,6 +105,7 @@ class GgufBuilder {
     out.insert(out.end(), tensors_.begin(), tensors_.end());
     // pad to alignment
     while (alignment && out.size() % alignment != 0) out.push_back(std::byte{0});
+    out.insert(out.end(), tensorData_.begin(), tensorData_.end());
     out.insert(out.end(), static_cast<std::size_t>(dataBytes), std::byte{0});
     return out;
   }
@@ -122,6 +138,7 @@ class GgufBuilder {
     for (int i = 0; i < 8; ++i) buf.push_back(static_cast<std::byte>((v >> (8 * i)) & 0xFF));
   }
 
+  std::vector<std::byte> tensorData_;
   std::uint32_t version_;
   std::uint64_t metaCount_ = 0;
   std::uint64_t tensorCount_ = 0;
