@@ -20,3 +20,9 @@ tokenizer, sampling (temperature/top-k/top-p/min-p + penalties), and a streaming
 TinyLlama 1.1B** ("The capital of France is" → "the city of Paris, which is a"). The CPU forward
 pass is a correctness reference (~13 s/token, unoptimized); GPU acceleration of this same path is
 Phase 6/8.
+
+## License
+
+**Proprietary — All Rights Reserved.** Copyright © 2026 Boominathan Alagirisamy. This software is
+not open source; no use, copying, modification, or distribution is permitted without prior written
+permission. See [LICENSE](LICENSE).
