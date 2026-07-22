@@ -109,18 +109,34 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
   float sum = 0.0f;
   for (int sb = 0; sb < nSB; ++sb) {
     const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ4KBytes;
-    const float d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
-    const float dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
-    const std::uint8_t* scales = blk + 4;
+    // Decode d/dmin once (lane 0) and precompute the 8 sub-block (d*scale, dmin*min) pairs once
+    // (lanes 0..7), instead of per element — reassociated identically, so bit-for-bit the same.
+    float d = 0.0f, dmin = 0.0f;
+    if (lane == 0) {
+      d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
+      dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
+    }
+    d = __shfl_sync(0xffffffffu, d, 0);
+    dmin = __shfl_sync(0xffffffffu, dmin, 0);
+    float dscale = 0.0f, dmn = 0.0f;
+    if (lane < 8) {
+      unsigned char sc, m;
+      getScaleMinK4(lane, blk + 4, sc, m);
+      dscale = d * sc;
+      dmn = dmin * m;
+    }
+
     const std::uint8_t* qs = blk + 16;
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
-    for (int i = lane; i < kQKK; i += 32) {
-      const int s = i / 32, chunk = i / 64, local = i % 64;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {  // element i = lane + k*32 lives in sub-block k
+      const int i = lane + k * 32;
+      const int chunk = i / 64, local = i % 64;
       const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
       const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
-      unsigned char sc, m;
-      getScaleMinK4(s, scales, sc, m);
-      sum += (d * sc * nib - dmin * m) * xb[i];
+      const float ds = __shfl_sync(0xffffffffu, dscale, k);
+      const float dm = __shfl_sync(0xffffffffu, dmn, k);
+      sum += (ds * nib - dm) * xb[i];
     }
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
