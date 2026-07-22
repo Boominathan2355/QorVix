@@ -10,12 +10,15 @@
 #include "qorvix/api/http_server.hpp"
 #include "qorvix/api/openai.hpp"
 #include "qorvix/cuda/backend.hpp"
+#include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
+#include "qorvix/runtime/dequant.hpp"
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
 #include "qorvix/runtime/text_model.hpp"
+#include "qorvix/runtime/weights.hpp"
 #include "qorvix/scheduler/scheduler.hpp"
 #include "qorvix/tokenizer/tokenizer.hpp"
 #include "qorvix/version.hpp"
@@ -422,6 +425,107 @@ int cmdServe(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+namespace {
+// Bridges a loaded GGUF (runtime Weights) into GPU model descriptors.
+qorvix::cuda::GpuWeight toGpuWeight(const qorvix::runtime::WeightMat& m) {
+  return qorvix::cuda::GpuWeight{m.quant, m.type, m.rows, m.cols};
+}
+int argmaxOf(const std::vector<float>& v) {
+  int best = 0;
+  for (int i = 1; i < static_cast<int>(v.size()); ++i)
+    if (v[i] > v[best]) best = i;
+  return best;
+}
+}  // namespace
+
+// Correctness gate for GPU inference: runs one forward pass on both the CPU TextModel and the GPU
+// model over a short prompt and compares logits.
+int cmdGpuCheck(const std::string& path) {
+  namespace rt = qorvix::runtime;
+  namespace cu = qorvix::cuda;
+  if (!cu::builtWithCuda()) {
+    std::cout << "CUDA not built in — rebuild with -DQORVIX_ENABLE_CUDA=ON (needs a GPU host).\n";
+    return 0;
+  }
+  if (path.empty()) {
+    std::cerr << "usage: qorvix gpu-check <file.gguf>\n";
+    return 1;
+  }
+  try {
+    auto file = qorvix::gguf::GgufFile::open(path);  // kept alive: CPU weights borrow its mmap
+    std::string err;
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) { std::cerr << "tokenizer: " << err << "\n"; return 1; }
+    const auto cfg = rt::configFromGguf(file, err);
+    if (!cfg.valid()) { std::cerr << "config: " << err << "\n"; return 1; }
+    auto weights = rt::loadWeights(file, cfg, err);
+    if (!weights) { std::cerr << "weights: " << err << "\n"; return 1; }
+
+    const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+    const int maxSeq = 64;
+
+    // Embedding table dequantized to F32 for the on-device lookup.
+    std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
+    if (!rt::dequantize(weights->tokenEmbd.type, weights->tokenEmbd.quant, embF32.data(),
+                        static_cast<std::size_t>(vocab) * d)) {
+      std::cerr << "failed to dequantize token_embd\n";
+      return 1;
+    }
+
+    cu::GpuModelConfig gc;
+    gc.nLayers = static_cast<int>(cfg.blockCount);
+    gc.dModel = d;
+    gc.nHeads = static_cast<int>(cfg.headCount);
+    gc.headDim = static_cast<int>(cfg.headDim());
+    gc.nKv = static_cast<int>(cfg.headCountKv);
+    gc.ffn = static_cast<int>(cfg.feedForwardLength);
+    gc.vocab = vocab;
+    gc.maxSeq = maxSeq;
+    gc.normEps = cfg.normEpsilon;
+    gc.ropeFreqBase = cfg.ropeFreqBase;
+
+    cu::GpuWeight output = weights->output.valid() ? toGpuWeight(weights->output)
+                                                   : toGpuWeight(weights->tokenEmbd);
+    std::vector<cu::GpuLayer> gl(cfg.blockCount);
+    for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+      const auto& L = weights->layers[l];
+      gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), toGpuWeight(L.wq), toGpuWeight(L.wk),
+               toGpuWeight(L.wv), toGpuWeight(L.wo), toGpuWeight(L.ffnGate), toGpuWeight(L.ffnUp),
+               toGpuWeight(L.ffnDown)};
+    }
+
+    std::string gerr;
+    std::cout << "Uploading weights to VRAM and building GPU model...\n";
+    auto gpu = cu::createGpuModel(gc, embF32.data(), weights->outputNorm.data(), output, gl, gerr);
+    if (!gpu) { std::cerr << "GPU model: " << gerr << "\n"; return 1; }
+
+    rt::TextModel cpu(cfg, std::move(*weights), maxSeq);  // in-memory ctor; borrows the live file
+
+    const auto ids = tok->encode("The capital of France is", true);
+    std::cout << "Comparing GPU vs CPU logits over " << ids.size() << " prompt tokens...\n";
+    float maxErr = 0.0f, maxRef = 1e-6f;
+    bool argmaxMatch = true;
+    for (int pos = 0; pos < static_cast<int>(ids.size()) && pos < maxSeq; ++pos) {
+      const auto& cl = cpu.forward(ids[pos], pos);
+      const auto& glog = gpu->forward(ids[pos], pos);
+      for (int i = 0; i < vocab; ++i) {
+        maxErr = std::max(maxErr, std::fabs(cl[i] - glog[i]));
+        maxRef = std::max(maxRef, std::fabs(cl[i]));
+      }
+      if (argmaxOf(cl) != argmaxOf(glog)) argmaxMatch = false;
+    }
+    const float relErr = maxErr / maxRef;
+    std::cout << "\nGPU vs CPU logits:  max abs err " << maxErr << ", rel err " << relErr << "\n"
+              << "Argmax agrees at every position: " << (argmaxMatch ? "yes" : "NO") << "\n"
+              << (argmaxMatch && relErr < 5e-2f ? "RESULT: PASS - GPU forward matches the CPU runtime.\n"
+                                                : "RESULT: MISMATCH - see errors above.\n");
+    return (argmaxMatch && relErr < 5e-2f) ? 0 : 1;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int cmdGpu() {
   if (!qorvix::cuda::builtWithCuda()) {
     std::cout << "CUDA support: not built in.\n"
@@ -487,6 +591,7 @@ int printUsage() {
             << "  generate <file> --prompt \"...\"   Generate text from a GGUF model\n"
             << "  serve <file> [--port N]         Start the OpenAI-compatible HTTP server\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
+            << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
             << "  help                Show this help\n";
@@ -514,6 +619,7 @@ int main(int argc, char** argv) {
   if (command == "generate") return cmdGenerate(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
+  if (command == "gpu-check") return cmdGpuCheck(arg1);
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 
   std::cerr << "Unknown command: " << command << "\n\n";

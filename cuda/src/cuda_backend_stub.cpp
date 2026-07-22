@@ -4,8 +4,16 @@
 // cuda_backend.cu; the two are never compiled together.
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_memory.hpp"
+#include "qorvix/cuda/gpu_model.hpp"
 
 namespace qorvix::cuda {
+
+std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig&, const float*, const float*,
+                                         const GpuWeight&, const std::vector<GpuLayer>&,
+                                         std::string& error) {
+  error = "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)";
+  return nullptr;
+}
 
 bool builtWithCuda() noexcept { return false; }
 int deviceCount() { return 0; }

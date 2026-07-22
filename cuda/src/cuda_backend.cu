@@ -15,8 +15,11 @@
 
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_memory.hpp"
+#include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/memory/disk_allocator.hpp"
 #include "qorvix/memory/slab_allocator.hpp"
+
+#include <memory>
 
 namespace qorvix::cuda {
 
@@ -1085,6 +1088,177 @@ SelfTestResult gpuForwardSelfTest() {
           (ok ? "GPU forward pass (2-layer, 3 positions) matches CPU reference (max err "
               : "GPU forward disagrees with CPU (max err ") +
               std::to_string(maxErr) + ")"};
+}
+
+// ---- GPU-resident model runner -------------------------------------------------------------
+
+namespace {
+
+std::size_t weightBytes(std::uint32_t type, int rows, int cols) {
+  const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  switch (type) {
+    case 0: return n * sizeof(float);   // F32
+    case 8: return n / 32 * kQ8Bytes;   // Q8_0
+    case 12: return n / kQKK * kQ4KBytes;  // Q4_K
+    case 14: return n / kQKK * kQ6KBytes;  // Q6_K
+    default: return 0;
+  }
+}
+
+struct DevWeight {
+  void* d = nullptr;
+  std::uint32_t type = 0;
+  int rows = 0;
+  int cols = 0;
+};
+
+class GpuModelImpl final : public GpuModel {
+ public:
+  explicit GpuModelImpl(const GpuModelConfig& cfg) : cfg_(cfg) {}
+
+  ~GpuModelImpl() override {
+    auto f = [](void* p) { if (p) cudaFree(p); };
+    f(dTokEmbd_);
+    f(dOutNorm_);
+    f(output_.d);
+    for (auto& L : layers_) {
+      f(L.attnNorm);
+      f(L.ffnNorm);
+      for (DevWeight* w : {&L.wq, &L.wk, &L.wv, &L.wo, &L.ffnGate, &L.ffnUp, &L.ffnDown}) f(w->d);
+    }
+    f(dKc_);
+    f(dVc_);
+    for (void* p : {dx_, dxn_, dq_, dk_, dv_, dattn_, dtmp_, dg_, du_, dact_, dlogits_}) f(p);
+  }
+
+  bool init(const float* tokenEmbdF32, const float* outputNorm, const GpuWeight& output,
+            const std::vector<GpuLayer>& layers, std::string& err) {
+    const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn, vocab = cfg_.vocab;
+    auto upF32 = [](const float* h, std::size_t n) {
+      float* p = nullptr;
+      if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return static_cast<float*>(nullptr);
+      cudaMemcpy(p, h, n * sizeof(float), cudaMemcpyHostToDevice);
+      return p;
+    };
+    auto upW = [&](const GpuWeight& w, DevWeight& out) -> bool {
+      const std::size_t bytes = weightBytes(w.ggmlType, w.rows, w.cols);
+      if (bytes == 0) { err = "unsupported weight type " + std::to_string(w.ggmlType); return false; }
+      if (cudaMalloc(&out.d, bytes) != cudaSuccess) { err = "cudaMalloc weight failed"; return false; }
+      cudaMemcpy(out.d, w.host, bytes, cudaMemcpyHostToDevice);
+      out.type = w.ggmlType;
+      out.rows = w.rows;
+      out.cols = w.cols;
+      return true;
+    };
+
+    dTokEmbd_ = upF32(tokenEmbdF32, static_cast<std::size_t>(vocab) * d);
+    dOutNorm_ = upF32(outputNorm, d);
+    if (!dTokEmbd_ || !dOutNorm_) { err = "cudaMalloc embedding/norm failed"; return false; }
+    if (!upW(output, output_)) return false;
+
+    layers_.resize(cfg_.nLayers);
+    for (int l = 0; l < cfg_.nLayers; ++l) {
+      const GpuLayer& s = layers[l];
+      DevLayer& t = layers_[l];
+      t.attnNorm = upF32(s.attnNorm, d);
+      t.ffnNorm = upF32(s.ffnNorm, d);
+      if (!t.attnNorm || !t.ffnNorm) { err = "cudaMalloc layer norm failed"; return false; }
+      if (!upW(s.wq, t.wq) || !upW(s.wk, t.wk) || !upW(s.wv, t.wv) || !upW(s.wo, t.wo) ||
+          !upW(s.ffnGate, t.ffnGate) || !upW(s.ffnUp, t.ffnUp) || !upW(s.ffnDown, t.ffnDown))
+        return false;
+    }
+
+    auto alloc = [](float*& p, std::size_t n) { return cudaMalloc(&p, n * sizeof(float)) == cudaSuccess; };
+    const std::size_t kvAll = static_cast<std::size_t>(cfg_.nLayers) * cfg_.maxSeq * kvDim;
+    if (!alloc(dx_, d) || !alloc(dxn_, d) || !alloc(dq_, cfg_.nHeads * cfg_.headDim) ||
+        !alloc(dk_, kvDim) || !alloc(dv_, kvDim) || !alloc(dattn_, cfg_.nHeads * cfg_.headDim) ||
+        !alloc(dtmp_, d) || !alloc(dg_, ffn) || !alloc(du_, ffn) || !alloc(dact_, ffn) ||
+        !alloc(dlogits_, vocab) || !alloc(dKc_, kvAll) || !alloc(dVc_, kvAll)) {
+      err = "cudaMalloc scratch/KV failed";
+      return false;
+    }
+    hostLogits_.resize(vocab);
+    return true;
+  }
+
+  void reset() override { /* KV slots are overwritten per position; nothing to clear */ }
+
+  const std::vector<float>& forward(int token, int pos) override {
+    const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
+    const int qDim = cfg_.nHeads * cfg_.headDim, hd = cfg_.headDim, mx = cfg_.maxSeq;
+    auto g = [](int n) { return (n + 255) / 256; };
+
+    embedRowKernel<<<g(d), 256>>>(dx_, dTokEmbd_, token, d);
+    for (int l = 0; l < cfg_.nLayers; ++l) {
+      DevLayer& w = layers_[l];
+      rmsnormKernel<<<1, 256>>>(dxn_, dx_, w.attnNorm, d, cfg_.normEps);
+      matmul(dq_, w.wq, dxn_);
+      matmul(dk_, w.wk, dxn_);
+      matmul(dv_, w.wv, dxn_);
+      ropeNeoxKernel<<<g(cfg_.nHeads * hd / 2), 256>>>(dq_, cfg_.nHeads, hd, pos, cfg_.ropeFreqBase);
+      ropeNeoxKernel<<<g(cfg_.nKv * hd / 2), 256>>>(dk_, cfg_.nKv, hd, pos, cfg_.ropeFreqBase);
+      kvStoreKernel<<<g(kvDim), 256>>>(dKc_, dk_, l, pos, mx, kvDim);
+      kvStoreKernel<<<g(kvDim), 256>>>(dVc_, dv_, l, pos, mx, kvDim);
+      float* Kl = dKc_ + static_cast<std::size_t>(l) * mx * kvDim;
+      float* Vl = dVc_ + static_cast<std::size_t>(l) * mx * kvDim;
+      const std::size_t sh = (static_cast<std::size_t>(pos + 1) + hd) * sizeof(float);
+      attentionDecodeKernel<<<cfg_.nHeads, hd, sh>>>(dattn_, dq_, Kl, Vl, cfg_.nHeads, cfg_.nKv, hd, pos + 1, kvDim);
+      matmul(dtmp_, w.wo, dattn_);
+      addKernel<<<g(d), 256>>>(dx_, dtmp_, d);
+      rmsnormKernel<<<1, 256>>>(dxn_, dx_, w.ffnNorm, d, cfg_.normEps);
+      matmul(dg_, w.ffnGate, dxn_);
+      matmul(du_, w.ffnUp, dxn_);
+      swigluKernel<<<g(ffn), 256>>>(dact_, dg_, du_, ffn);
+      matmul(dtmp_, w.ffnDown, dact_);
+      addKernel<<<g(d), 256>>>(dx_, dtmp_, d);
+    }
+    rmsnormKernel<<<1, 256>>>(dxn_, dx_, dOutNorm_, d, cfg_.normEps);
+    matmul(dlogits_, output_, dxn_);
+    cudaMemcpy(hostLogits_.data(), dlogits_, cfg_.vocab * sizeof(float), cudaMemcpyDeviceToHost);
+    return hostLogits_;
+  }
+
+ private:
+  struct DevLayer {
+    float* attnNorm = nullptr;
+    float* ffnNorm = nullptr;
+    DevWeight wq, wk, wv, wo, ffnGate, ffnUp, ffnDown;
+  };
+
+  // Dispatches out = W * x to the kernel for W's quant type.
+  void matmul(float* out, const DevWeight& w, const float* x) {
+    const int grid = (w.rows + kWarpsPerBlock - 1) / kWarpsPerBlock, threads = kWarpsPerBlock * 32;
+    switch (w.type) {
+      case 12: qmatmulQ4_KKernel<<<grid, threads>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
+      case 14: qmatmulQ6_KKernel<<<grid, threads>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
+      case 8: qmatmulQ8_0Kernel<<<grid, threads>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
+      default: matmulF32Kernel<<<w.rows, 256>>>(out, static_cast<const float*>(w.d), x, w.rows, w.cols); break;
+    }
+  }
+
+  GpuModelConfig cfg_;
+  float* dTokEmbd_ = nullptr;
+  float* dOutNorm_ = nullptr;
+  DevWeight output_;
+  std::vector<DevLayer> layers_;
+  float *dKc_ = nullptr, *dVc_ = nullptr;
+  float *dx_ = nullptr, *dxn_ = nullptr, *dq_ = nullptr, *dk_ = nullptr, *dv_ = nullptr;
+  float *dattn_ = nullptr, *dtmp_ = nullptr, *dg_ = nullptr, *du_ = nullptr, *dact_ = nullptr, *dlogits_ = nullptr;
+  std::vector<float> hostLogits_;
+};
+
+}  // namespace
+
+std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig& cfg, const float* tokenEmbdF32,
+                                         const float* outputNorm, const GpuWeight& output,
+                                         const std::vector<GpuLayer>& layers, std::string& error) {
+  if (deviceCount() <= 0) {
+    error = "no CUDA device present";
+    return nullptr;
+  }
+  auto m = std::make_unique<GpuModelImpl>(cfg);
+  if (!m->init(tokenEmbdF32, outputNorm, output, layers, error)) return nullptr;
+  return m;
 }
 
 // ---- memory integration --------------------------------------------------------------------
