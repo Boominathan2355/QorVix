@@ -12,6 +12,7 @@ if(Catch2_FOUND)
     cuda_test.cpp
     ops_test.cpp
     dequant_test.cpp
+    qmatmul_test.cpp
     model_config_test.cpp
     text_model_test.cpp
     tokenizer_test.cpp
