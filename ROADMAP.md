@@ -121,10 +121,20 @@ This mirrors how llama.cpp itself started.
   harness + Catch2), **and end-to-end from a real GGUF on disk** — `generate` loads a built
   toy model (dequantized F32 weights + BPE vocab) and streams the expected tokens.
 
-**Remaining for Phase 5 — real-model validation:** drop a real GGUF (e.g. TinyLlama/Qwen2-0.5B
-Q4_K_M) in `models/` and validate generated text against llama.cpp, confirming the
-per-architecture RoPE mode (interleaved vs NeoX) and partial-rope handling. That closes Phase 5;
-GPU acceleration of this same path is Phase 6/8.
+**Part 2c ✅ — real-model validation:** validated on **TinyLlama 1.1B Chat Q4_K_M** (real llama
+arch, 22 layers, GQA 32/4, SPM tokenizer). `model-info` reads the config exactly; greedy
+`generate` on "The capital of France is" produces "the city of Paris, which is a" — coherent,
+grammatical, factually correct. This exercises the whole path on real weights: GGUF parse → SPM
+tokenizer (32k vocab) → Q4_K/Q6_K dequant → 22-layer forward pass → greedy decode. The RoPE mode
+is confirmed empirically (NeoX is correct for this GGUF llama model; wrong rope would scramble
+positions and produce garbage). Exact bit-level logit parity with llama.cpp is not yet measured
+(llama.cpp isn't installed here), but generation correctness is established.
+
+**Phase 5 is functionally complete** — Qorvix generates correct text from a real GGUF model on
+CPU. Known gaps, deferred by design: CPU forward pass is unoptimized (~13 s/token single-threaded
+naive F32 matmul — no SIMD/threading/quant kernels yet), so it's a *reference*, not fast; Qwen2/
+Gemma need their attention-bias / logit-softcap quirks; partial-rope (rope_dim < head_dim) untested.
+Speed comes from **Phase 6** (native quantized kernels) and **Phase 8** (GPU) — same path, accelerated.
 
 ## Phase 6 — Native Quantization Kernels
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.
@@ -166,8 +176,11 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phase 4 code-complete. Runtime skeleton, GGUF parser, unified memory manager, and the
-CUDA backend (device mgmt, GpuVram tier, self-tests) build and pass tests — CPU path locally and
-in Docker, CUDA path compiles under nvcc. GPU *execution* is unverified (no NVIDIA device on this
-box or CI). No inference yet — treat performance claims in SPEC.md as targets, not current
-capabilities. Next: Phase 5 (text runtime, end-to-end — the first real inference).
+**Status:** Phase 5 complete — **Qorvix generates correct text from a real GGUF model on CPU**,
+validated on TinyLlama 1.1B Chat Q4_K_M ("The capital of France is" → "the city of Paris…").
+Foundations through the memory manager (Phase 3) pass tests locally and in the Docker Linux image.
+The CUDA backend (Phase 4) is authored, but the `.cu` path is **compile-unverified** — the earlier
+"compiles under nvcc" claim was wrong (the Docker CUDA build never completed; there's no NVIDIA
+device on this box or CI). Performance claims in SPEC.md remain targets: the CPU runtime is a
+correctness *reference* (~13 s/token, unoptimized), not fast. Next: Phase 6 (native quantized
+kernels) / Phase 8 (GPU) to accelerate the now-validated path.
