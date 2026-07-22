@@ -12,8 +12,9 @@ add_library(qorvix_runtime STATIC
 target_include_directories(qorvix_runtime PUBLIC include)
 target_compile_features(qorvix_runtime PUBLIC cxx_std_23)
 
-# dequant references the GGUF ggml_type enum; the generator drives the tokenizer.
-target_link_libraries(qorvix_runtime PUBLIC qorvix_gguf qorvix_tokenizer)
+# dequant references the GGUF ggml_type enum; the generator drives the tokenizer; the forward
+# pass stores attention K/V in the paged GlobalKvCache from the memory module.
+target_link_libraries(qorvix_runtime PUBLIC qorvix_gguf qorvix_tokenizer qorvix_memory)
 
 # Multithread the CPU reference matmul (the forward pass's dominant cost) via OpenMP when
 # available. Optional: without it the #pragma omp lines are simply ignored.

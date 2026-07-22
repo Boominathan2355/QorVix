@@ -8,6 +8,7 @@ if(Catch2_FOUND)
     plugin_registry_test.cpp
     gguf_file_test.cpp
     memory_test.cpp
+    kv_cache_test.cpp
     transfer_test.cpp
     cuda_test.cpp
     ops_test.cpp

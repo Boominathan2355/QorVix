@@ -165,9 +165,18 @@ speed at scale is the GPU path.
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.
 Quantized KV cache.
 
-## Phase 7 — KV Cache, Batching, Scheduler
-`GlobalKVCache` (paged, shared, session-restore, compression, pruning), dynamic + continuous
-batching, request prioritization, GPU/memory/model-aware scheduling.
+## Phase 7 — KV Cache, Batching, Scheduler 🚧
+**Part 1 ✅ — `GlobalKvCache`:** paged, multi-session KV store (vLLM-style page tables) in the
+`memory` module. A page holds `tokensPerPage` tokens of K+V for one layer; per-session page tables
+map (session, layer, token) → a page from one shared pool, so sequences are isolated, their KV need
+not be contiguous, and closing a session returns pages to the pool. `appendToken` grows pages on
+boundaries and fails cleanly when the pool is exhausted; `reset` frees pages but keeps the session.
+Wired into `TextModel` (one session sized to maxSeq): TinyLlama output is byte-identical to the old
+contiguous cache, and the in-memory F32 forward tests still pass.
+
+**Remaining:** the scheduler — request queue + prioritization, session lifecycle, continuous
+batching (requests join/leave a running decode set), GPU/memory/model-aware admission. Plus KV
+compression / cross-session prefix reuse / sliding-window pruning on the cache itself.
 
 ## Phase 8 — CUDA Performance Pass
 FlashAttention 3, CUDA Graphs, CUTLASS kernels, tensor core paths, kernel fusion, persistent

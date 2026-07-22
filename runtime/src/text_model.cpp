@@ -8,14 +8,33 @@
 
 namespace qorvix::runtime {
 
+namespace {
+constexpr int kKvTokensPerPage = 256;
+
+memory::KvCacheConfig kvConfig(const ModelConfig& c) {
+  return memory::KvCacheConfig{static_cast<int>(c.blockCount), static_cast<int>(c.kvDim()),
+                               kKvTokensPerPage};
+}
+
+// Pool sized to hold one sequence of maxSeq tokens across all layers.
+std::size_t kvPoolBytes(const ModelConfig& c, std::uint32_t maxSeq) {
+  const std::size_t pagesPerLayer = (maxSeq + kKvTokensPerPage - 1) / kKvTokensPerPage;
+  const std::size_t pages = static_cast<std::size_t>(c.blockCount) * pagesPerLayer;
+  const std::size_t pageFloats = static_cast<std::size_t>(kKvTokensPerPage) * c.kvDim() * 2;
+  return pages * pageFloats * sizeof(float);
+}
+}  // namespace
+
 TextModel::TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLen)
-    : cfg_(std::move(config)), w_(std::move(weights)), maxSeq_(maxSeqLen) {
+    : cfg_(std::move(config)),
+      w_(std::move(weights)),
+      maxSeq_(maxSeqLen),
+      kv_(kvConfig(cfg_), kvPoolBytes(cfg_, maxSeqLen)) {
   const std::size_t d = cfg_.embeddingLength;
   const std::size_t kv = cfg_.kvDim();
   const std::size_t ffn = cfg_.feedForwardLength;
 
-  kCache_.assign(static_cast<std::size_t>(cfg_.blockCount) * maxSeq_ * kv, 0.0f);
-  vCache_.assign(static_cast<std::size_t>(cfg_.blockCount) * maxSeq_ * kv, 0.0f);
+  session_ = kv_.open();
 
   x_.assign(d, 0.0f);
   xn_.assign(d, 0.0f);
@@ -52,10 +71,9 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
   const int group = nHeads / nKv;  // query heads per kv head (GQA)
   const float invSqrt = 1.0f / std::sqrt(static_cast<float>(headDim));
 
-  // Cache the freshly projected K/V for this position.
-  const std::size_t layerBase = static_cast<std::size_t>(layer) * maxSeq_ * kvDim;
-  float* kRow = kCache_.data() + layerBase + static_cast<std::size_t>(pos) * kvDim;
-  float* vRow = vCache_.data() + layerBase + static_cast<std::size_t>(pos) * kvDim;
+  // Store the freshly projected K/V for this position into the paged cache.
+  float* kRow = kv_.kSlot(session_, layer, pos);
+  float* vRow = kv_.vSlot(session_, layer, pos);
   for (int i = 0; i < kvDim; ++i) {
     kRow[i] = k_[i];
     vRow[i] = v_[i];
@@ -68,7 +86,7 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
     const std::size_t headOff = static_cast<std::size_t>(kvHead) * headDim;
 
     for (int t = 0; t <= pos; ++t) {
-      const float* kt = kCache_.data() + layerBase + static_cast<std::size_t>(t) * kvDim + headOff;
+      const float* kt = kv_.kSlot(session_, layer, t) + headOff;
       float dot = 0.0f;
       for (int d = 0; d < headDim; ++d) dot += qh[d] * kt[d];
       scores[t] = dot * invSqrt;
@@ -78,7 +96,7 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
     float* outH = attn_.data() + static_cast<std::size_t>(h) * headDim;
     for (int d = 0; d < headDim; ++d) outH[d] = 0.0f;
     for (int t = 0; t <= pos; ++t) {
-      const float* vt = vCache_.data() + layerBase + static_cast<std::size_t>(t) * kvDim + headOff;
+      const float* vt = kv_.vSlot(session_, layer, t) + headOff;
       const float s = scores[t];
       for (int d = 0; d < headDim; ++d) outH[d] += s * vt[d];
     }
@@ -88,6 +106,11 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
 const std::vector<float>& TextModel::forward(int token, int pos) {
   const int d = static_cast<int>(cfg_.embeddingLength);
   const int headDim = static_cast<int>(cfg_.headDim());
+
+  // Grow the paged KV cache so slot `pos` exists in every layer (normally appends one token).
+  while (kv_.length(session_) <= pos) {
+    if (!kv_.appendToken(session_)) break;  // pool exhausted; attention will clamp to what exists
+  }
 
   // Embedding lookup (dequantizes one row when the table is quantized).
   embeddingRow(w_.tokenEmbd, token, x_.data());
@@ -125,7 +148,6 @@ const std::vector<float>& TextModel::forward(int token, int pos) {
   ops::rmsnorm(xn_.data(), x_.data(), w_.outputNorm.data(), d, cfg_.normEpsilon);
   wmatmul(logits_.data(), w_.lmHead(), xn_.data());
 
-  if (pos + 1 > filled_) filled_ = pos + 1;
   return logits_;
 }
 
