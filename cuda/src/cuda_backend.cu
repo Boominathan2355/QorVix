@@ -547,6 +547,51 @@ SelfTestResult qmatmulSelfTest() {
                           ")" + timing};
 }
 
+// Times a 4096x4096 K-quant GEMV (content-independent) and returns "; NxN GEMV: X GB/s". `type`
+// selects the kernel (12=Q4_K, 14=Q6_K); `blockBytes` is that type's super-block byte size.
+std::string timeKQuantGemv(std::uint32_t type, int blockBytes) {
+  const int R = 4096, C = 4096;
+  const std::size_t bigRowBytes = static_cast<std::size_t>(C / kQKK) * blockBytes;
+  const std::size_t big = static_cast<std::size_t>(R) * bigRowBytes;
+  std::uint8_t* dW = nullptr;
+  float *dX = nullptr, *dOut = nullptr;
+  if (cudaMalloc(&dW, big) != cudaSuccess || cudaMalloc(&dX, C * sizeof(float)) != cudaSuccess ||
+      cudaMalloc(&dOut, R * sizeof(float)) != cudaSuccess) {
+    cudaFree(dW);
+    cudaFree(dX);
+    cudaFree(dOut);
+    return "";
+  }
+  cudaMemset(dW, 1, big);
+  cudaMemset(dX, 0, C * sizeof(float));
+  const int grid = qmatmulGridBlocks(R), threads = kWarpsPerBlock * 32;
+  auto launch = [&] {
+    if (type == 12) qmatmulQ4_KKernel<<<grid, threads>>>(dOut, dW, dX, R, C);
+    else qmatmulQ6_KKernel<<<grid, threads>>>(dOut, dW, dX, R, C);
+  };
+  launch();  // warm up
+  cudaDeviceSynchronize();
+  cudaEvent_t t0, t1;
+  cudaEventCreate(&t0);
+  cudaEventCreate(&t1);
+  const int iters = 50;
+  cudaEventRecord(t0);
+  for (int i = 0; i < iters; ++i) launch();
+  cudaEventRecord(t1);
+  cudaEventSynchronize(t1);
+  float ms = 0.0f;
+  cudaEventElapsedTime(&ms, t0, t1);
+  cudaEventDestroy(t0);
+  cudaEventDestroy(t1);
+  cudaFree(dW);
+  cudaFree(dX);
+  cudaFree(dOut);
+  const double gbps = static_cast<double>(big) * iters / (ms / 1000.0) / 1e9;
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "; %dx%d GEMV: %.0f GB/s", R, C, gbps);
+  return buf;
+}
+
 SelfTestResult qmatmulQ4_KSelfTest() {
   if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
 
@@ -621,10 +666,11 @@ SelfTestResult qmatmulQ4_KSelfTest() {
     maxErr = std::max(maxErr, std::fabs(gpu[r] - ref[r]));
     maxRef = std::max(maxRef, std::fabs(ref[r]));
   }
+  const std::string timing = timeKQuantGemv(12, kQ4KBytes);
   const bool ok = maxErr / maxRef < 1e-3f;
   return {true, ok,
           (ok ? "GPU Q4_K matmul matches host reference (rel err " : "Q4_K disagrees with CPU (rel err ") +
-              std::to_string(maxErr / maxRef) + ")"};
+              std::to_string(maxErr / maxRef) + ")" + timing};
 }
 
 SelfTestResult qmatmulQ6_KSelfTest() {
@@ -697,10 +743,11 @@ SelfTestResult qmatmulQ6_KSelfTest() {
     maxErr = std::max(maxErr, std::fabs(gpu[r] - ref[r]));
     maxRef = std::max(maxRef, std::fabs(ref[r]));
   }
+  const std::string timing = timeKQuantGemv(14, kQ6KBytes);
   const bool ok = maxErr / maxRef < 1e-3f;
   return {true, ok,
           (ok ? "GPU Q6_K matmul matches host reference (rel err " : "Q6_K disagrees with CPU (rel err ") +
-              std::to_string(maxErr / maxRef) + ")"};
+              std::to_string(maxErr / maxRef) + ")" + timing};
 }
 
 SelfTestResult opsSelfTest() {
