@@ -126,28 +126,17 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
       dmn = dmin * m;
     }
 
-    // Vectorized load: each lane reads its 4 qs bytes as one 32-bit word, so the warp pulls the
-    // whole 128-byte qs block in a single coalesced transaction (vs 8 scattered byte-loads + 16
-    // shuffles before). Lane L owns qs[4L..4L+3], all inside chunk c=L/8 -> sub-blocks 2c (low
-    // nibbles) and 2c+1 (high nibbles). Same 256 (weight, x, scale) terms as the scalar loop; only
-    // the summation order differs (reassociated), so results match within fp rounding, not bit-for-
-    // bit -- gated on gpu-check argmax staying identical to the CPU reference.
     const std::uint8_t* qs = blk + 16;
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
-    const int c = lane >> 3;          // chunk 0..3
-    const int o = (lane & 7) << 2;    // 0,4,...,28 within the chunk
-    const float dslo = __shfl_sync(0xffffffffu, dscale, 2 * c);
-    const float dmlo = __shfl_sync(0xffffffffu, dmn, 2 * c);
-    const float dshi = __shfl_sync(0xffffffffu, dscale, 2 * c + 1);
-    const float dmhi = __shfl_sync(0xffffffffu, dmn, 2 * c + 1);
-    const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(qs + (lane << 2));
-    const float* xlo = xb + c * 64 + o;
-    const float* xhi = xlo + 32;
 #pragma unroll
-    for (int b = 0; b < 4; ++b) {
-      const int byte = static_cast<int>((packed >> (8 * b)) & 0xFFu);
-      sum += (dslo * (byte & 0xF) - dmlo) * xlo[b];
-      sum += (dshi * (byte >> 4) - dmhi) * xhi[b];
+    for (int k = 0; k < 8; ++k) {  // element i = lane + k*32 lives in sub-block k
+      const int i = lane + k * 32;
+      const int chunk = i / 64, local = i % 64;
+      const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
+      const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
+      const float ds = __shfl_sync(0xffffffffu, dscale, k);
+      const float dm = __shfl_sync(0xffffffffu, dmn, k);
+      sum += (ds * nib - dm) * xb[i];
     }
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
