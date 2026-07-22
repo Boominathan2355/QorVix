@@ -124,6 +124,42 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
   if (lane == 0) out[row] = sum;
 }
 
+__global__ void qmatmulQ6_KKernel(float* __restrict__ out, const std::uint8_t* __restrict__ W,
+                                  const float* __restrict__ x, int rows, int cols) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  const int nSB = cols / kQKK;
+  const std::size_t rowBytes = static_cast<std::size_t>(nSB) * kQ6KBytes;
+  const std::uint8_t* rowPtr = W + static_cast<std::size_t>(row) * rowBytes;
+
+  float sum = 0.0f;
+  for (int sb = 0; sb < nSB; ++sb) {
+    const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ6KBytes;
+    const std::uint8_t* ql = blk;
+    const std::uint8_t* qh = blk + 128;
+    const signed char* sc = reinterpret_cast<const signed char*>(blk + 192);
+    const float d = __half2float(__ushort_as_half(blk[208] | (static_cast<unsigned short>(blk[209]) << 8)));
+    const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
+    for (int i = lane; i < kQKK; i += 32) {
+      const int half = i >> 7, p = i & 127, l = p & 31, quarter = p >> 5, is = l >> 4;
+      const std::uint8_t* qlh = ql + half * 64;
+      const std::uint8_t* qhh = qh + half * 32;
+      const signed char* sch = sc + half * 8;
+      int lo, hi;
+      if (quarter == 0) { lo = qlh[l] & 0xF;           hi = (qhh[l] >> 0) & 3; }
+      else if (quarter == 1) { lo = qlh[l + 32] & 0xF; hi = (qhh[l] >> 2) & 3; }
+      else if (quarter == 2) { lo = qlh[l] >> 4;       hi = (qhh[l] >> 4) & 3; }
+      else { lo = qlh[l + 32] >> 4;                    hi = (qhh[l] >> 6) & 3; }
+      const int q = (lo | (hi << 4)) - 32;
+      sum += d * static_cast<float>(sch[is + quarter * 2]) * q * xb[i];
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+  if (lane == 0) out[row] = sum;
+}
+
 // ---- forward-pass elementwise / norm kernels (building blocks for on-GPU inference) --------
 // These match the CPU reference ops (runtime/ops.cpp) so the GPU forward pass reproduces the
 // validated math. Each is verified against a host reference in opsSelfTest().
@@ -585,6 +621,82 @@ SelfTestResult qmatmulQ4_KSelfTest() {
   const bool ok = maxErr / maxRef < 1e-3f;
   return {true, ok,
           (ok ? "GPU Q4_K matmul matches host reference (rel err " : "Q4_K disagrees with CPU (rel err ") +
+              std::to_string(maxErr / maxRef) + ")"};
+}
+
+SelfTestResult qmatmulQ6_KSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  auto encodeHalf = [](float f) {
+    __half h = __float2half(f);
+    unsigned short b;
+    std::memcpy(&b, &h, 2);
+    return b;
+  };
+  auto decodeHalf = [](unsigned short b) {
+    __half h;
+    std::memcpy(&h, &b, 2);
+    return __half2float(h);
+  };
+
+  const int rows = 32, cols = kQKK;
+  std::vector<std::uint8_t> W(static_cast<std::size_t>(rows) * kQ6KBytes);
+  std::vector<float> x(cols), ref(rows, 0.0f), gpu(rows, 0.0f);
+  for (int i = 0; i < cols; ++i) x[i] = 0.02f * ((i % 9) - 4);
+
+  for (int r = 0; r < rows; ++r) {
+    std::uint8_t* blk = W.data() + static_cast<std::size_t>(r) * kQ6KBytes;
+    for (int i = 0; i < 128; ++i) blk[i] = static_cast<std::uint8_t>((r + i) & 0xFF);        // ql
+    for (int i = 0; i < 64; ++i) blk[128 + i] = static_cast<std::uint8_t>((r * 2 + i) & 0xFF); // qh
+    for (int i = 0; i < 16; ++i) blk[192 + i] = static_cast<std::uint8_t>((r + i) % 9 - 4);    // int8 scales
+    const unsigned short dh = encodeHalf(0.01f * (r % 4 + 1));
+    blk[208] = dh & 0xFF; blk[209] = dh >> 8;
+
+    const std::uint8_t* ql = blk;
+    const std::uint8_t* qh = blk + 128;
+    const signed char* sc = reinterpret_cast<const signed char*>(blk + 192);
+    const float d = decodeHalf(dh);
+    double acc = 0.0;
+    for (int i = 0; i < kQKK; ++i) {
+      const int half = i >> 7, p = i & 127, l = p & 31, quarter = p >> 5, is = l >> 4;
+      const std::uint8_t* qlh = ql + half * 64;
+      const std::uint8_t* qhh = qh + half * 32;
+      const signed char* sch = sc + half * 8;
+      int lo, hi;
+      if (quarter == 0) { lo = qlh[l] & 0xF; hi = (qhh[l] >> 0) & 3; }
+      else if (quarter == 1) { lo = qlh[l + 32] & 0xF; hi = (qhh[l] >> 2) & 3; }
+      else if (quarter == 2) { lo = qlh[l] >> 4; hi = (qhh[l] >> 4) & 3; }
+      else { lo = qlh[l + 32] >> 4; hi = (qhh[l] >> 6) & 3; }
+      const int q = (lo | (hi << 4)) - 32;
+      acc += static_cast<double>(d) * sch[is + quarter * 2] * q * x[i];
+    }
+    ref[r] = static_cast<float>(acc);
+  }
+
+  std::uint8_t* dW = nullptr;
+  float *dX = nullptr, *dOut = nullptr;
+  cudaMalloc(&dW, W.size());
+  cudaMalloc(&dX, cols * sizeof(float));
+  cudaMalloc(&dOut, rows * sizeof(float));
+  cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dX, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice);
+  qmatmulQ6_KKernel<<<qmatmulGridBlocks(rows), kWarpsPerBlock * 32>>>(dOut, dW, dX, rows, cols);
+  cudaError_t e = cudaGetLastError();
+  if (e == cudaSuccess) e = cudaDeviceSynchronize();
+  cudaMemcpy(gpu.data(), dOut, rows * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaFree(dW);
+  cudaFree(dX);
+  cudaFree(dOut);
+  if (e != cudaSuccess) return {true, false, "Q6_K kernel launch: " + cudaErr(e)};
+
+  float maxErr = 0.0f, maxRef = 1e-6f;
+  for (int r = 0; r < rows; ++r) {
+    maxErr = std::max(maxErr, std::fabs(gpu[r] - ref[r]));
+    maxRef = std::max(maxRef, std::fabs(ref[r]));
+  }
+  const bool ok = maxErr / maxRef < 1e-3f;
+  return {true, ok,
+          (ok ? "GPU Q6_K matmul matches host reference (rel err " : "Q6_K disagrees with CPU (rel err ") +
               std::to_string(maxErr / maxRef) + ")"};
 }
 

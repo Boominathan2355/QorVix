@@ -25,6 +25,9 @@ SelfTestResult qmatmulSelfTest() {
 SelfTestResult qmatmulQ4_KSelfTest() {
   return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
 }
+SelfTestResult qmatmulQ6_KSelfTest() {
+  return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
+}
 SelfTestResult opsSelfTest() {
   return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
 }

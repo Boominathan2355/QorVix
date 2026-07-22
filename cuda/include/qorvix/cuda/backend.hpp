@@ -51,9 +51,10 @@ SelfTestResult gemmSelfTest();
 // host reference on a small matrix, then times a large one; message reports GFLOP/s and GB/s.
 SelfTestResult qmatmulSelfTest();
 
-// Native Q4_K matmul on the GPU (the dominant weight type in real GGUF models), checked against a
-// host reference. Q6_K and the rest of the K-quants follow the same pattern.
+// Native Q4_K / Q6_K matmul on the GPU (the weight types real GGUF models use), each checked
+// against a host reference.
 SelfTestResult qmatmulQ4_KSelfTest();
+SelfTestResult qmatmulQ6_KSelfTest();
 
 // GPU forward-pass building blocks (RMSNorm, RoPE, SwiGLU, residual add) checked against a CPU
 // reference — the elementwise/norm ops the on-GPU forward pass is assembled from.
