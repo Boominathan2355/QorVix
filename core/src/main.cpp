@@ -454,6 +454,9 @@ int cmdGpu() {
   const auto qmm = qorvix::cuda::qmatmulSelfTest();
   std::cout << "Self-test (Q8_0 matmul):  " << (qmm.passed ? "PASS" : (qmm.ran ? "FAIL" : "skip"))
             << " - " << qmm.message << "\n";
+  const auto q4k = qorvix::cuda::qmatmulQ4_KSelfTest();
+  std::cout << "Self-test (Q4_K matmul):  " << (q4k.passed ? "PASS" : (q4k.ran ? "FAIL" : "skip"))
+            << " - " << q4k.message << "\n";
   const auto ops = qorvix::cuda::opsSelfTest();
   std::cout << "Self-test (forward ops):  " << (ops.passed ? "PASS" : (ops.ran ? "FAIL" : "skip"))
             << " - " << ops.message << "\n";
@@ -464,7 +467,8 @@ int cmdGpu() {
   std::cout << "Self-test (GPU forward):  " << (fwd.passed ? "PASS" : (fwd.ran ? "FAIL" : "skip"))
             << " - " << fwd.message << "\n";
   return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ||
-                 (ops.ran && !ops.passed) || (attn.ran && !attn.passed) || (fwd.ran && !fwd.passed)
+                 (q4k.ran && !q4k.passed) || (ops.ran && !ops.passed) || (attn.ran && !attn.passed) ||
+                 (fwd.ran && !fwd.passed)
              ? 1
              : 0;
 }

@@ -73,6 +73,57 @@ __global__ void qmatmulQ8_0Kernel(float* __restrict__ out, const std::uint8_t* _
 // Launch geometry for the warp-per-row kernel.
 inline int qmatmulGridBlocks(int rows) { return (rows + kWarpsPerBlock - 1) / kWarpsPerBlock; }
 
+// ---- K-quant matmul kernels (Q4_K, Q6_K) — the types real GGUF models actually use -----------
+// Warp-per-row GEMV that dequantizes 256-element super-blocks on the fly, mirroring the CPU
+// dequant (runtime/dequant.cpp). Correctness-first (per-element dequant + warp reduce); the same
+// tuning that the Q8_0 kernel wants applies later.
+constexpr int kQKK = 256;      // K-quant super-block
+constexpr int kQ4KBytes = 144;  // Q4_K: d(2) + dmin(2) + scales[12] + qs[128]
+constexpr int kQ6KBytes = 210;  // Q6_K: ql[128] + qh[64] + scales[16] + d(2)
+
+// 6-bit (scale, min) unpack for sub-block j of a Q4_K/Q5_K scales array. Verbatim from ggml.
+__device__ inline void getScaleMinK4(int j, const unsigned char* q, unsigned char& d,
+                                     unsigned char& m) {
+  if (j < 4) {
+    d = q[j] & 63;
+    m = q[j + 4] & 63;
+  } else {
+    d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
+}
+
+__global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* __restrict__ W,
+                                  const float* __restrict__ x, int rows, int cols) {
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  const int nSB = cols / kQKK;
+  const std::size_t rowBytes = static_cast<std::size_t>(nSB) * kQ4KBytes;
+  const std::uint8_t* rowPtr = W + static_cast<std::size_t>(row) * rowBytes;
+
+  float sum = 0.0f;
+  for (int sb = 0; sb < nSB; ++sb) {
+    const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ4KBytes;
+    const float d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
+    const float dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
+    const std::uint8_t* scales = blk + 4;
+    const std::uint8_t* qs = blk + 16;
+    const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
+    for (int i = lane; i < kQKK; i += 32) {
+      const int s = i / 32, chunk = i / 64, local = i % 64;
+      const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
+      const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
+      unsigned char sc, m;
+      getScaleMinK4(s, scales, sc, m);
+      sum += (d * sc * nib - dmin * m) * xb[i];
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
+  if (lane == 0) out[row] = sum;
+}
+
 // ---- forward-pass elementwise / norm kernels (building blocks for on-GPU inference) --------
 // These match the CPU reference ops (runtime/ops.cpp) so the GPU forward pass reproduces the
 // validated math. Each is verified against a host reference in opsSelfTest().
@@ -455,6 +506,86 @@ SelfTestResult qmatmulSelfTest() {
 
   return {true, true, "GPU Q8_0 matmul matches host reference (max err " + std::to_string(maxErr) +
                           ")" + timing};
+}
+
+SelfTestResult qmatmulQ4_KSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  auto encodeHalf = [](float f) {
+    __half h = __float2half(f);
+    unsigned short b;
+    std::memcpy(&b, &h, 2);
+    return b;
+  };
+  auto decodeHalf = [](unsigned short b) {
+    __half h;
+    std::memcpy(&h, &b, 2);
+    return __half2float(h);
+  };
+  auto hostScaleMin = [](int j, const std::uint8_t* q, std::uint8_t& d, std::uint8_t& m) {
+    if (j < 4) {
+      d = q[j] & 63;
+      m = q[j + 4] & 63;
+    } else {
+      d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+      m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+  };
+
+  const int rows = 32, cols = kQKK;  // one super-block per row
+  std::vector<std::uint8_t> W(static_cast<std::size_t>(rows) * kQ4KBytes);
+  std::vector<float> x(cols), ref(rows, 0.0f), gpu(rows, 0.0f);
+  for (int i = 0; i < cols; ++i) x[i] = 0.02f * ((i % 9) - 4);
+
+  for (int r = 0; r < rows; ++r) {
+    std::uint8_t* blk = W.data() + static_cast<std::size_t>(r) * kQ4KBytes;
+    const unsigned short dh = encodeHalf(0.02f * (r % 5 + 1));
+    const unsigned short mh = encodeHalf(0.01f);
+    blk[0] = dh & 0xFF; blk[1] = dh >> 8;
+    blk[2] = mh & 0xFF; blk[3] = mh >> 8;
+    for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<std::uint8_t>((r * 3 + i * 5) & 0x3F);
+    for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<std::uint8_t>((r + i) & 0xFF);
+
+    const float d = decodeHalf(dh), dmin = decodeHalf(mh);
+    const std::uint8_t* scales = blk + 4;
+    const std::uint8_t* qs = blk + 16;
+    double acc = 0.0;
+    for (int i = 0; i < kQKK; ++i) {
+      const int s = i / 32, chunk = i / 64, local = i % 64;
+      const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
+      const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
+      std::uint8_t sc, m;
+      hostScaleMin(s, scales, sc, m);
+      acc += (static_cast<double>(d) * sc * nib - static_cast<double>(dmin) * m) * x[i];
+    }
+    ref[r] = static_cast<float>(acc);
+  }
+
+  std::uint8_t* dW = nullptr;
+  float *dX = nullptr, *dOut = nullptr;
+  cudaMalloc(&dW, W.size());
+  cudaMalloc(&dX, cols * sizeof(float));
+  cudaMalloc(&dOut, rows * sizeof(float));
+  cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dX, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice);
+  qmatmulQ4_KKernel<<<qmatmulGridBlocks(rows), kWarpsPerBlock * 32>>>(dOut, dW, dX, rows, cols);
+  cudaError_t e = cudaGetLastError();
+  if (e == cudaSuccess) e = cudaDeviceSynchronize();
+  cudaMemcpy(gpu.data(), dOut, rows * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaFree(dW);
+  cudaFree(dX);
+  cudaFree(dOut);
+  if (e != cudaSuccess) return {true, false, "Q4_K kernel launch: " + cudaErr(e)};
+
+  float maxErr = 0.0f, maxRef = 1e-6f;
+  for (int r = 0; r < rows; ++r) {
+    maxErr = std::max(maxErr, std::fabs(gpu[r] - ref[r]));
+    maxRef = std::max(maxRef, std::fabs(ref[r]));
+  }
+  const bool ok = maxErr / maxRef < 1e-3f;
+  return {true, ok,
+          (ok ? "GPU Q4_K matmul matches host reference (rel err " : "Q4_K disagrees with CPU (rel err ") +
+              std::to_string(maxErr / maxRef) + ")"};
 }
 
 SelfTestResult opsSelfTest() {
