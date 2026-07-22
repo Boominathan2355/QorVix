@@ -1,5 +1,6 @@
 #include "qorvix/runtime/text_model.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 
@@ -16,20 +17,22 @@ memory::KvCacheConfig kvConfig(const ModelConfig& c) {
                                kKvTokensPerPage};
 }
 
-// Pool sized to hold one sequence of maxSeq tokens across all layers.
-std::size_t kvPoolBytes(const ModelConfig& c, std::uint32_t maxSeq) {
+// Pool sized to hold `maxSessions` sequences of maxSeq tokens across all layers.
+std::size_t kvPoolBytes(const ModelConfig& c, std::uint32_t maxSeq, std::uint32_t maxSessions) {
   const std::size_t pagesPerLayer = (maxSeq + kKvTokensPerPage - 1) / kKvTokensPerPage;
-  const std::size_t pages = static_cast<std::size_t>(c.blockCount) * pagesPerLayer;
+  const std::size_t pages =
+      static_cast<std::size_t>(c.blockCount) * pagesPerLayer * std::max<std::uint32_t>(1, maxSessions);
   const std::size_t pageFloats = static_cast<std::size_t>(kKvTokensPerPage) * c.kvDim() * 2;
   return pages * pageFloats * sizeof(float);
 }
 }  // namespace
 
-TextModel::TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLen)
+TextModel::TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLen,
+                     std::uint32_t maxSessions)
     : cfg_(std::move(config)),
       w_(std::move(weights)),
       maxSeq_(maxSeqLen),
-      kv_(kvConfig(cfg_), kvPoolBytes(cfg_, maxSeqLen)) {
+      kv_(kvConfig(cfg_), kvPoolBytes(cfg_, maxSeqLen, maxSessions)) {
   const std::size_t d = cfg_.embeddingLength;
   const std::size_t kv = cfg_.kvDim();
   const std::size_t ffn = cfg_.feedForwardLength;
@@ -50,20 +53,20 @@ TextModel::TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLe
 }
 
 std::optional<TextModel> TextModel::fromGguf(gguf::GgufFile file, std::string& error,
-                                            std::uint32_t maxSeqLen) {
+                                            std::uint32_t maxSeqLen, std::uint32_t maxSessions) {
   ModelConfig cfg = configFromGguf(file, error);
   if (!cfg.valid()) return std::nullopt;
   auto weights = loadWeights(file, cfg, error);  // borrows pointers into file's mmap
   if (!weights) return std::nullopt;
 
-  TextModel model(std::move(cfg), std::move(*weights), maxSeqLen);
+  TextModel model(std::move(cfg), std::move(*weights), maxSeqLen, maxSessions);
   // Take ownership of the file so the mmap (and the borrowed weight pointers) outlive this call.
   // Moving GgufFile transfers the same mapping address, so the borrowed pointers stay valid.
   model.file_ = std::make_unique<gguf::GgufFile>(std::move(file));
   return model;
 }
 
-void TextModel::attention(const LayerWeights& L, int layer, int pos) {
+void TextModel::attention(memory::SessionId session, const LayerWeights& L, int layer, int pos) {
   const int headDim = static_cast<int>(cfg_.headDim());
   const int nHeads = static_cast<int>(cfg_.headCount);
   const int nKv = static_cast<int>(cfg_.headCountKv);
@@ -72,8 +75,8 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
   const float invSqrt = 1.0f / std::sqrt(static_cast<float>(headDim));
 
   // Store the freshly projected K/V for this position into the paged cache.
-  float* kRow = kv_.kSlot(session_, layer, pos);
-  float* vRow = kv_.vSlot(session_, layer, pos);
+  float* kRow = kv_.kSlot(session, layer, pos);
+  float* vRow = kv_.vSlot(session, layer, pos);
   for (int i = 0; i < kvDim; ++i) {
     kRow[i] = k_[i];
     vRow[i] = v_[i];
@@ -86,7 +89,7 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
     const std::size_t headOff = static_cast<std::size_t>(kvHead) * headDim;
 
     for (int t = 0; t <= pos; ++t) {
-      const float* kt = kv_.kSlot(session_, layer, t) + headOff;
+      const float* kt = kv_.kSlot(session, layer, t) + headOff;
       float dot = 0.0f;
       for (int d = 0; d < headDim; ++d) dot += qh[d] * kt[d];
       scores[t] = dot * invSqrt;
@@ -96,20 +99,20 @@ void TextModel::attention(const LayerWeights& L, int layer, int pos) {
     float* outH = attn_.data() + static_cast<std::size_t>(h) * headDim;
     for (int d = 0; d < headDim; ++d) outH[d] = 0.0f;
     for (int t = 0; t <= pos; ++t) {
-      const float* vt = kv_.vSlot(session_, layer, t) + headOff;
+      const float* vt = kv_.vSlot(session, layer, t) + headOff;
       const float s = scores[t];
       for (int d = 0; d < headDim; ++d) outH[d] += s * vt[d];
     }
   }
 }
 
-const std::vector<float>& TextModel::forward(int token, int pos) {
+const std::vector<float>& TextModel::forward(memory::SessionId session, int token, int pos) {
   const int d = static_cast<int>(cfg_.embeddingLength);
   const int headDim = static_cast<int>(cfg_.headDim());
 
   // Grow the paged KV cache so slot `pos` exists in every layer (normally appends one token).
-  while (kv_.length(session_) <= pos) {
-    if (!kv_.appendToken(session_)) break;  // pool exhausted; attention will clamp to what exists
+  while (kv_.length(session) <= pos) {
+    if (!kv_.appendToken(session)) break;  // pool exhausted; attention will clamp to what exists
   }
 
   // Embedding lookup (dequantizes one row when the table is quantized).
@@ -129,7 +132,7 @@ const std::vector<float>& TextModel::forward(int token, int pos) {
     ops::rope(k_.data(), static_cast<int>(cfg_.headCountKv), headDim, pos, cfg_.ropeFreqBase,
               cfg_.ropeMode);
 
-    attention(L, static_cast<int>(layer), pos);
+    attention(session, L, static_cast<int>(layer), pos);
 
     wmatmul(tmpDModel_.data(), L.wo, attn_.data());
     ops::add(x_.data(), tmpDModel_.data(), d);

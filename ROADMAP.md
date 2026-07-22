@@ -174,9 +174,19 @@ boundaries and fails cleanly when the pool is exhausted; `reset` frees pages but
 Wired into `TextModel` (one session sized to maxSeq): TinyLlama output is byte-identical to the old
 contiguous cache, and the in-memory F32 forward tests still pass.
 
-**Remaining:** the scheduler — request queue + prioritization, session lifecycle, continuous
-batching (requests join/leave a running decode set), GPU/memory/model-aware admission. Plus KV
-compression / cross-session prefix reuse / sliding-window pruning on the cache itself.
+**Part 2 ✅ — scheduler + continuous batching:** `TextModel` now supports many concurrent sessions
+(`openSession`/`forward(session,…)`; KV pool sized for `maxSessions`). The `scheduler` module adds a
+priority request queue, admission up to `maxConcurrent` (each request gets a session and is
+prefilled), and a `step()` loop that decodes one token per active request per round — finished ones
+free their session so waiting requests are admitted mid-flight (continuous batching: the running set
+isn't drained between requests). Streaming per-token callbacks, per-request sampling/params.
+Verified on synthetic models: isolated correct output across concurrent requests, batching 5
+requests through 2 slots, priority ordering, streaming. TinyLlama single-sequence output unchanged.
+
+**Remaining:** each round still runs per-session forwards sequentially — fusing them into one
+batched matmul is a GPU optimization (Phase 8). Plus GPU/memory-aware admission, and KV
+compression / cross-session prefix reuse / sliding-window pruning on the cache. The scheduler is a
+library; exposing it over HTTP is Phase 9.
 
 ## Phase 8 — CUDA Performance Pass
 FlashAttention 3, CUDA Graphs, CUTLASS kernels, tensor core paths, kernel fusion, persistent

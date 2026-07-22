@@ -18,30 +18,39 @@ namespace qorvix::runtime {
 class TextModel {
  public:
   // In-memory construction (tests / synthetic models). Weights may be owned-F32 WeightMats.
-  TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLen = 4096);
+  // The KV pool is sized to hold `maxSessions` concurrent sequences of up to `maxSeqLen` tokens.
+  TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLen = 4096,
+            std::uint32_t maxSessions = 1);
 
   // Builds from an opened GGUF file, taking ownership of it so the mmap stays alive for the
   // borrowed quantized weights. Returns nullopt with `error` set on failure.
   static std::optional<TextModel> fromGguf(gguf::GgufFile file, std::string& error,
-                                           std::uint32_t maxSeqLen = 4096);
+                                           std::uint32_t maxSeqLen = 4096,
+                                           std::uint32_t maxSessions = 1);
 
   const ModelConfig& config() const noexcept { return cfg_; }
   std::uint32_t maxSeqLen() const noexcept { return maxSeq_; }
 
-  // Clears the KV cache (start a fresh sequence).
-  void reset() { kv_.reset(session_); }
+  // --- multi-session API (the scheduler drives many sessions against the shared KV pool) ---
+  memory::SessionId openSession() { return kv_.open(); }
+  void closeSession(memory::SessionId s) { kv_.close(s); }
+  void resetSession(memory::SessionId s) { kv_.reset(s); }
+  int sessionLength(memory::SessionId s) const { return kv_.length(s); }
 
-  // Runs the transformer for `token` at absolute position `pos` (0-based), updating the KV cache,
-  // and returns logits over the vocabulary ([vocabSize]). `pos` must equal the number of tokens
-  // already cached (sequential decode) and be < maxSeqLen.
-  const std::vector<float>& forward(int token, int pos);
+  // Runs the transformer for `token` at position `pos` of `session`, updating that session's KV
+  // cache, and returns logits ([vocabSize]). `pos` must equal the session's current length.
+  const std::vector<float>& forward(memory::SessionId session, int token, int pos);
+
+  // --- single-sequence convenience (uses a default session opened at construction) ---
+  void reset() { kv_.reset(session_); }
+  const std::vector<float>& forward(int token, int pos) { return forward(session_, token, pos); }
 
   // Feeds `prompt` (positions 0..N-1) then greedily appends up to `maxNew` argmax tokens.
   // Returns only the generated tokens. Resets the KV cache first.
   std::vector<int> generateGreedy(const std::vector<int>& prompt, int maxNew);
 
  private:
-  void attention(const LayerWeights& L, int layer, int pos);
+  void attention(memory::SessionId session, const LayerWeights& L, int layer, int pos);
 
   ModelConfig cfg_;
   Weights w_;
