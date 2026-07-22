@@ -31,6 +31,7 @@ add_subdirectory(cuda)
 add_subdirectory(tokenizer)
 add_subdirectory(runtime)
 add_subdirectory(scheduler)
+add_subdirectory(api)
 add_subdirectory(core)
 add_subdirectory(plugins)
 

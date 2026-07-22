@@ -20,10 +20,12 @@ if(Catch2_FOUND)
     sampler_test.cpp
     generator_test.cpp
     scheduler_test.cpp
+    json_test.cpp
+    openai_test.cpp
   )
   target_link_libraries(qorvix_tests PRIVATE
     qorvix_core qorvix_gguf qorvix_memory qorvix_cuda qorvix_runtime qorvix_tokenizer
-    qorvix_scheduler Catch2::Catch2WithMain)
+    qorvix_scheduler qorvix_api Catch2::Catch2WithMain)
 
   # The plugin test dlopen's the real example plugin; hand it the built library path and make
   # sure that library is built before the tests run.

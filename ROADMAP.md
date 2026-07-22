@@ -192,9 +192,23 @@ library; exposing it over HTTP is Phase 9.
 FlashAttention 3, CUDA Graphs, CUTLASS kernels, tensor core paths, kernel fusion, persistent
 kernels. Benchmark against Phase 5 baseline before/after each optimization.
 
-## Phase 9 — API Layer
-OpenAI-compatible REST endpoints, WebSocket + SSE streaming, API gateway in front of the
-scheduler.
+## Phase 9 — API Layer 🚧
+**Part a ✅ — OpenAI protocol layer (`api` module, zero external deps → builds in every preset):**
+- A small in-tree JSON library (standard-conforming parser + serializer; order-preserving objects,
+  string escapes incl. `\uXXXX` and surrogate pairs) — no vcpkg/third-party JSON needed.
+- OpenAI schema mapping: parse `/v1/chat/completions` and `/v1/completions` requests (model,
+  messages/prompt, stream, and sampling: max_tokens/temperature/top_p/top_k/min_p/penalties/seed/
+  stop); build `/v1/models`, chat/text completion objects, streaming chunks, error objects, and SSE
+  framing (`data: …\n\n`, `[DONE]`).
+- Verified locally (standalone harness + Catch2): parsing, escaping, malformed-input rejection,
+  request→struct, response/chunk shapes, SSE.
+
+**Part b (next):** the HTTP transport — a from-scratch HTTP/1.1 server (cross-platform sockets,
+keeps the "build from scratch" mission and stays vcpkg-free) wired to the scheduler, plus a
+`qorvix serve --model <file>` CLI. Verify by curling `/v1/models` and streaming/non-streaming
+`/v1/chat/completions` against TinyLlama. (Boost.Beast remains an option for production hardening.)
+WebSocket streaming and the multimodal endpoints (embeddings/audio/images) follow their backends
+in Phases 11+.
 
 ## Phase 10 — Multi-GPU
 NCCL-based tensor parallelism, pipeline parallelism, expert parallelism, load balancing across
