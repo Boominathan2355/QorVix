@@ -35,29 +35,10 @@ export CC=gcc-12 CXX=g++-12
 echo "cmake: $(cmake --version | head -1)"
 
 # --- 3. Get the source ----------------------------------------------------------------------
-# The repo is PRIVATE. Provide a GitHub token (fine-grained, read-only, scoped to QorVix) via the
-# GH_TOKEN env var, e.g. in a Colab cell before this one:
-#     import os; os.environ['GH_TOKEN'] = 'github_pat_...'
-# If the source is already checked out at ${SRC} (e.g. you cloned it yourself), it is reused.
 SRC=/content/qorvix
-if [ -d "${SRC}/.git" ]; then
-  echo "---- reusing existing source at ${SRC} (git pull) ----"
-  git -C "${SRC}" pull --ff-only || true
-elif [ -n "${GH_TOKEN:-}" ]; then
-  echo "---- cloning Qorvix into ${SRC} (authenticated) ----"
-  rm -rf "${SRC}"
-  git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/Boominathan2355/QorVix.git" "${SRC}"
-else
-  echo "---- cloning Qorvix into ${SRC} ----"
-  rm -rf "${SRC}"
-  if ! git clone --depth 1 https://github.com/Boominathan2355/QorVix.git "${SRC}"; then
-    echo "ERROR: clone failed. QorVix is a PRIVATE repo — set a GitHub token first."
-    echo "  In a Colab cell BEFORE this one:"
-    echo "      import os; os.environ['GH_TOKEN'] = 'github_pat_...'"
-    echo "  Use a fine-grained PAT with read-only 'Contents' permission, scoped to QorVix only."
-    exit 1
-  fi
-fi
+echo "---- cloning Qorvix into ${SRC} ----"
+rm -rf "${SRC}"
+git clone --depth 1 https://github.com/Boominathan2355/QorVix.git "${SRC}"
 cd "${SRC}"
 
 # --- 4. Configure + build (CUDA on; no vcpkg / no tests needed for the GPU self-test) --------

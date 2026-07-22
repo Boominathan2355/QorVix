@@ -9,29 +9,15 @@ CUDA runs only on NVIDIA GPUs. In Colab: **Runtime → Change runtime type → H
 T4 GPU** (or any GPU). A **TPU** runtime cannot run CUDA (no `nvcc`, no cuBLAS) and the script will
 stop with an error.
 
-## ⚠️ Private repo — you need a GitHub token
-
-QorVix is a **private** repository, so the old public `curl … | bash` one-liner (and any anonymous
-`git clone`) now returns 404. Create a **fine-grained personal access token** with read-only
-**Contents** permission scoped to the `QorVix` repo only
-(GitHub → Settings → Developer settings → Fine-grained tokens), then use it below. Do **not** paste
-the token into a file that gets committed; keep it in the Colab cell.
-
 ## Run it (one cell)
 
 ```python
-import os
-os.environ['GH_TOKEN'] = 'github_pat_...'   # fine-grained, read-only Contents, QorVix only
-
-# Authenticated shallow clone, then run the build+test script (it reuses this checkout).
-!git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/Boominathan2355/QorVix.git" /content/qorvix
-!bash /content/qorvix/scripts/colab_cuda_test.sh
+!curl -fsSL https://raw.githubusercontent.com/Boominathan2355/QorVix/main/scripts/colab_cuda_test.sh | bash
 ```
 
-The script: checks for an NVIDIA GPU, installs `ninja`/`gcc-12`, reuses (or authenticated-clones)
-the repo, configures with `-DQORVIX_ENABLE_CUDA=ON` (no vcpkg — the CUDA executable needs only
-`nvcc` + a C++23 host compiler), builds, and runs `qorvix gpu`. `GH_TOKEN` set in the cell is also
-picked up by the script, so a fresh runtime works without the explicit `git clone` line too.
+The script: checks for an NVIDIA GPU, installs `ninja`/`gcc-12`, clones the repo, configures with
+`-DQORVIX_ENABLE_CUDA=ON` (no vcpkg — the CUDA executable needs only `nvcc` + a C++23 host
+compiler), builds, and runs `qorvix gpu`.
 
 ## What it verifies
 
