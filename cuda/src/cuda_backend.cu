@@ -126,6 +126,41 @@ __global__ void addKernel(float* __restrict__ out, const float* __restrict__ x, 
   if (i < n) out[i] += x[i];
 }
 
+// F32 GEMV: out[r] = dot(W[r,:], x). One block per row, block-reduce. Used by the forward driver
+// for its (F32) weights; quantized weights use qmatmulQ8_0Kernel.
+__global__ void matmulF32Kernel(float* __restrict__ out, const float* __restrict__ W,
+                                const float* __restrict__ x, int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const float* r = W + static_cast<std::size_t>(row) * cols;
+  float partial = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) partial += r[c] * x[c];
+  __shared__ float sh[256];
+  sh[threadIdx.x] = partial;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[row] = sh[0];
+}
+
+// Copy one embedding row: dst[i] = table[token*d + i]. (A kernel keeps everything device-side.)
+__global__ void embedRowKernel(float* __restrict__ dst, const float* __restrict__ table, int token,
+                               int d) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < d) dst[i] = table[static_cast<std::size_t>(token) * d + i];
+}
+
+// Copy a kvDim vector into the KV cache slot for (layer, pos): cache[(layer*maxSeq+pos)*kvDim+i].
+__global__ void kvStoreKernel(float* __restrict__ cache, const float* __restrict__ src, int layer,
+                              int pos, int maxSeq, int kvDim) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < kvDim) {
+    cache[(static_cast<std::size_t>(layer) * maxSeq + pos) * kvDim + i] = src[i];
+  }
+}
+
 // Single-query (decode-step) attention with a cached K/V that live in VRAM. One block per query
 // head (blockDim == headDim); GQA maps query head h -> kv head h/(nHeads/nKv). Computes
 // softmax(qK^T / sqrt(headDim)) V over cached positions 0..seqLen-1. Correct-and-clear (per-t
@@ -591,6 +626,221 @@ SelfTestResult attentionSelfTest() {
   const bool ok = maxErr < 1e-3f;
   return {true, ok,
           (ok ? "GQA decode attention matches CPU (max err " : "attention disagrees with CPU (max err ") +
+              std::to_string(maxErr) + ")"};
+}
+
+SelfTestResult gpuForwardSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  // Tiny synthetic Llama-style model.
+  const int L = 2, d = 32, nHeads = 4, headDim = 8, nKv = 2, ffn = 64, vocab = 16, maxSeq = 8;
+  const int kvDim = nKv * headDim;           // 16
+  const int qDim = nHeads * headDim;         // 32 == d
+  const int group = nHeads / nKv;
+  const float eps = 1e-5f, freqBase = 10000.0f;
+
+  auto gen = [](int seed, int i) { return 0.01f * (((i * 7 + seed * 13) % 17) - 8); };
+
+  // Host weights (shared by the CPU reference and uploaded to the GPU).
+  std::vector<float> tokEmbd(vocab * d), outNorm(d, 1.0f), output(vocab * d);
+  for (int i = 0; i < vocab * d; ++i) tokEmbd[i] = gen(1, i);
+  for (int i = 0; i < vocab * d; ++i) output[i] = gen(2, i);
+  for (int i = 0; i < d; ++i) outNorm[i] = 1.0f + 0.01f * i;
+
+  struct Layer {
+    std::vector<float> attnNorm, wq, wk, wv, wo, ffnNorm, ffnGate, ffnUp, ffnDown;
+  };
+  std::vector<Layer> layers(L);
+  for (int l = 0; l < L; ++l) {
+    Layer& w = layers[l];
+    w.attnNorm.assign(d, 0.0f);
+    w.ffnNorm.assign(d, 0.0f);
+    for (int i = 0; i < d; ++i) {
+      w.attnNorm[i] = 1.0f + 0.01f * ((i + l) % 5);
+      w.ffnNorm[i] = 1.0f + 0.01f * ((i + l) % 3);
+    }
+    w.wq.resize(qDim * d);
+    w.wo.resize(d * qDim);
+    w.wk.resize(kvDim * d);
+    w.wv.resize(kvDim * d);
+    w.ffnGate.resize(ffn * d);
+    w.ffnUp.resize(ffn * d);
+    w.ffnDown.resize(d * ffn);
+    for (int i = 0; i < qDim * d; ++i) w.wq[i] = gen(10 + l, i);
+    for (int i = 0; i < d * qDim; ++i) w.wo[i] = gen(20 + l, i);
+    for (int i = 0; i < kvDim * d; ++i) w.wk[i] = gen(30 + l, i);
+    for (int i = 0; i < kvDim * d; ++i) w.wv[i] = gen(40 + l, i);
+    for (int i = 0; i < ffn * d; ++i) w.ffnGate[i] = gen(50 + l, i);
+    for (int i = 0; i < ffn * d; ++i) w.ffnUp[i] = gen(60 + l, i);
+    for (int i = 0; i < d * ffn; ++i) w.ffnDown[i] = gen(70 + l, i);
+  }
+
+  // ---- CPU reference forward (mirrors runtime/TextModel) ----
+  auto rms = [&](std::vector<float>& o, const std::vector<float>& x, const std::vector<float>& w, int n) {
+    double sq = 0.0;
+    for (int i = 0; i < n; ++i) sq += static_cast<double>(x[i]) * x[i];
+    const float sc = 1.0f / std::sqrt(static_cast<float>(sq / n) + eps);
+    for (int i = 0; i < n; ++i) o[i] = x[i] * sc * w[i];
+  };
+  auto mm = [&](std::vector<float>& o, const std::vector<float>& W, const std::vector<float>& x, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+      double a = 0.0;
+      for (int c = 0; c < cols; ++c) a += static_cast<double>(W[r * cols + c]) * x[c];
+      o[r] = static_cast<float>(a);
+    }
+  };
+  auto rope = [&](std::vector<float>& v, int nh, int pos) {
+    const int half = headDim / 2;
+    for (int h = 0; h < nh; ++h)
+      for (int i = 0; i < half; ++i) {
+        const float th = pos * std::pow(freqBase, -2.0f * i / headDim);
+        const float c = std::cos(th), s = std::sin(th);
+        const float a = v[h * headDim + i], b = v[h * headDim + i + half];
+        v[h * headDim + i] = a * c - b * s;
+        v[h * headDim + i + half] = a * s + b * c;
+      }
+  };
+  std::vector<float> hKc(static_cast<std::size_t>(L) * maxSeq * kvDim, 0.0f), hVc = hKc;
+  auto cpuForward = [&](int token, int pos, std::vector<float>& logits) {
+    std::vector<float> x(tokEmbd.begin() + token * d, tokEmbd.begin() + token * d + d);
+    std::vector<float> xn(d), q(qDim), k(kvDim), v(kvDim), attn(qDim), tmp(d), g(ffn), u(ffn), act(ffn);
+    for (int l = 0; l < L; ++l) {
+      Layer& w = layers[l];
+      rms(xn, x, w.attnNorm, d);
+      mm(q, w.wq, xn, qDim, d);
+      mm(k, w.wk, xn, kvDim, d);
+      mm(v, w.wv, xn, kvDim, d);
+      rope(q, nHeads, pos);
+      rope(k, nKv, pos);
+      for (int i = 0; i < kvDim; ++i) {
+        hKc[(static_cast<std::size_t>(l) * maxSeq + pos) * kvDim + i] = k[i];
+        hVc[(static_cast<std::size_t>(l) * maxSeq + pos) * kvDim + i] = v[i];
+      }
+      const float invSqrt = 1.0f / std::sqrt(static_cast<float>(headDim));
+      for (int h = 0; h < nHeads; ++h) {
+        const int kvHead = h / group;
+        std::vector<float> sc(pos + 1);
+        for (int t = 0; t <= pos; ++t) {
+          float dot = 0.0f;
+          for (int e = 0; e < headDim; ++e)
+            dot += q[h * headDim + e] * hKc[(static_cast<std::size_t>(l) * maxSeq + t) * kvDim + kvHead * headDim + e];
+          sc[t] = dot * invSqrt;
+        }
+        float mx = sc[0];
+        for (int t = 1; t <= pos; ++t) mx = std::max(mx, sc[t]);
+        float sum = 0.0f;
+        for (int t = 0; t <= pos; ++t) { sc[t] = std::exp(sc[t] - mx); sum += sc[t]; }
+        for (int e = 0; e < headDim; ++e) {
+          float a = 0.0f;
+          for (int t = 0; t <= pos; ++t)
+            a += (sc[t] / sum) * hVc[(static_cast<std::size_t>(l) * maxSeq + t) * kvDim + kvHead * headDim + e];
+          attn[h * headDim + e] = a;
+        }
+      }
+      mm(tmp, w.wo, attn, d, qDim);
+      for (int i = 0; i < d; ++i) x[i] += tmp[i];
+      rms(xn, x, w.ffnNorm, d);
+      mm(g, w.ffnGate, xn, ffn, d);
+      mm(u, w.ffnUp, xn, ffn, d);
+      for (int i = 0; i < ffn; ++i) act[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+      mm(tmp, w.ffnDown, act, d, ffn);
+      for (int i = 0; i < d; ++i) x[i] += tmp[i];
+    }
+    rms(xn, x, outNorm, d);
+    logits.resize(vocab);
+    mm(logits, output, xn, vocab, d);
+  };
+
+  // ---- GPU forward driver (weights + KV cache resident in VRAM) ----
+  auto up = [](const std::vector<float>& v) {
+    float* p = nullptr;
+    cudaMalloc(&p, v.size() * sizeof(float));
+    cudaMemcpy(p, v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice);
+    return p;
+  };
+  float* dTokEmbd = up(tokEmbd);
+  float* dOutNorm = up(outNorm);
+  float* dOutput = up(output);
+  std::vector<float*> dAttnNorm(L), dWq(L), dWk(L), dWv(L), dWo(L), dFfnNorm(L), dGate(L), dUp(L), dDown(L);
+  for (int l = 0; l < L; ++l) {
+    dAttnNorm[l] = up(layers[l].attnNorm);
+    dWq[l] = up(layers[l].wq);
+    dWk[l] = up(layers[l].wk);
+    dWv[l] = up(layers[l].wv);
+    dWo[l] = up(layers[l].wo);
+    dFfnNorm[l] = up(layers[l].ffnNorm);
+    dGate[l] = up(layers[l].ffnGate);
+    dUp[l] = up(layers[l].ffnUp);
+    dDown[l] = up(layers[l].ffnDown);
+  }
+  float *dx, *dxn, *dq, *dk, *dv, *dattn, *dtmp, *dg, *du, *dact, *dlogits, *dKc, *dVc;
+  cudaMalloc(&dx, d * sizeof(float));
+  cudaMalloc(&dxn, d * sizeof(float));
+  cudaMalloc(&dq, qDim * sizeof(float));
+  cudaMalloc(&dk, kvDim * sizeof(float));
+  cudaMalloc(&dv, kvDim * sizeof(float));
+  cudaMalloc(&dattn, qDim * sizeof(float));
+  cudaMalloc(&dtmp, d * sizeof(float));
+  cudaMalloc(&dg, ffn * sizeof(float));
+  cudaMalloc(&du, ffn * sizeof(float));
+  cudaMalloc(&dact, ffn * sizeof(float));
+  cudaMalloc(&dlogits, vocab * sizeof(float));
+  cudaMalloc(&dKc, static_cast<std::size_t>(L) * maxSeq * kvDim * sizeof(float));
+  cudaMalloc(&dVc, static_cast<std::size_t>(L) * maxSeq * kvDim * sizeof(float));
+
+  auto grid = [](int n) { return (n + 255) / 256; };
+  auto gpuForward = [&](int token, int pos, std::vector<float>& logits) {
+    embedRowKernel<<<grid(d), 256>>>(dx, dTokEmbd, token, d);
+    for (int l = 0; l < L; ++l) {
+      rmsnormKernel<<<1, 256>>>(dxn, dx, dAttnNorm[l], d, eps);
+      matmulF32Kernel<<<qDim, 256>>>(dq, dWq[l], dxn, qDim, d);
+      matmulF32Kernel<<<kvDim, 256>>>(dk, dWk[l], dxn, kvDim, d);
+      matmulF32Kernel<<<kvDim, 256>>>(dv, dWv[l], dxn, kvDim, d);
+      ropeNeoxKernel<<<grid(nHeads * headDim / 2), 256>>>(dq, nHeads, headDim, pos, freqBase);
+      ropeNeoxKernel<<<grid(nKv * headDim / 2), 256>>>(dk, nKv, headDim, pos, freqBase);
+      kvStoreKernel<<<grid(kvDim), 256>>>(dKc, dk, l, pos, maxSeq, kvDim);
+      kvStoreKernel<<<grid(kvDim), 256>>>(dVc, dv, l, pos, maxSeq, kvDim);
+      float* Kl = dKc + static_cast<std::size_t>(l) * maxSeq * kvDim;
+      float* Vl = dVc + static_cast<std::size_t>(l) * maxSeq * kvDim;
+      const std::size_t shBytes = (static_cast<std::size_t>(pos + 1) + headDim) * sizeof(float);
+      attentionDecodeKernel<<<nHeads, headDim, shBytes>>>(dattn, dq, Kl, Vl, nHeads, nKv, headDim, pos + 1, kvDim);
+      matmulF32Kernel<<<d, 256>>>(dtmp, dWo[l], dattn, d, qDim);
+      addKernel<<<grid(d), 256>>>(dx, dtmp, d);
+      rmsnormKernel<<<1, 256>>>(dxn, dx, dFfnNorm[l], d, eps);
+      matmulF32Kernel<<<ffn, 256>>>(dg, dGate[l], dxn, ffn, d);
+      matmulF32Kernel<<<ffn, 256>>>(du, dUp[l], dxn, ffn, d);
+      swigluKernel<<<grid(ffn), 256>>>(dact, dg, du, ffn);
+      matmulF32Kernel<<<d, 256>>>(dtmp, dDown[l], dact, d, ffn);
+      addKernel<<<grid(d), 256>>>(dx, dtmp, d);
+    }
+    rmsnormKernel<<<1, 256>>>(dxn, dx, dOutNorm, d, eps);
+    matmulF32Kernel<<<vocab, 256>>>(dlogits, dOutput, dxn, vocab, d);
+    logits.resize(vocab);
+    cudaMemcpy(logits.data(), dlogits, vocab * sizeof(float), cudaMemcpyDeviceToHost);
+  };
+
+  const int tokens[3] = {1, 5, 9};
+  float maxErr = 0.0f;
+  for (int pos = 0; pos < 3; ++pos) {
+    std::vector<float> cpuLogits, gpuLogits;
+    cpuForward(tokens[pos], pos, cpuLogits);
+    gpuForward(tokens[pos], pos, gpuLogits);
+    for (int i = 0; i < vocab; ++i) maxErr = std::max(maxErr, std::fabs(cpuLogits[i] - gpuLogits[i]));
+  }
+  const cudaError_t e = cudaDeviceSynchronize();
+
+  // Cleanup.
+  for (float* p : {dTokEmbd, dOutNorm, dOutput, dx, dxn, dq, dk, dv, dattn, dtmp, dg, du, dact, dlogits, dKc, dVc})
+    cudaFree(p);
+  for (int l = 0; l < L; ++l)
+    for (float* p : {dAttnNorm[l], dWq[l], dWk[l], dWv[l], dWo[l], dFfnNorm[l], dGate[l], dUp[l], dDown[l]})
+      cudaFree(p);
+
+  if (e != cudaSuccess) return {true, false, "GPU forward kernels: " + cudaErr(e)};
+  const bool ok = maxErr < 2e-2f;
+  return {true, ok,
+          (ok ? "GPU forward pass (2-layer, 3 positions) matches CPU reference (max err "
+              : "GPU forward disagrees with CPU (max err ") +
               std::to_string(maxErr) + ")"};
 }
 

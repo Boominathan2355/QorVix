@@ -28,6 +28,9 @@ SelfTestResult opsSelfTest() {
 SelfTestResult attentionSelfTest() {
   return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
 }
+SelfTestResult gpuForwardSelfTest() {
+  return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
+}
 
 std::unique_ptr<memory::ISlabAllocator> makeGpuSlabAllocator() { return nullptr; }
 std::unique_ptr<memory::ITransferEngine> makeCudaTransferEngine() { return nullptr; }

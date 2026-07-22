@@ -460,8 +460,11 @@ int cmdGpu() {
   const auto attn = qorvix::cuda::attentionSelfTest();
   std::cout << "Self-test (attention):    " << (attn.passed ? "PASS" : (attn.ran ? "FAIL" : "skip"))
             << " - " << attn.message << "\n";
+  const auto fwd = qorvix::cuda::gpuForwardSelfTest();
+  std::cout << "Self-test (GPU forward):  " << (fwd.passed ? "PASS" : (fwd.ran ? "FAIL" : "skip"))
+            << " - " << fwd.message << "\n";
   return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ||
-                 (ops.ran && !ops.passed) || (attn.ran && !attn.passed)
+                 (ops.ran && !ops.passed) || (attn.ran && !attn.passed) || (fwd.ran && !fwd.passed)
              ? 1
              : 0;
 }

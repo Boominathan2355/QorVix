@@ -58,4 +58,9 @@ SelfTestResult opsSelfTest();
 // Single-query GQA attention over a cached K/V in VRAM, checked against a CPU reference.
 SelfTestResult attentionSelfTest();
 
+// End-to-end: a tiny synthetic transformer's forward pass run entirely on the GPU (weights, hidden
+// state, and KV cache resident in VRAM, kernels chained per layer), compared against an inline CPU
+// reference over several positions. Proves the assembled on-GPU forward pass is correct.
+SelfTestResult gpuForwardSelfTest();
+
 }  // namespace qorvix::cuda
