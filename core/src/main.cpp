@@ -451,7 +451,11 @@ int cmdGpu() {
   const auto gemm = qorvix::cuda::gemmSelfTest();
   std::cout << "Self-test (cuBLAS GEMM):  " << (gemm.passed ? "PASS" : (gemm.ran ? "FAIL" : "skip"))
             << " - " << gemm.message << "\n";
-  return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) ? 1 : 0;
+  const auto qmm = qorvix::cuda::qmatmulSelfTest();
+  std::cout << "Self-test (Q8_0 matmul):  " << (qmm.passed ? "PASS" : (qmm.ran ? "FAIL" : "skip"))
+            << " - " << qmm.message << "\n";
+  return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ? 1
+                                                                                              : 0;
 }
 
 int printUsage() {

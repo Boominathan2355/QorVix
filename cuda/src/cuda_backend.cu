@@ -2,9 +2,13 @@
 // found (see cuda/CMakeLists.txt). The CPU stub (cuda_backend_stub.cpp) provides the same
 // symbols otherwise; the two are never compiled together.
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -24,6 +28,42 @@ std::string cudaErr(cudaError_t e) { return cudaGetErrorString(e); }
 __global__ void scaleKernel(float* data, float factor, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) data[i] = data[i] * factor;
+}
+
+// Native quantized GEMV: out[r] = dot(dequant(Q8_0 row r), x). One block per output row; threads
+// cooperatively dequantize the row's 32-element blocks (fp16 scale * int8 quants) straight into
+// the dot product — the weight stays Q8_0 in VRAM, never expanded to F32. This is the GPU form of
+// the CPU qmatmul; a first correct-and-decent kernel (block-reduce), not yet the tuned form.
+constexpr int kQ8Block = 32;
+constexpr int kQ8Bytes = 34;  // fp16 scale (2) + 32 int8
+
+__global__ void qmatmulQ8_0Kernel(float* __restrict__ out, const std::uint8_t* __restrict__ W,
+                                  const float* __restrict__ x, int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int nBlocks = cols / kQ8Block;
+  const std::size_t rowBytes = static_cast<std::size_t>(nBlocks) * kQ8Bytes;
+  const std::uint8_t* rowPtr = W + static_cast<std::size_t>(row) * rowBytes;
+
+  float partial = 0.0f;
+  for (int b = threadIdx.x; b < nBlocks; b += blockDim.x) {
+    const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(b) * kQ8Bytes;
+    const unsigned short hbits = blk[0] | (static_cast<unsigned short>(blk[1]) << 8);
+    const float d = __half2float(__ushort_as_half(hbits));
+    const signed char* qs = reinterpret_cast<const signed char*>(blk + 2);
+    const float* xb = x + static_cast<std::size_t>(b) * kQ8Block;
+#pragma unroll
+    for (int i = 0; i < kQ8Block; ++i) partial += d * static_cast<float>(qs[i]) * xb[i];
+  }
+
+  __shared__ float sh[256];
+  sh[threadIdx.x] = partial;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) out[row] = sh[0];
 }
 
 }  // namespace
@@ -149,6 +189,121 @@ SelfTestResult gemmSelfTest() {
     if (std::fabs(C[i] - B[i]) > 1e-3f) return {true, false, "GEMM result mismatch"};
   }
   return {true, true, "cuBLAS SGEMM (A=I) verified on a 4x4 matrix"};
+}
+
+SelfTestResult qmatmulSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  auto encodeHalf = [](float f) -> unsigned short {
+    __half h = __float2half(f);
+    unsigned short bits;
+    std::memcpy(&bits, &h, sizeof(bits));
+    return bits;
+  };
+  auto decodeHalf = [](unsigned short bits) -> float {
+    __half h;
+    std::memcpy(&h, &bits, sizeof(h));
+    return __half2float(h);
+  };
+
+  // ---- correctness on a small Q8_0 matrix vs a host reference ----
+  const int rows = 64, cols = 256;
+  const int nBlocks = cols / kQ8Block;
+  const std::size_t rowBytes = static_cast<std::size_t>(nBlocks) * kQ8Bytes;
+  std::vector<std::uint8_t> W(static_cast<std::size_t>(rows) * rowBytes, 0);
+  std::vector<float> x(cols), ref(rows, 0.0f), gpu(rows, 0.0f);
+
+  for (int i = 0; i < cols; ++i) x[i] = 0.1f * ((i % 5) - 2);
+  for (int r = 0; r < rows; ++r) {
+    double acc = 0.0;
+    for (int b = 0; b < nBlocks; ++b) {
+      std::uint8_t* blk = W.data() + static_cast<std::size_t>(r) * rowBytes + static_cast<std::size_t>(b) * kQ8Bytes;
+      const unsigned short hs = encodeHalf(0.02f * ((r % 7) + 1));
+      blk[0] = static_cast<std::uint8_t>(hs & 0xFF);
+      blk[1] = static_cast<std::uint8_t>(hs >> 8);
+      const float d = decodeHalf(hs);  // use the rounded scale so the reference matches the kernel
+      for (int i = 0; i < kQ8Block; ++i) {
+        const signed char q = static_cast<signed char>(((r + b + i) % 15) - 7);
+        blk[2 + i] = static_cast<std::uint8_t>(q);
+        acc += d * static_cast<float>(q) * x[b * kQ8Block + i];
+      }
+    }
+    ref[r] = static_cast<float>(acc);
+  }
+
+  std::uint8_t* dW = nullptr;
+  float* dX = nullptr;
+  float* dOut = nullptr;
+  if (cudaMalloc(&dW, W.size()) != cudaSuccess || cudaMalloc(&dX, cols * sizeof(float)) != cudaSuccess ||
+      cudaMalloc(&dOut, rows * sizeof(float)) != cudaSuccess) {
+    cudaFree(dW);
+    cudaFree(dX);
+    cudaFree(dOut);
+    return {true, false, "cudaMalloc failed for qmatmul operands"};
+  }
+  cudaMemcpy(dW, W.data(), W.size(), cudaMemcpyHostToDevice);
+  cudaMemcpy(dX, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice);
+
+  qmatmulQ8_0Kernel<<<rows, 256>>>(dOut, dW, dX, rows, cols);
+  cudaError_t e = cudaGetLastError();
+  if (e == cudaSuccess) e = cudaDeviceSynchronize();
+  if (e != cudaSuccess) {
+    cudaFree(dW);
+    cudaFree(dX);
+    cudaFree(dOut);
+    return {true, false, "qmatmul kernel launch: " + cudaErr(e)};
+  }
+  cudaMemcpy(gpu.data(), dOut, rows * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaFree(dW);
+  cudaFree(dX);
+  cudaFree(dOut);
+
+  float maxErr = 0.0f;
+  for (int r = 0; r < rows; ++r) maxErr = std::max(maxErr, std::fabs(gpu[r] - ref[r]));
+  if (maxErr > 1e-2f) {
+    return {true, false, "GPU qmatmul disagrees with host reference (max err " +
+                             std::to_string(maxErr) + ")"};
+  }
+
+  // ---- throughput on a large Q8_0 matrix (content irrelevant here) ----
+  const int R = 4096, C = 4096;
+  const std::size_t bigRowBytes = static_cast<std::size_t>(C / kQ8Block) * kQ8Bytes;
+  const std::size_t bigW = static_cast<std::size_t>(R) * bigRowBytes;
+  std::uint8_t* dbW = nullptr;
+  float *dbX = nullptr, *dbOut = nullptr;
+  std::string timing;
+  if (cudaMalloc(&dbW, bigW) == cudaSuccess && cudaMalloc(&dbX, C * sizeof(float)) == cudaSuccess &&
+      cudaMalloc(&dbOut, R * sizeof(float)) == cudaSuccess) {
+    cudaMemset(dbW, 1, bigW);
+    cudaMemset(dbX, 0, C * sizeof(float));
+    qmatmulQ8_0Kernel<<<R, 256>>>(dbOut, dbW, dbX, R, C);  // warm up
+    cudaDeviceSynchronize();
+
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    const int iters = 50;
+    cudaEventRecord(t0);
+    for (int it = 0; it < iters; ++it) qmatmulQ8_0Kernel<<<R, 256>>>(dbOut, dbW, dbX, R, C);
+    cudaEventRecord(t1);
+    cudaEventSynchronize(t1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, t0, t1);
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    const double sec = ms / 1000.0;
+    const double gflops = 2.0 * R * C * iters / sec / 1e9;
+    const double gbps = static_cast<double>(bigW) * iters / sec / 1e9;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "; %dx%d Q8_0 GEMV: %.0f GFLOP/s, %.0f GB/s", R, C, gflops, gbps);
+    timing = buf;
+  }
+  cudaFree(dbW);
+  cudaFree(dbX);
+  cudaFree(dbOut);
+
+  return {true, true, "GPU Q8_0 matmul matches host reference (max err " + std::to_string(maxErr) +
+                          ")" + timing};
 }
 
 // ---- memory integration --------------------------------------------------------------------

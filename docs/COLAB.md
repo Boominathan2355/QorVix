@@ -25,7 +25,10 @@ compiler), builds, and runs `qorvix gpu`.
 - CUDA build status and **device enumeration** (name, compute capability, SM count, free/total VRAM),
 - a **scale-kernel self-test** — host→device copy, a custom CUDA kernel launch, device→host copy,
   result checked on the host,
-- a **cuBLAS SGEMM self-test** — `C = A·B` with `A` an identity, verified on the host.
+- a **cuBLAS SGEMM self-test** — `C = A·B` with `A` an identity, verified on the host,
+- a **native Q8_0 matmul self-test** (Phase 8) — a GPU GEMV that dequantizes Q8_0 weights in
+  registers, checked against a host reference, then timed on a 4096×4096 matrix (reports GFLOP/s
+  and GB/s — compare the GB/s to the CPU runtime's ~3.7 GB/s).
 
 Exit code is nonzero if any self-test fails. Copy the output back here.
 

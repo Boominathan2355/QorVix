@@ -188,9 +188,21 @@ batched matmul is a GPU optimization (Phase 8). Plus GPU/memory-aware admission,
 compression / cross-session prefix reuse / sliding-window pruning on the cache. The scheduler is a
 library; exposing it over HTTP is Phase 9.
 
-## Phase 8 — CUDA Performance Pass
-FlashAttention 3, CUDA Graphs, CUTLASS kernels, tensor core paths, kernel fusion, persistent
-kernels. Benchmark against Phase 5 baseline before/after each optimization.
+## Phase 8 — CUDA Performance Pass / GPU inference 🚧
+Moving the validated CPU forward pass onto the GPU, one kernel at a time, each verified on the T4
+(via Colab) against the CPU reference — the discipline that got the CPU runtime correct.
+
+**Part a ✅ — native quantized matmul kernel:** `qmatmulQ8_0Kernel` — a block-per-row GEMV that
+dequantizes Q8_0 blocks (fp16 scale × int8) straight into the dot product, keeping the weight
+quantized in VRAM (the GPU form of the CPU `qmatmul`). A `qmatmulSelfTest` checks it against a host
+reference and times a 4096×4096 GEMV (reports GFLOP/s + GB/s), surfaced via `qorvix gpu`.
+Compile-verified under nvcc in Docker (96/96 tests pass in-container); execution-verified on a T4
+via the Colab notebook.
+
+**Remaining:** GPU kernels for the rest of the forward pass (rmsnorm, RoPE, attention/FlashAttention,
+SwiGLU, elementwise) + K-quant matmuls, a resident-on-GPU forward loop (weights + KV in VRAM, no
+per-op transfers) so `generate` runs on the GPU, then the tuned kernels (warp/tensor-core GEMV,
+CUDA graphs, kernel fusion, cuBLAS/CUTLASS). Benchmark each against the CPU baseline.
 
 ## Phase 9 — API Layer 🚧
 **Part a ✅ — OpenAI protocol layer (`api` module, zero external deps → builds in every preset):**

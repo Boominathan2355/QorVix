@@ -46,4 +46,9 @@ SelfTestResult selfTest();
 // One GEMM via cuBLAS (C = A*B with A = identity, so C must equal B), verified on the host.
 SelfTestResult gemmSelfTest();
 
+// Native quantized matmul on the GPU: a block-per-row GEMV over Q8_0 weights (dequantized in
+// registers, never copied to F32 — the GPU form of the CPU qmatmul). Checks correctness against a
+// host reference on a small matrix, then times a large one; message reports GFLOP/s and GB/s.
+SelfTestResult qmatmulSelfTest();
+
 }  // namespace qorvix::cuda
