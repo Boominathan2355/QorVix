@@ -1185,7 +1185,7 @@ class GpuModelImpl final : public GpuModel {
 
   const std::vector<float>& forward(int token, int pos) override {
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
-    const int qDim = cfg_.nHeads * cfg_.headDim, hd = cfg_.headDim, mx = cfg_.maxSeq;
+    const int hd = cfg_.headDim, mx = cfg_.maxSeq;
     auto g = [](int n) { return (n + 255) / 256; };
 
     embedRowKernel<<<g(d), 256>>>(dx_, dTokEmbd_, token, d);

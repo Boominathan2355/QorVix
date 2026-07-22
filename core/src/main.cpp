@@ -216,12 +216,130 @@ std::string flagValue(const std::vector<std::string_view>& args, std::string_vie
   return {};
 }
 
+// ---- GPU bridge helpers (used by generate --gpu and gpu-check) -----------------------------
+// Bridges a loaded GGUF (runtime Weights) into GPU model descriptors.
+qorvix::cuda::GpuWeight toGpuWeight(const qorvix::runtime::WeightMat& m) {
+  return qorvix::cuda::GpuWeight{m.quant, m.type, m.rows, m.cols};
+}
+int argmaxOf(const std::vector<float>& v) {
+  int best = 0;
+  for (int i = 1; i < static_cast<int>(v.size()); ++i)
+    if (v[i] > v[best]) best = i;
+  return best;
+}
+bool hasFlag(const std::vector<std::string_view>& args, std::string_view flag) {
+  for (const auto& a : args)
+    if (a == flag) return true;
+  return false;
+}
+
+// Uploads a loaded GGUF model's weights to VRAM and returns a GPU model runner. Dequantizes the
+// embedding table to F32 for the on-device lookup; layer weights stay quantized.
+std::unique_ptr<qorvix::cuda::GpuModel> buildGpuModel(const qorvix::runtime::ModelConfig& cfg,
+                                                      const qorvix::runtime::Weights& w, int maxSeq,
+                                                      std::string& err) {
+  namespace rt = qorvix::runtime;
+  namespace cu = qorvix::cuda;
+  const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+  std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
+  if (!rt::dequantize(w.tokenEmbd.type, w.tokenEmbd.quant, embF32.data(),
+                      static_cast<std::size_t>(vocab) * d)) {
+    err = "failed to dequantize token_embd";
+    return nullptr;
+  }
+  cu::GpuModelConfig gc;
+  gc.nLayers = static_cast<int>(cfg.blockCount);
+  gc.dModel = d;
+  gc.nHeads = static_cast<int>(cfg.headCount);
+  gc.headDim = static_cast<int>(cfg.headDim());
+  gc.nKv = static_cast<int>(cfg.headCountKv);
+  gc.ffn = static_cast<int>(cfg.feedForwardLength);
+  gc.vocab = vocab;
+  gc.maxSeq = maxSeq;
+  gc.normEps = cfg.normEpsilon;
+  gc.ropeFreqBase = cfg.ropeFreqBase;
+
+  cu::GpuWeight output = w.output.valid() ? toGpuWeight(w.output) : toGpuWeight(w.tokenEmbd);
+  std::vector<cu::GpuLayer> gl(cfg.blockCount);
+  for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+    const auto& L = w.layers[l];
+    gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), toGpuWeight(L.wq), toGpuWeight(L.wk),
+             toGpuWeight(L.wv), toGpuWeight(L.wo), toGpuWeight(L.ffnGate), toGpuWeight(L.ffnUp),
+             toGpuWeight(L.ffnDown)};
+  }
+  return cu::createGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err);
+}
+
+// GPU generation loop: drives the on-device GpuModel with the tokenizer + sampler.
+int generateGpu(const std::string& path, const std::string& prompt,
+                const qorvix::runtime::GenerationConfig& cfg) {
+  namespace rt = qorvix::runtime;
+  namespace cu = qorvix::cuda;
+  if (!cu::builtWithCuda() || cu::deviceCount() == 0) {
+    std::cerr << "error: --gpu requested but no CUDA device is available "
+                 "(build with -DQORVIX_ENABLE_CUDA=ON on a GPU host)\n";
+    return 1;
+  }
+  try {
+    using clock = std::chrono::steady_clock;
+    const auto tLoad0 = clock::now();
+    auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) { std::cerr << "error: tokenizer: " << err << "\n"; return 1; }
+    const auto mc = rt::configFromGguf(file, err);
+    if (!mc.valid()) { std::cerr << "error: config: " << err << "\n"; return 1; }
+    auto weights = rt::loadWeights(file, mc, err);
+    if (!weights) { std::cerr << "error: weights: " << err << "\n"; return 1; }
+
+    const auto promptIds = tok->encode(prompt, cfg.addBos);
+    const int maxSeq = static_cast<int>(promptIds.size()) + cfg.maxNewTokens + 4;
+    auto gpu = buildGpuModel(mc, *weights, maxSeq, err);
+    if (!gpu) { std::cerr << "error: GPU model: " << err << "\n"; return 1; }
+    const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+    rt::Sampler sampler(cfg.sampling, cfg.seed);
+    std::vector<int> history = promptIds;
+    const int eos = tok->special().eos;
+
+    std::cout << prompt << std::flush;
+    const auto tGen0 = clock::now();
+    int pos = 0;
+    std::vector<float> logits;
+    for (std::size_t i = 0; i < promptIds.size() && pos < maxSeq; ++i, ++pos)
+      logits = gpu->forward(promptIds[i], pos);
+    int next = sampler.sample(logits, history);
+
+    int generated = 0;
+    bool hitEos = false;
+    for (int n = 0; n < cfg.maxNewTokens && pos < maxSeq; ++n) {
+      if (next == eos) { hitEos = true; break; }
+      std::cout << tok->decodeToken(next) << std::flush;
+      history.push_back(next);
+      ++generated;
+      logits = gpu->forward(next, pos++);
+      next = sampler.sample(logits, history);
+    }
+    const double genSec = std::chrono::duration<double>(clock::now() - tGen0).count();
+    const int forwards = static_cast<int>(promptIds.size()) + generated;
+    std::cout << "\n\n[GPU | " << promptIds.size() << " prompt tokens, " << generated << " generated"
+              << (hitEos ? ", eos" : "") << "]\n"
+              << "[load " << std::fixed << std::setprecision(1) << loadSec << "s | " << forwards
+              << " forwards in " << genSec << "s = " << std::setprecision(2)
+              << (genSec > 0 ? forwards / genSec : 0.0) << " tok/s]\n";
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int cmdGenerate(const std::vector<std::string_view>& args) {
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   const std::string prompt = flagValue(args, "--prompt");
   if (path.empty() || prompt.empty()) {
     std::cerr << "usage: qorvix generate <file.gguf> --prompt \"...\" "
-                 "[--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n";
+                 "[--gpu] [--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n";
     return 1;
   }
 
@@ -231,6 +349,8 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   if (auto v = flagValue(args, "--top-k"); !v.empty()) cfg.sampling.topK = std::stoi(v);
   if (auto v = flagValue(args, "--top-p"); !v.empty()) cfg.sampling.topP = std::stof(v);
   if (auto v = flagValue(args, "--seed"); !v.empty()) cfg.seed = std::stoull(v);
+
+  if (hasFlag(args, "--gpu")) return generateGpu(path, prompt, cfg);
 
   try {
     using clock = std::chrono::steady_clock;
@@ -425,19 +545,6 @@ int cmdServe(const std::vector<std::string_view>& args) {
   return 0;
 }
 
-namespace {
-// Bridges a loaded GGUF (runtime Weights) into GPU model descriptors.
-qorvix::cuda::GpuWeight toGpuWeight(const qorvix::runtime::WeightMat& m) {
-  return qorvix::cuda::GpuWeight{m.quant, m.type, m.rows, m.cols};
-}
-int argmaxOf(const std::vector<float>& v) {
-  int best = 0;
-  for (int i = 1; i < static_cast<int>(v.size()); ++i)
-    if (v[i] > v[best]) best = i;
-  return best;
-}
-}  // namespace
-
 // Correctness gate for GPU inference: runs one forward pass on both the CPU TextModel and the GPU
 // model over a short prompt and compares logits.
 int cmdGpuCheck(const std::string& path) {
@@ -461,42 +568,12 @@ int cmdGpuCheck(const std::string& path) {
     auto weights = rt::loadWeights(file, cfg, err);
     if (!weights) { std::cerr << "weights: " << err << "\n"; return 1; }
 
-    const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+    const int vocab = static_cast<int>(cfg.vocabSize);
     const int maxSeq = 64;
-
-    // Embedding table dequantized to F32 for the on-device lookup.
-    std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
-    if (!rt::dequantize(weights->tokenEmbd.type, weights->tokenEmbd.quant, embF32.data(),
-                        static_cast<std::size_t>(vocab) * d)) {
-      std::cerr << "failed to dequantize token_embd\n";
-      return 1;
-    }
-
-    cu::GpuModelConfig gc;
-    gc.nLayers = static_cast<int>(cfg.blockCount);
-    gc.dModel = d;
-    gc.nHeads = static_cast<int>(cfg.headCount);
-    gc.headDim = static_cast<int>(cfg.headDim());
-    gc.nKv = static_cast<int>(cfg.headCountKv);
-    gc.ffn = static_cast<int>(cfg.feedForwardLength);
-    gc.vocab = vocab;
-    gc.maxSeq = maxSeq;
-    gc.normEps = cfg.normEpsilon;
-    gc.ropeFreqBase = cfg.ropeFreqBase;
-
-    cu::GpuWeight output = weights->output.valid() ? toGpuWeight(weights->output)
-                                                   : toGpuWeight(weights->tokenEmbd);
-    std::vector<cu::GpuLayer> gl(cfg.blockCount);
-    for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
-      const auto& L = weights->layers[l];
-      gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), toGpuWeight(L.wq), toGpuWeight(L.wk),
-               toGpuWeight(L.wv), toGpuWeight(L.wo), toGpuWeight(L.ffnGate), toGpuWeight(L.ffnUp),
-               toGpuWeight(L.ffnDown)};
-    }
 
     std::string gerr;
     std::cout << "Uploading weights to VRAM and building GPU model...\n";
-    auto gpu = cu::createGpuModel(gc, embF32.data(), weights->outputNorm.data(), output, gl, gerr);
+    auto gpu = buildGpuModel(cfg, *weights, maxSeq, gerr);
     if (!gpu) { std::cerr << "GPU model: " << gerr << "\n"; return 1; }
 
     rt::TextModel cpu(cfg, std::move(*weights), maxSeq);  // in-memory ctor; borrows the live file
