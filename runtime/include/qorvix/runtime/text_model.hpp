@@ -1,15 +1,13 @@
 #pragma once
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/runtime/model_config.hpp"
 #include "qorvix/runtime/weights.hpp"
-
-namespace qorvix::gguf {
-class GgufFile;
-}
 
 namespace qorvix::runtime {
 
@@ -18,10 +16,12 @@ namespace qorvix::runtime {
 // paged, GPU-accelerated path is built on top of this ground truth in later phases.
 class TextModel {
  public:
+  // In-memory construction (tests / synthetic models). Weights may be owned-F32 WeightMats.
   TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLen = 4096);
 
-  // Builds from an opened (mmap'd) GGUF file. Returns nullopt with `error` set on failure.
-  static std::optional<TextModel> fromGguf(const gguf::GgufFile& file, std::string& error,
+  // Builds from an opened GGUF file, taking ownership of it so the mmap stays alive for the
+  // borrowed quantized weights. Returns nullopt with `error` set on failure.
+  static std::optional<TextModel> fromGguf(gguf::GgufFile file, std::string& error,
                                            std::uint32_t maxSeqLen = 4096);
 
   const ModelConfig& config() const noexcept { return cfg_; }
@@ -44,6 +44,8 @@ class TextModel {
 
   ModelConfig cfg_;
   Weights w_;
+  // Keeps the mmap alive when weights borrow quantized bytes from it (null for in-memory models).
+  std::unique_ptr<gguf::GgufFile> file_;
   std::uint32_t maxSeq_;
   int filled_ = 0;  // number of positions currently in the KV cache
 

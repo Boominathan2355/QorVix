@@ -6,6 +6,7 @@
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/ops.hpp"
 #include "qorvix/runtime/text_model.hpp"
+#include "qorvix/runtime/weights.hpp"
 #include "qorvix/tokenizer/tokenizer.hpp"
 
 using namespace qorvix::runtime;
@@ -32,30 +33,31 @@ ModelConfig cfg4() {  // d=4, 2 heads, MHA, 1 layer, vocab=4
 }
 
 LayerWeights zeroLayer(const ModelConfig& c) {
-  const std::size_t d = c.embeddingLength, kv = c.kvDim(), ffn = c.feedForwardLength;
+  const int d = c.embeddingLength, kv = c.kvDim(), ffn = c.feedForwardLength;
   LayerWeights L;
   L.attnNorm.assign(d, 1.0f);
-  L.wq.assign(d * d, 0.0f);
-  L.wk.assign(kv * d, 0.0f);
-  L.wv.assign(kv * d, 0.0f);
-  L.wo.assign(d * d, 0.0f);
+  L.wq = WeightMat::f32(std::vector<float>(d * d, 0.0f), d, d);
+  L.wk = WeightMat::f32(std::vector<float>(kv * d, 0.0f), kv, d);
+  L.wv = WeightMat::f32(std::vector<float>(kv * d, 0.0f), kv, d);
+  L.wo = WeightMat::f32(std::vector<float>(d * d, 0.0f), d, d);
   L.ffnNorm.assign(d, 1.0f);
-  L.ffnGate.assign(ffn * d, 0.0f);
-  L.ffnUp.assign(ffn * d, 0.0f);
-  L.ffnDown.assign(d * ffn, 0.0f);
+  L.ffnGate = WeightMat::f32(std::vector<float>(ffn * d, 0.0f), ffn, d);
+  L.ffnUp = WeightMat::f32(std::vector<float>(ffn * d, 0.0f), ffn, d);
+  L.ffnDown = WeightMat::f32(std::vector<float>(d * ffn, 0.0f), d, ffn);
   return L;
 }
 
 // Builds a model whose LM head always makes `winner` the argmax (its output row dominates).
 TextModel modelPredicting(int winner) {
   ModelConfig c = cfg4();
+  const int d = c.embeddingLength, vocab = c.vocabSize;
   Weights w;
-  w.tokenEmbd.assign(c.vocabSize * c.embeddingLength, 0.5f);  // all-positive embeddings
+  w.tokenEmbd = WeightMat::f32(std::vector<float>(vocab * d, 0.5f), vocab, d);
   w.layers = {zeroLayer(c)};
-  w.outputNorm.assign(c.embeddingLength, 1.0f);
-  w.output.assign(c.vocabSize * c.embeddingLength, 0.0f);
-  for (int j = 0; j < static_cast<int>(c.embeddingLength); ++j)
-    w.output[winner * c.embeddingLength + j] = 10.0f;
+  w.outputNorm.assign(d, 1.0f);
+  std::vector<float> out(vocab * d, 0.0f);
+  for (int j = 0; j < d; ++j) out[winner * d + j] = 10.0f;
+  w.output = WeightMat::f32(std::move(out), vocab, d);
   return TextModel(c, std::move(w), /*maxSeqLen=*/32);
 }
 

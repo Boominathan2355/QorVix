@@ -30,13 +30,18 @@ TextModel::TextModel(ModelConfig config, Weights weights, std::uint32_t maxSeqLe
   logits_.assign(cfg_.vocabSize, 0.0f);
 }
 
-std::optional<TextModel> TextModel::fromGguf(const gguf::GgufFile& file, std::string& error,
+std::optional<TextModel> TextModel::fromGguf(gguf::GgufFile file, std::string& error,
                                             std::uint32_t maxSeqLen) {
   ModelConfig cfg = configFromGguf(file, error);
   if (!cfg.valid()) return std::nullopt;
-  auto weights = loadWeights(file, cfg, error);
+  auto weights = loadWeights(file, cfg, error);  // borrows pointers into file's mmap
   if (!weights) return std::nullopt;
-  return TextModel(std::move(cfg), std::move(*weights), maxSeqLen);
+
+  TextModel model(std::move(cfg), std::move(*weights), maxSeqLen);
+  // Take ownership of the file so the mmap (and the borrowed weight pointers) outlive this call.
+  // Moving GgufFile transfers the same mapping address, so the borrowed pointers stay valid.
+  model.file_ = std::make_unique<gguf::GgufFile>(std::move(file));
+  return model;
 }
 
 void TextModel::attention(const LayerWeights& L, int layer, int pos) {
@@ -84,18 +89,17 @@ const std::vector<float>& TextModel::forward(int token, int pos) {
   const int d = static_cast<int>(cfg_.embeddingLength);
   const int headDim = static_cast<int>(cfg_.headDim());
 
-  // Embedding lookup.
-  const float* emb = w_.tokenEmbd.data() + static_cast<std::size_t>(token) * d;
-  for (int i = 0; i < d; ++i) x_[i] = emb[i];
+  // Embedding lookup (dequantizes one row when the table is quantized).
+  embeddingRow(w_.tokenEmbd, token, x_.data());
 
   for (std::uint32_t layer = 0; layer < cfg_.blockCount; ++layer) {
     const LayerWeights& L = w_.layers[layer];
 
     // --- attention block ---
     ops::rmsnorm(xn_.data(), x_.data(), L.attnNorm.data(), d, cfg_.normEpsilon);
-    ops::matmul(q_.data(), L.wq.data(), xn_.data(), static_cast<int>(cfg_.headCount) * headDim, d);
-    ops::matmul(k_.data(), L.wk.data(), xn_.data(), static_cast<int>(cfg_.kvDim()), d);
-    ops::matmul(v_.data(), L.wv.data(), xn_.data(), static_cast<int>(cfg_.kvDim()), d);
+    wmatmul(q_.data(), L.wq, xn_.data());
+    wmatmul(k_.data(), L.wk, xn_.data());
+    wmatmul(v_.data(), L.wv, xn_.data());
 
     ops::rope(q_.data(), static_cast<int>(cfg_.headCount), headDim, pos, cfg_.ropeFreqBase,
               cfg_.ropeMode);
@@ -104,26 +108,22 @@ const std::vector<float>& TextModel::forward(int token, int pos) {
 
     attention(L, static_cast<int>(layer), pos);
 
-    ops::matmul(tmpDModel_.data(), L.wo.data(), attn_.data(), d,
-                static_cast<int>(cfg_.headCount) * headDim);
+    wmatmul(tmpDModel_.data(), L.wo, attn_.data());
     ops::add(x_.data(), tmpDModel_.data(), d);
 
     // --- feed-forward block (SwiGLU) ---
     ops::rmsnorm(xn_.data(), x_.data(), L.ffnNorm.data(), d, cfg_.normEpsilon);
-    ops::matmul(ffnGate_.data(), L.ffnGate.data(), xn_.data(),
-                static_cast<int>(cfg_.feedForwardLength), d);
-    ops::matmul(ffnUp_.data(), L.ffnUp.data(), xn_.data(),
-                static_cast<int>(cfg_.feedForwardLength), d);
+    wmatmul(ffnGate_.data(), L.ffnGate, xn_.data());
+    wmatmul(ffnUp_.data(), L.ffnUp, xn_.data());
     ops::swiglu(ffnAct_.data(), ffnGate_.data(), ffnUp_.data(),
                 static_cast<int>(cfg_.feedForwardLength));
-    ops::matmul(tmpDModel_.data(), L.ffnDown.data(), ffnAct_.data(), d,
-                static_cast<int>(cfg_.feedForwardLength));
+    wmatmul(tmpDModel_.data(), L.ffnDown, ffnAct_.data());
     ops::add(x_.data(), tmpDModel_.data(), d);
   }
 
   // Final norm + LM head.
   ops::rmsnorm(xn_.data(), x_.data(), w_.outputNorm.data(), d, cfg_.normEpsilon);
-  ops::matmul(logits_.data(), w_.lmHead().data(), xn_.data(), static_cast<int>(cfg_.vocabSize), d);
+  wmatmul(logits_.data(), w_.lmHead(), xn_.data());
 
   if (pos + 1 > filled_) filled_ = pos + 1;
   return logits_;

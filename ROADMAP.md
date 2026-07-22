@@ -75,10 +75,12 @@ New `cuda` module — a backend facade callable from any build, plus the GpuVram
   real `.cu` (nvcc, links cudart+cublas). `qorvix gpu` CLI reports devices + runs the self-tests.
 - Tests skip device assertions cleanly when `deviceCount()==0`, so CI/GPU-less hosts stay green.
 
-**Verified:** stub path + transfer routing locally (quick preset). The real `.cu`/cuBLAS path is
-being compile-checked under nvcc via `Dockerfile.cuda` (build in progress at commit time; result
-folded in once it lands). **Not yet run on a GPU** — this dev box and CI have no NVIDIA device, so
-even once it compiles, the kernels/GEMM stay execution-unverified until GPU hardware is available.
+**Verified:** stub path + transfer routing locally (quick preset). The real `.cu`/cuBLAS path
+**compiles under nvcc** — confirmed by building `Dockerfile.cuda` (nvcc 12.6 builds
+`cuda_backend.cu` → `libqorvix_cuda.a` → the `qorvix:cuda` image; 70/70 tests pass in-container).
+**Not yet run on a GPU** — this dev box and CI have no NVIDIA device, so the kernels/GEMM stay
+execution-unverified until GPU hardware is available (the CUDA facade degrades gracefully with no
+device, which is what the container tests exercise).
 
 Deferred to the CUDA performance pass (Phase 8): pinned host memory, async streams/overlapped
 transfers, CUDA graphs, FlashAttention, CUTLASS. Bring-up establishes the device + memory tier
@@ -140,7 +142,26 @@ bandwidth) and **Phase 8** (GPU) are where real speed comes from — same valida
 Other known gaps, deferred by design: Qwen2/Gemma need their attention-bias / logit-softcap quirks;
 partial-rope (rope_dim < head_dim) untested.
 
-## Phase 6 — Native Quantization Kernels
+## Phase 6 — Native Quantization Kernels 🚧
+**Part a ✅ — quantized matmul kernels:** `qmatmul` computes the GEMV directly against GGUF blocks
+(dequantize one block into registers, fold into the dot product — never materialize the F32
+weight); `dequantRow` for embedding lookup. Verified bit-for-bit against dequant+F32-matmul.
+
+**Part b ✅ — wired into the model:** `WeightMat` holds each matmul weight as either owned-F32
+(tests) or **borrowed quantized bytes aliasing the mmap** (real models); `TextModel` owns the
+GgufFile to keep that mapping alive. The forward pass runs `qmatmul` on 4-bit weights directly.
+Measured on TinyLlama 1.1B (vs the F32-preload path, identical output):
+- **Peak RAM ~5 GB → ~0.8 GB** (~6×) — weights stay 4-bit.
+- **Load 16 s → 0.2 s** (~80×) — no upfront dequant.
+- **Forward ~0.72 tok/s** — on par with F32 (the on-the-fly dequant compute balances the ~8× lower
+  bandwidth on 4 cores). Fixed a nasty nested-OpenMP bug (dequant-inside-parallel-qmatmul) that
+  had made it 30× slower.
+
+**Remaining:** the on-the-fly dequant is still scalar — SIMD `vec_dot` kernels per quant type
+would push CPU speed up; quantized KV cache; and the GPU forms of these kernels (Phase 8). Real
+speed at scale is the GPU path.
+
+### (original scope)
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.
 Quantized KV cache.
 
@@ -180,11 +201,11 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phase 5 complete — **Qorvix generates correct text from a real GGUF model on CPU**,
-validated on TinyLlama 1.1B Chat Q4_K_M ("The capital of France is" → "the city of Paris…").
-Foundations through the memory manager (Phase 3) pass tests locally and in the Docker Linux image.
-The CUDA backend (Phase 4) is authored, but the `.cu` path is **compile-unverified** — the earlier
-"compiles under nvcc" claim was wrong (the Docker CUDA build never completed; there's no NVIDIA
-device on this box or CI). Performance claims in SPEC.md remain targets: the CPU runtime is a
-correctness *reference* (~13 s/token, unoptimized), not fast. Next: Phase 6 (native quantized
-kernels) / Phase 8 (GPU) to accelerate the now-validated path.
+**Status:** Phases 0–5 complete, Phase 6 in progress. **Qorvix generates correct text from a real
+GGUF model on CPU** (TinyLlama 1.1B: "The capital of France is" → "the city of Paris, which is a
+city in France"), now with **native quantized weights** — ~0.8 GB RAM (6× less than F32) and 0.2 s
+load. Foundations through the memory manager (Phase 3) pass tests locally and in the Docker Linux
+image (70/70). The CUDA backend (Phase 4) is now **compile-verified**: `nvcc` builds `cuda_backend.cu`
+and the `qorvix:cuda` image in Docker, all tests green — but GPU *execution* is still unverified
+(no NVIDIA device on this box or CI). Performance claims in SPEC.md remain targets: the CPU runtime
+is a correctness *reference* (~0.7 tok/s on 4 cores), not fast. Real speed is the GPU path (Phase 8).

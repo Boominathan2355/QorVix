@@ -229,14 +229,16 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   try {
     using clock = std::chrono::steady_clock;
     const auto tLoad0 = clock::now();
-    const auto file = qorvix::gguf::GgufFile::open(path);
+    auto file = qorvix::gguf::GgufFile::open(path);
     std::string err;
+    // Build the tokenizer first (it copies the vocab out of the file), then hand the file to the
+    // model, which takes ownership so its quantized weights can keep aliasing the mmap.
     auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
     if (!tok) {
       std::cerr << "error: tokenizer: " << err << "\n";
       return 1;
     }
-    auto model = qorvix::runtime::TextModel::fromGguf(file, err);
+    auto model = qorvix::runtime::TextModel::fromGguf(std::move(file), err);
     if (!model) {
       std::cerr << "error: model: " << err << "\n";
       return 1;
