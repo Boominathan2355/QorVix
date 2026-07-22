@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1304,6 +1305,9 @@ class GpuModelImpl final : public GpuModel {
     // 48 KB static shared-mem limit, disable the graph path and fall back to eager launches.
     attnShMax_ = (static_cast<std::size_t>(cfg_.maxSeq) + cfg_.headDim) * sizeof(float);
     if (attnShMax_ > 48 * 1024) useGraph_ = false;
+    // QORVIX_NO_GRAPH=1 forces the eager path so profilers (ncu/nsys) can isolate individual
+    // GEMV launches in the real generate workload — captured graphs replay as one opaque node.
+    if (const char* e = std::getenv("QORVIX_NO_GRAPH"); e && e[0] == '1') useGraph_ = false;
     if (cudaStreamCreate(&stream_) != cudaSuccess ||
         cudaMalloc(&dParams_, 2 * sizeof(int)) != cudaSuccess ||
         cudaMallocHost(&hParams_, 2 * sizeof(int)) != cudaSuccess) {
