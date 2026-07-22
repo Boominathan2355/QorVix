@@ -131,10 +131,14 @@ positions and produce garbage). Exact bit-level logit parity with llama.cpp is n
 (llama.cpp isn't installed here), but generation correctness is established.
 
 **Phase 5 is functionally complete** — Qorvix generates correct text from a real GGUF model on
-CPU. Known gaps, deferred by design: CPU forward pass is unoptimized (~13 s/token single-threaded
-naive F32 matmul — no SIMD/threading/quant kernels yet), so it's a *reference*, not fast; Qwen2/
-Gemma need their attention-bias / logit-softcap quirks; partial-rope (rope_dim < head_dim) untested.
-Speed comes from **Phase 6** (native quantized kernels) and **Phase 8** (GPU) — same path, accelerated.
+CPU. A first optimization pass (Release `-O3` + OpenMP-parallel matmul & dequant + `-march=native`
+AVX2, via the `quick-release` preset) took TinyLlama from ~185s to ~43s for the same work (~4.3×,
+byte-identical output) — load ~16s, forward ~0.8 tok/s on 4 cores. It's still a *reference*, not
+fast: the forward pass is memory-bandwidth-bound because it streams all ~4.4 GB of dequantized-F32
+weights every token. **Phase 6** (native quantized kernels — read 4-bit weights directly, ~8× less
+bandwidth) and **Phase 8** (GPU) are where real speed comes from — same validated path, accelerated.
+Other known gaps, deferred by design: Qwen2/Gemma need their attention-bias / logit-softcap quirks;
+partial-rope (rope_dim < head_dim) untested.
 
 ## Phase 6 — Native Quantization Kernels
 Direct GPU kernels for Q4_K/Q5_K/Q6_K/Q8_0 — matmul, attention, and FFN without dequant-to-FP16.

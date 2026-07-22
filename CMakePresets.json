@@ -42,13 +42,24 @@
       "binaryDir": "${sourceDir}/build/quick",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" },
       "description": "No vcpkg toolchain — only builds targets with zero third-party deps. For fast local iteration before vcpkg is bootstrapped."
+    },
+    {
+      "name": "quick-release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/quick-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "QORVIX_NATIVE": "ON"
+      },
+      "description": "Optimized, dependency-free build (-O3 + -march=native + OpenMP). For benchmarking the CPU runtime without vcpkg."
     }
   ],
   "buildPresets": [
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-release", "configurePreset": "linux-release" },
     { "name": "windows-debug", "configurePreset": "windows-debug" },
-    { "name": "quick", "configurePreset": "quick" }
+    { "name": "quick", "configurePreset": "quick" },
+    { "name": "quick-release", "configurePreset": "quick-release" }
   ],
   "testPresets": [
     { "name": "linux-debug", "configurePreset": "linux-debug", "output": { "outputOnFailure": true } },

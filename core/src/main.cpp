@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <iomanip>
 #include <iostream>
@@ -226,6 +227,8 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   if (auto v = flagValue(args, "--seed"); !v.empty()) cfg.seed = std::stoull(v);
 
   try {
+    using clock = std::chrono::steady_clock;
+    const auto tLoad0 = clock::now();
     const auto file = qorvix::gguf::GgufFile::open(path);
     std::string err;
     auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
@@ -238,13 +241,21 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
       std::cerr << "error: model: " << err << "\n";
       return 1;
     }
+    const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
 
     qorvix::runtime::Generator gen(*model, *tok);
     std::cout << prompt << std::flush;
+    const auto tGen0 = clock::now();
     auto result = gen.generate(prompt, cfg,
                                [](const std::string& piece) { std::cout << piece << std::flush; });
+    const double genSec = std::chrono::duration<double>(clock::now() - tGen0).count();
+
+    const int forwards = result.promptTokens + static_cast<int>(result.tokens.size());
     std::cout << "\n\n[" << result.promptTokens << " prompt tokens, " << result.tokens.size()
               << " generated" << (result.hitEos ? ", eos" : "") << "]\n";
+    std::cout << "[load " << std::fixed << std::setprecision(1) << loadSec << "s | "
+              << forwards << " forwards in " << genSec << "s = " << std::setprecision(2)
+              << (genSec > 0 ? forwards / genSec : 0.0) << " tok/s]\n";
     return 0;
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";

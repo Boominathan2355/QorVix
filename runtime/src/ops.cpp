@@ -32,11 +32,26 @@ void layernorm(float* out, const float* x, const float* weight, const float* bia
 }
 
 void matmul(float* out, const float* weight, const float* x, int rows, int cols) {
+  // out[r] = dot(weight[r,:], x). Rows are independent, so the OpenMP parallelization is
+  // bit-identical to running this same loop serially (no cross-row reduction). Accumulation is
+  // F32 (as in real inference) rather than the earlier F64 — a negligible precision change. The
+  // pragma is a no-op unless the build enables OpenMP (see runtime/CMakeLists.txt).
+#pragma omp parallel for schedule(static)
   for (int r = 0; r < rows; ++r) {
     const float* row = weight + static_cast<std::size_t>(r) * cols;
-    double acc = 0.0;
-    for (int c = 0; c < cols; ++c) acc += static_cast<double>(row[c]) * x[c];
-    out[r] = static_cast<float>(acc);
+    // float accumulators unrolled by 4: lets the compiler emit vector FMAs (a GEMV is
+    // memory-bandwidth bound, so the win is mostly threads streaming the weight matrix).
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    int c = 0;
+    for (; c + 4 <= cols; c += 4) {
+      a0 += row[c] * x[c];
+      a1 += row[c + 1] * x[c + 1];
+      a2 += row[c + 2] * x[c + 2];
+      a3 += row[c + 3] * x[c + 3];
+    }
+    float acc = a0 + a1 + a2 + a3;
+    for (; c < cols; ++c) acc += row[c] * x[c];
+    out[r] = acc;
   }
 }
 

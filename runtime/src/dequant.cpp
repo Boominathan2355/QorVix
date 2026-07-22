@@ -32,6 +32,7 @@ constexpr int kQK = 256;  // K-quant super-block size
 
 void dequantQ8_0(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 34;  // half d + int8 qs[32]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / 32; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -42,6 +43,7 @@ void dequantQ8_0(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ4_0(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 18;  // half d + uint8 qs[16]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / 32; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -55,6 +57,7 @@ void dequantQ4_0(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ4_1(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 20;  // half d + half m + uint8 qs[16]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / 32; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -69,6 +72,7 @@ void dequantQ4_1(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ5_0(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 22;  // half d + uint8 qh[4] + uint8 qs[16]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / 32; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -86,6 +90,7 @@ void dequantQ5_0(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ5_1(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 24;  // half d + half m + uint8 qh[4] + uint8 qs[16]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / 32; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -104,6 +109,7 @@ void dequantQ5_1(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ8_1(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 36;  // half d + half s + int8 qs[32]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / 32; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -116,6 +122,7 @@ void dequantQ8_1(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ4_K(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 144;  // half d + half dmin + scales[12] + qs[128]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / kQK; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -141,6 +148,7 @@ void dequantQ4_K(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ5_K(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 176;  // half d + half dmin + scales[12] + qh[32] + qs[128]
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / kQK; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const float d = fp16ToFloat(readHalf(p));
@@ -172,6 +180,7 @@ void dequantQ5_K(const std::uint8_t* src, float* dst, std::size_t n) {
 
 void dequantQ6_K(const std::uint8_t* src, float* dst, std::size_t n) {
   constexpr int blockBytes = 210;  // ql[128] + qh[64] + int8 scales[16] + half d
+#pragma omp parallel for schedule(static)
   for (std::size_t b = 0; b < n / kQK; ++b) {
     const std::uint8_t* p = src + b * blockBytes;
     const std::uint8_t* ql = p;
