@@ -159,20 +159,29 @@ __global__ void qmatmulQ6_KKernel(float* __restrict__ out, const std::uint8_t* _
     const std::uint8_t* ql = blk;
     const std::uint8_t* qh = blk + 128;
     const signed char* sc = reinterpret_cast<const signed char*>(blk + 192);
-    const float d = __half2float(__ushort_as_half(blk[208] | (static_cast<unsigned short>(blk[209]) << 8)));
+    // Decode d once (lane 0) and precompute the 16 (d*scale) values once (lanes 0..15),
+    // instead of per element — reassociated identically ((d*sc)*q == d*sc*q).
+    float d = 0.0f;
+    if (lane == 0)
+      d = __half2float(__ushort_as_half(blk[208] | (static_cast<unsigned short>(blk[209]) << 8)));
+    d = __shfl_sync(0xffffffffu, d, 0);
+    const float dsc = (lane < 16) ? d * static_cast<float>(sc[lane]) : 0.0f;
+
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
-    for (int i = lane; i < kQKK; i += 32) {
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      const int i = lane + k * 32;
       const int half = i >> 7, p = i & 127, l = p & 31, quarter = p >> 5, is = l >> 4;
       const std::uint8_t* qlh = ql + half * 64;
       const std::uint8_t* qhh = qh + half * 32;
-      const signed char* sch = sc + half * 8;
       int lo, hi;
       if (quarter == 0) { lo = qlh[l] & 0xF;           hi = (qhh[l] >> 0) & 3; }
       else if (quarter == 1) { lo = qlh[l + 32] & 0xF; hi = (qhh[l] >> 2) & 3; }
       else if (quarter == 2) { lo = qlh[l] >> 4;       hi = (qhh[l] >> 4) & 3; }
       else { lo = qlh[l + 32] >> 4;                    hi = (qhh[l] >> 6) & 3; }
       const int q = (lo | (hi << 4)) - 32;
-      sum += d * static_cast<float>(sch[is + quarter * 2]) * q * xb[i];
+      const float dscv = __shfl_sync(0xffffffffu, dsc, half * 8 + is + quarter * 2);
+      sum += dscv * q * xb[i];
     }
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
