@@ -199,10 +199,19 @@ reference and times a 4096×4096 GEMV (reports GFLOP/s + GB/s), surfaced via `qo
 Compile-verified under nvcc in Docker (96/96 tests pass in-container); execution-verified on a T4
 via the Colab notebook.
 
-**Remaining:** GPU kernels for the rest of the forward pass (rmsnorm, RoPE, attention/FlashAttention,
-SwiGLU, elementwise) + K-quant matmuls, a resident-on-GPU forward loop (weights + KV in VRAM, no
-per-op transfers) so `generate` runs on the GPU, then the tuned kernels (warp/tensor-core GEMV,
-CUDA graphs, kernel fusion, cuBLAS/CUTLASS). Benchmark each against the CPU baseline.
+**Part b ✅ — real-model GPU inference.** Device kernels for the whole forward pass (RMSNorm, RoPE,
+GQA attention over VRAM-resident KV, SwiGLU, residual add) plus native quantized matmuls (Q4_K,
+Q6_K, Q8_0, F32), each verified against the CPU reference on a T4. `GpuModel` uploads a real GGUF's
+weights to VRAM (layer weights quantized, embedding dequantized to F32, F32 norms) and runs the
+forward pass dispatching per quant type; `qorvix gpu-check` gates correctness against the CPU
+`TextModel`. **Verified on a T4:** gpu-check on real TinyLlama Q4_K_M matches the CPU runtime
+(rel err 3.7e-06, argmax agrees everywhere), and **`qorvix generate --gpu` produces correct text
+at ~66 tok/s vs the CPU's ~0.7 tok/s (~90×)**. The Colab notebook builds, self-tests, gpu-checks,
+and benchmarks all of this on real hardware.
+
+**Remaining (tuning — now directly raises tok/s):** coalesced/vectorized K-quant loads (or dp4a),
+FlashAttention-style attention, CUDA graphs / kernel fusion, multi-token prefill batching, and
+wiring the GPU path into the scheduler + HTTP server. Benchmark each against this ~66 tok/s floor.
 
 ## Phase 9 — API Layer 🚧
 **Part a ✅ — OpenAI protocol layer (`api` module, zero external deps → builds in every preset):**
@@ -256,11 +265,12 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phases 0–5 complete, Phase 6 in progress. **Qorvix generates correct text from a real
-GGUF model on CPU** (TinyLlama 1.1B: "The capital of France is" → "the city of Paris, which is a
-city in France"), now with **native quantized weights** — ~0.8 GB RAM (6× less than F32) and 0.2 s
-load. Foundations through the memory manager (Phase 3) pass tests locally and in the Docker Linux
-image (70/70). The CUDA backend (Phase 4) is now **compile-verified**: `nvcc` builds `cuda_backend.cu`
-and the `qorvix:cuda` image in Docker, all tests green — but GPU *execution* is still unverified
-(no NVIDIA device on this box or CI). Performance claims in SPEC.md remain targets: the CPU runtime
-is a correctness *reference* (~0.7 tok/s on 4 cores), not fast. Real speed is the GPU path (Phase 8).
+**Status:** Phases 0–9 substantially complete; **Qorvix runs correct GPU inference on real models.**
+CPU path: correct text generation from real GGUF models with native quantized weights (~0.8 GB RAM),
+a paged multi-session KV cache, a continuous-batching scheduler, and an OpenAI-compatible HTTP
+server (`qorvix serve`). GPU path (Phase 8): every forward-pass kernel (Q4_K/Q6_K/Q8_0/F32 matmul,
+RMSNorm, RoPE, GQA attention, SwiGLU) verified on a Tesla T4, and **`generate --gpu` produces
+correct text on real TinyLlama at ~66 tok/s — ~90× the CPU** (gpu-check: rel err 3.7e-06 vs the CPU
+runtime). The Colab notebook builds/self-tests/benchmarks it all on real hardware. Remaining work is
+optimization (tuned kernels, FlashAttention, CUDA graphs, prefill batching), multi-GPU (Phase 10),
+and the multimodal engines (Phase 11+) — the un-tuned GPU kernels mean ~66 tok/s is a floor.
