@@ -290,10 +290,10 @@ int cmdGpu() {
 
   const auto self = qorvix::cuda::selfTest();
   std::cout << "\nSelf-test (scale kernel): " << (self.passed ? "PASS" : (self.ran ? "FAIL" : "skip"))
-            << " — " << self.message << "\n";
+            << " - " << self.message << "\n";
   const auto gemm = qorvix::cuda::gemmSelfTest();
   std::cout << "Self-test (cuBLAS GEMM):  " << (gemm.passed ? "PASS" : (gemm.ran ? "FAIL" : "skip"))
-            << " — " << gemm.message << "\n";
+            << " - " << gemm.message << "\n";
   return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) ? 1 : 0;
 }
 
