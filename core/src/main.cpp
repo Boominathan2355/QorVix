@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "qorvix/api/http_server.hpp"
+#include "qorvix/api/openai.hpp"
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
@@ -14,6 +16,7 @@
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
 #include "qorvix/runtime/text_model.hpp"
+#include "qorvix/scheduler/scheduler.hpp"
 #include "qorvix/tokenizer/tokenizer.hpp"
 #include "qorvix/version.hpp"
 
@@ -265,6 +268,160 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   }
 }
 
+namespace {
+qorvix::scheduler::RequestParams toRequestParams(const qorvix::api::SamplingRequest& s) {
+  qorvix::scheduler::RequestParams rp;
+  rp.maxNewTokens = s.maxTokens;
+  rp.sampling.temperature = s.temperature;
+  rp.sampling.topP = s.topP;
+  rp.sampling.topK = s.topK;
+  rp.sampling.minP = s.minP;
+  rp.sampling.frequencyPenalty = s.frequencyPenalty;
+  rp.sampling.presencePenalty = s.presencePenalty;
+  rp.sampling.repetitionPenalty = s.repetitionPenalty;
+  rp.seed = s.seed;
+  rp.addBos = true;
+  return rp;
+}
+}  // namespace
+
+int cmdServe(const std::vector<std::string_view>& args) {
+  namespace api = qorvix::api;
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (path.empty()) {
+    std::cerr << "usage: qorvix serve <file.gguf> [--port N] [--max-concurrent N] [--ctx N]\n";
+    return 1;
+  }
+  int port = 8080, maxConcurrent = 4, ctx = 4096;
+  if (auto v = flagValue(args, "--port"); !v.empty()) port = std::stoi(v);
+  if (auto v = flagValue(args, "--max-concurrent"); !v.empty()) maxConcurrent = std::stoi(v);
+  if (auto v = flagValue(args, "--ctx"); !v.empty()) ctx = std::stoi(v);
+
+  std::string err;
+  std::optional<qorvix::tokenizer::Tokenizer> tok;
+  std::optional<qorvix::runtime::TextModel> model;
+  try {
+    auto file = qorvix::gguf::GgufFile::open(path);
+    tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) {
+      std::cerr << "error: tokenizer: " << err << "\n";
+      return 1;
+    }
+    model = qorvix::runtime::TextModel::fromGguf(std::move(file), err,
+                                                 static_cast<std::uint32_t>(ctx),
+                                                 static_cast<std::uint32_t>(maxConcurrent));
+    if (!model) {
+      std::cerr << "error: model: " << err << "\n";
+      return 1;
+    }
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+
+  const std::string modelId = model->config().architecture + "/" + path;
+  qorvix::scheduler::Scheduler sched(*model, *tok, {maxConcurrent});
+  long long idCounter = 0;
+
+  api::HttpServer server(port);
+  if (!server.start(err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  std::cout << "qorvix serving " << path << " on http://0.0.0.0:" << port << "\n"
+            << "  POST /v1/chat/completions   POST /v1/completions   GET /v1/models\n"
+            << "  (Ctrl-C to stop)\n";
+
+  auto handler = [&](const api::HttpRequest& req, api::HttpResponder& res) {
+    if (req.method == "OPTIONS") {
+      res.send(200, "text/plain", "");
+      return;
+    }
+    if (req.method == "GET" && req.target == "/v1/models") {
+      res.send(200, "application/json", api::modelsResponse({modelId}).dump());
+      return;
+    }
+    if (req.method == "GET" && (req.target == "/" || req.target == "/health")) {
+      res.send(200, "application/json", R"({"status":"ok","service":"qorvix"})");
+      return;
+    }
+
+    const bool isChat = req.target == "/v1/chat/completions";
+    const bool isCompletion = req.target == "/v1/completions";
+    if (req.method != "POST" || (!isChat && !isCompletion)) {
+      res.send(404, "application/json",
+               api::errorResponse("unknown route " + req.method + " " + req.target, "not_found").dump());
+      return;
+    }
+
+    std::string perr;
+    auto body = api::json::parse(req.body, &perr);
+    if (!body) {
+      res.send(400, "application/json", api::errorResponse("invalid JSON: " + perr).dump());
+      return;
+    }
+
+    std::string prompt, respModel = modelId;
+    bool stream = false;
+    qorvix::scheduler::RequestParams rp;
+    if (isChat) {
+      auto cr = api::parseChatRequest(*body, perr);
+      if (!cr.valid) {
+        res.send(400, "application/json", api::errorResponse(perr).dump());
+        return;
+      }
+      prompt = api::buildChatPrompt(cr.messages);
+      stream = cr.stream;
+      rp = toRequestParams(cr.sampling);
+      if (!cr.model.empty()) respModel = cr.model;
+    } else {
+      auto cr = api::parseCompletionRequest(*body, perr);
+      if (!cr.valid) {
+        res.send(400, "application/json", api::errorResponse(perr).dump());
+        return;
+      }
+      prompt = cr.prompt;
+      stream = cr.stream;
+      rp = toRequestParams(cr.sampling);
+      if (!cr.model.empty()) respModel = cr.model;
+    }
+
+    const std::string id = (isChat ? "chatcmpl-" : "cmpl-") + std::to_string(++idCounter);
+
+    if (stream) {
+      res.beginStream(200, "text/event-stream");
+      if (isChat) res.writeChunk(api::sseData(api::chatChunk(id, respModel, "", true, "")));
+      sched.submit(prompt, rp, [&](qorvix::scheduler::RequestId, const std::string& piece) {
+        res.writeChunk(api::sseData(isChat ? api::chatChunk(id, respModel, piece, false, "")
+                                           : api::completionChunk(id, respModel, piece, "")));
+      });
+      auto results = sched.runToCompletion();
+      const bool eos = !results.empty() && results.front().hitEos;
+      const std::string finish = eos ? "stop" : "length";
+      res.writeChunk(api::sseData(isChat ? api::chatChunk(id, respModel, "", false, finish)
+                                         : api::completionChunk(id, respModel, "", finish)));
+      res.writeChunk(api::sseDone());
+      res.endStream();
+    } else {
+      sched.submit(prompt, rp);
+      auto results = sched.runToCompletion();
+      if (results.empty()) {
+        res.send(500, "application/json", api::errorResponse("generation produced no result", "server_error").dump());
+        return;
+      }
+      const auto& r = results.front();
+      const std::string finish = r.hitEos ? "stop" : "length";
+      const int completion = static_cast<int>(r.tokens.size());
+      auto json = isChat ? api::chatCompletion(id, respModel, r.text, r.promptTokens, completion, finish)
+                         : api::completion(id, respModel, r.text, r.promptTokens, completion, finish);
+      res.send(200, "application/json", json.dump());
+    }
+  };
+
+  server.run(handler);
+  return 0;
+}
+
 int cmdGpu() {
   if (!qorvix::cuda::builtWithCuda()) {
     std::cout << "CUDA support: not built in.\n"
@@ -306,6 +463,7 @@ int printUsage() {
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
             << "  generate <file> --prompt \"...\"   Generate text from a GGUF model\n"
+            << "  serve <file> [--port N]         Start the OpenAI-compatible HTTP server\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
@@ -332,6 +490,7 @@ int main(int argc, char** argv) {
   if (command == "gguf-info") return cmdGgufInfo(arg1);
   if (command == "model-info") return cmdModelInfo(arg1);
   if (command == "generate") return cmdGenerate(args);
+  if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 

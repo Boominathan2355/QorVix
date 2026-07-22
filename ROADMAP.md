@@ -203,12 +203,22 @@ kernels. Benchmark against Phase 5 baseline before/after each optimization.
 - Verified locally (standalone harness + Catch2): parsing, escaping, malformed-input rejection,
   request→struct, response/chunk shapes, SSE.
 
-**Part b (next):** the HTTP transport — a from-scratch HTTP/1.1 server (cross-platform sockets,
-keeps the "build from scratch" mission and stays vcpkg-free) wired to the scheduler, plus a
-`qorvix serve --model <file>` CLI. Verify by curling `/v1/models` and streaming/non-streaming
-`/v1/chat/completions` against TinyLlama. (Boost.Beast remains an option for production hardening.)
-WebSocket streaming and the multimodal endpoints (embeddings/audio/images) follow their backends
-in Phases 11+.
+**Part b ✅ — HTTP transport + `serve`:** a from-scratch cross-platform HTTP/1.1 server
+(winsock/POSIX, no vcpkg) in the `api` module, and `qorvix serve <file> [--port --ctx
+--max-concurrent]` wiring it to the scheduler. Routes `GET /v1/models`, `POST /v1/chat/completions`,
+`POST /v1/completions` (streaming SSE + non-streaming), plus `/health` and CORS. **Verified with
+curl against TinyLlama:** `/v1/models` lists the model; non-streaming `/v1/completions` returns a
+proper OpenAI object ("The capital of France is" → "the city of Paris, which is the", with token
+usage); streaming `/v1/chat/completions` emits the correct chunk sequence (role delta → content
+deltas → `finish_reason` → `[DONE]`).
+
+**Known follow-ups:** chat quality needs the model's own chat template (GGUF
+`tokenizer.chat_template`) — the current generic `user:/assistant:` template mismatches
+instruction-tuned models, so use `/v1/completions` for faithful output meanwhile. The server is
+single-connection (one request at a time) — concurrent HTTP + the scheduler's batching needs a
+threaded accept loop. WebSocket streaming and the multimodal endpoints
+(embeddings/audio/images) follow their backends in Phases 11+. Boost.Beast stays an option for
+production hardening.
 
 ## Phase 10 — Multi-GPU
 NCCL-based tensor parallelism, pipeline parallelism, expert parallelism, load balancing across
