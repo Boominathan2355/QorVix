@@ -211,8 +211,8 @@ __global__ void rmsnormKernel(float* __restrict__ out, const float* __restrict__
 }
 
 // RoPE (NeoX: rotate split-half pairs (i, i+head_dim/2)) over a [n_heads*head_dim] vector.
-__global__ void ropeNeoxKernel(float* __restrict__ vec, int n_heads, int head_dim, int pos,
-                               float freqBase) {
+__device__ inline void ropeNeoxBody(float* __restrict__ vec, int n_heads, int head_dim, int pos,
+                                    float freqBase) {
   const int half = head_dim / 2;
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // one thread per (head, pair)
   if (idx >= n_heads * half) return;
@@ -224,6 +224,16 @@ __global__ void ropeNeoxKernel(float* __restrict__ vec, int n_heads, int head_di
   const float a = v[i], b = v[i + half];
   v[i] = a * c - b * s;
   v[i + half] = a * s + b * c;
+}
+__global__ void ropeNeoxKernel(float* __restrict__ vec, int n_heads, int head_dim, int pos,
+                               float freqBase) {
+  ropeNeoxBody(vec, n_heads, head_dim, pos, freqBase);
+}
+// Graph-capturable variant: reads pos from a device param buffer (params[1]) so a captured graph
+// stays valid as pos advances — only dParams is updated per token, not the launch args.
+__global__ void ropeNeoxKernelP(float* __restrict__ vec, int n_heads, int head_dim,
+                                const int* __restrict__ params, float freqBase) {
+  ropeNeoxBody(vec, n_heads, head_dim, params[1], freqBase);
 }
 
 // SwiGLU: out[i] = silu(gate[i]) * up[i], silu(z) = z * sigmoid(z).
@@ -261,19 +271,37 @@ __global__ void matmulF32Kernel(float* __restrict__ out, const float* __restrict
 }
 
 // Copy one embedding row: dst[i] = table[token*d + i]. (A kernel keeps everything device-side.)
-__global__ void embedRowKernel(float* __restrict__ dst, const float* __restrict__ table, int token,
-                               int d) {
+__device__ inline void embedRowBody(float* __restrict__ dst, const float* __restrict__ table,
+                                    int token, int d) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < d) dst[i] = table[static_cast<std::size_t>(token) * d + i];
 }
+__global__ void embedRowKernel(float* __restrict__ dst, const float* __restrict__ table, int token,
+                               int d) {
+  embedRowBody(dst, table, token, d);
+}
+// Graph-capturable variant: token comes from the device param buffer (params[0]).
+__global__ void embedRowKernelP(float* __restrict__ dst, const float* __restrict__ table,
+                                const int* __restrict__ params, int d) {
+  embedRowBody(dst, table, params[0], d);
+}
 
 // Copy a kvDim vector into the KV cache slot for (layer, pos): cache[(layer*maxSeq+pos)*kvDim+i].
-__global__ void kvStoreKernel(float* __restrict__ cache, const float* __restrict__ src, int layer,
-                              int pos, int maxSeq, int kvDim) {
+__device__ inline void kvStoreBody(float* __restrict__ cache, const float* __restrict__ src,
+                                   int layer, int pos, int maxSeq, int kvDim) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < kvDim) {
     cache[(static_cast<std::size_t>(layer) * maxSeq + pos) * kvDim + i] = src[i];
   }
+}
+__global__ void kvStoreKernel(float* __restrict__ cache, const float* __restrict__ src, int layer,
+                              int pos, int maxSeq, int kvDim) {
+  kvStoreBody(cache, src, layer, pos, maxSeq, kvDim);
+}
+// Graph-capturable variant: pos comes from the device param buffer (params[1]).
+__global__ void kvStoreKernelP(float* __restrict__ cache, const float* __restrict__ src, int layer,
+                               const int* __restrict__ params, int maxSeq, int kvDim) {
+  kvStoreBody(cache, src, layer, params[1], maxSeq, kvDim);
 }
 
 // Single-query (decode-step) attention with a cached K/V that live in VRAM. One block per query
@@ -281,9 +309,9 @@ __global__ void kvStoreKernel(float* __restrict__ cache, const float* __restrict
 // softmax(qK^T / sqrt(headDim)) V over cached positions 0..seqLen-1. Correct-and-clear (per-t
 // block reduce + serial softmax); FlashAttention-style tiling is the later optimization.
 // Shared memory: (seqLen + headDim) floats.
-__global__ void attentionDecodeKernel(float* __restrict__ out, const float* __restrict__ q,
-                                      const float* __restrict__ K, const float* __restrict__ V,
-                                      int nHeads, int nKv, int headDim, int seqLen, int kvDim) {
+__device__ inline void attentionDecodeBody(float* __restrict__ out, const float* __restrict__ q,
+                                           const float* __restrict__ K, const float* __restrict__ V,
+                                           int nHeads, int nKv, int headDim, int seqLen, int kvDim) {
   const int h = blockIdx.x;
   if (h >= nHeads) return;
   const int kvHead = h / (nHeads / nKv);
@@ -329,6 +357,20 @@ __global__ void attentionDecodeKernel(float* __restrict__ out, const float* __re
     acc += scores[t] * vt[tid];
   }
   out[static_cast<std::size_t>(h) * headDim + tid] = acc;
+}
+__global__ void attentionDecodeKernel(float* __restrict__ out, const float* __restrict__ q,
+                                      const float* __restrict__ K, const float* __restrict__ V,
+                                      int nHeads, int nKv, int headDim, int seqLen, int kvDim) {
+  attentionDecodeBody(out, q, K, V, nHeads, nKv, headDim, seqLen, kvDim);
+}
+// Graph-capturable variant: seqLen = params[1] + 1 (pos+1). Shared memory is sized at capture for
+// the max sequence, but the body only touches scores[0..seqLen-1] and red[0..headDim-1], so the
+// math is bit-identical to the eager kernel.
+__global__ void attentionDecodeKernelP(float* __restrict__ out, const float* __restrict__ q,
+                                       const float* __restrict__ K, const float* __restrict__ V,
+                                       int nHeads, int nKv, int headDim, const int* __restrict__ params,
+                                       int kvDim) {
+  attentionDecodeBody(out, q, K, V, nHeads, nKv, headDim, params[1] + 1, kvDim);
 }
 
 }  // namespace
@@ -1189,6 +1231,11 @@ class GpuModelImpl final : public GpuModel {
   explicit GpuModelImpl(const GpuModelConfig& cfg) : cfg_(cfg) {}
 
   ~GpuModelImpl() override {
+    if (graphExec_) cudaGraphExecDestroy(graphExec_);
+    if (graph_) cudaGraphDestroy(graph_);
+    if (stream_) cudaStreamDestroy(stream_);
+    if (hParams_) cudaFreeHost(hParams_);
+    if (dParams_) cudaFree(dParams_);
     auto f = [](void* p) { if (p) cudaFree(p); };
     f(dTokEmbd_);
     f(dOutNorm_);
@@ -1250,12 +1297,31 @@ class GpuModelImpl final : public GpuModel {
       return false;
     }
     hostLogits_.resize(vocab);
+
+    // CUDA Graph plumbing: a dedicated stream, a 2-int device param buffer {token, pos} updated
+    // per token (outside the graph), and a pinned host mirror. Attention shared memory is fixed at
+    // the max sequence so the captured graph is valid for every pos. If that would exceed the
+    // 48 KB static shared-mem limit, disable the graph path and fall back to eager launches.
+    attnShMax_ = (static_cast<std::size_t>(cfg_.maxSeq) + cfg_.headDim) * sizeof(float);
+    if (attnShMax_ > 48 * 1024) useGraph_ = false;
+    if (cudaStreamCreate(&stream_) != cudaSuccess ||
+        cudaMalloc(&dParams_, 2 * sizeof(int)) != cudaSuccess ||
+        cudaMallocHost(&hParams_, 2 * sizeof(int)) != cudaSuccess) {
+      useGraph_ = false;  // graph unavailable; eager path still works
+    }
     return true;
   }
 
   void reset() override { /* KV slots are overwritten per position; nothing to clear */ }
 
   const std::vector<float>& forward(int token, int pos) override {
+    if (useGraph_) return forwardGraph(token, pos);
+    return forwardEager(token, pos);
+  }
+
+  // Eager path: one host-issued launch per kernel on the default stream. Kept as the reference and
+  // as the fallback when graph capture is unavailable.
+  const std::vector<float>& forwardEager(int token, int pos) {
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
     const int hd = cfg_.headDim, mx = cfg_.maxSeq;
     auto g = [](int n) { return (n + 255) / 256; };
@@ -1290,6 +1356,66 @@ class GpuModelImpl final : public GpuModel {
     return hostLogits_;
   }
 
+  // Graph path: capture the whole forward once (token/pos read from dParams_ so the structure is
+  // static), then replay it with a single cudaGraphLaunch per token. Eliminates ~350 per-token
+  // host launches. Bit-identical to the eager path — same kernels, same math.
+  const std::vector<float>& forwardGraph(int token, int pos) {
+    hParams_[0] = token;
+    hParams_[1] = pos;
+    if (!graphReady_) {
+      cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal);
+      recordForward();
+      cudaError_t ce = cudaStreamEndCapture(stream_, &graph_);
+      if (ce != cudaSuccess ||
+          cudaGraphInstantiate(&graphExec_, graph_, 0) != cudaSuccess) {
+        useGraph_ = false;  // capture/instantiate failed — fall back permanently
+        return forwardEager(token, pos);
+      }
+      graphReady_ = true;
+    }
+    // Update params on the capture stream, then replay. Same-stream ordering guarantees the copy
+    // lands before any kernel reads dParams_.
+    cudaMemcpyAsync(dParams_, hParams_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_);
+    cudaGraphLaunch(graphExec_, stream_);
+    cudaStreamSynchronize(stream_);
+    return hostLogits_;
+  }
+
+  // Records the forward pass onto stream_ for graph capture: every launch is on stream_, token/pos
+  // come from dParams_ via the *P kernels, and attention shared memory is fixed at attnShMax_.
+  void recordForward() {
+    const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
+    const int hd = cfg_.headDim, mx = cfg_.maxSeq;
+    auto g = [](int n) { return (n + 255) / 256; };
+
+    embedRowKernelP<<<g(d), 256, 0, stream_>>>(dx_, dTokEmbd_, dParams_, d);
+    for (int l = 0; l < cfg_.nLayers; ++l) {
+      DevLayer& w = layers_[l];
+      rmsnormKernel<<<1, 256, 0, stream_>>>(dxn_, dx_, w.attnNorm, d, cfg_.normEps);
+      matmulS(dq_, w.wq, dxn_);
+      matmulS(dk_, w.wk, dxn_);
+      matmulS(dv_, w.wv, dxn_);
+      ropeNeoxKernelP<<<g(cfg_.nHeads * hd / 2), 256, 0, stream_>>>(dq_, cfg_.nHeads, hd, dParams_, cfg_.ropeFreqBase);
+      ropeNeoxKernelP<<<g(cfg_.nKv * hd / 2), 256, 0, stream_>>>(dk_, cfg_.nKv, hd, dParams_, cfg_.ropeFreqBase);
+      kvStoreKernelP<<<g(kvDim), 256, 0, stream_>>>(dKc_, dk_, l, dParams_, mx, kvDim);
+      kvStoreKernelP<<<g(kvDim), 256, 0, stream_>>>(dVc_, dv_, l, dParams_, mx, kvDim);
+      float* Kl = dKc_ + static_cast<std::size_t>(l) * mx * kvDim;
+      float* Vl = dVc_ + static_cast<std::size_t>(l) * mx * kvDim;
+      attentionDecodeKernelP<<<cfg_.nHeads, hd, attnShMax_, stream_>>>(dattn_, dq_, Kl, Vl, cfg_.nHeads, cfg_.nKv, hd, dParams_, kvDim);
+      matmulS(dtmp_, w.wo, dattn_);
+      addKernel<<<g(d), 256, 0, stream_>>>(dx_, dtmp_, d);
+      rmsnormKernel<<<1, 256, 0, stream_>>>(dxn_, dx_, w.ffnNorm, d, cfg_.normEps);
+      matmulS(dg_, w.ffnGate, dxn_);
+      matmulS(du_, w.ffnUp, dxn_);
+      swigluKernel<<<g(ffn), 256, 0, stream_>>>(dact_, dg_, du_, ffn);
+      matmulS(dtmp_, w.ffnDown, dact_);
+      addKernel<<<g(d), 256, 0, stream_>>>(dx_, dtmp_, d);
+    }
+    rmsnormKernel<<<1, 256, 0, stream_>>>(dxn_, dx_, dOutNorm_, d, cfg_.normEps);
+    matmulS(dlogits_, output_, dxn_);
+    cudaMemcpyAsync(hostLogits_.data(), dlogits_, cfg_.vocab * sizeof(float), cudaMemcpyDeviceToHost, stream_);
+  }
+
  private:
   struct DevLayer {
     float* attnNorm = nullptr;
@@ -1297,7 +1423,7 @@ class GpuModelImpl final : public GpuModel {
     DevWeight wq, wk, wv, wo, ffnGate, ffnUp, ffnDown;
   };
 
-  // Dispatches out = W * x to the kernel for W's quant type.
+  // Dispatches out = W * x to the kernel for W's quant type (default stream, eager path).
   void matmul(float* out, const DevWeight& w, const float* x) {
     const int grid = (w.rows + kWarpsPerBlock - 1) / kWarpsPerBlock, threads = kWarpsPerBlock * 32;
     switch (w.type) {
@@ -1305,6 +1431,17 @@ class GpuModelImpl final : public GpuModel {
       case 14: qmatmulQ6_KKernel<<<grid, threads>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
       case 8: qmatmulQ8_0Kernel<<<grid, threads>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
       default: matmulF32Kernel<<<w.rows, 256>>>(out, static_cast<const float*>(w.d), x, w.rows, w.cols); break;
+    }
+  }
+
+  // Same dispatch, launched on stream_ for graph capture. Identical kernels/args to matmul().
+  void matmulS(float* out, const DevWeight& w, const float* x) {
+    const int grid = (w.rows + kWarpsPerBlock - 1) / kWarpsPerBlock, threads = kWarpsPerBlock * 32;
+    switch (w.type) {
+      case 12: qmatmulQ4_KKernel<<<grid, threads, 0, stream_>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
+      case 14: qmatmulQ6_KKernel<<<grid, threads, 0, stream_>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
+      case 8: qmatmulQ8_0Kernel<<<grid, threads, 0, stream_>>>(out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols); break;
+      default: matmulF32Kernel<<<w.rows, 256, 0, stream_>>>(out, static_cast<const float*>(w.d), x, w.rows, w.cols); break;
     }
   }
 
@@ -1317,6 +1454,16 @@ class GpuModelImpl final : public GpuModel {
   float *dx_ = nullptr, *dxn_ = nullptr, *dq_ = nullptr, *dk_ = nullptr, *dv_ = nullptr;
   float *dattn_ = nullptr, *dtmp_ = nullptr, *dg_ = nullptr, *du_ = nullptr, *dact_ = nullptr, *dlogits_ = nullptr;
   std::vector<float> hostLogits_;
+
+  // CUDA Graph state. The graph is captured on the first forwardGraph() call and replayed after.
+  cudaStream_t stream_ = nullptr;
+  cudaGraph_t graph_ = nullptr;
+  cudaGraphExec_t graphExec_ = nullptr;
+  int* dParams_ = nullptr;    // device {token, pos}, read by the *P kernels
+  int* hParams_ = nullptr;    // pinned host mirror, copied to dParams_ per token
+  std::size_t attnShMax_ = 0; // fixed attention shared-mem size (max sequence)
+  bool useGraph_ = true;      // false disables capture and uses the eager path
+  bool graphReady_ = false;   // true once the graph is captured + instantiated
 };
 
 }  // namespace
