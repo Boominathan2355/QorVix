@@ -126,6 +126,61 @@ __global__ void addKernel(float* __restrict__ out, const float* __restrict__ x, 
   if (i < n) out[i] += x[i];
 }
 
+// Single-query (decode-step) attention with a cached K/V that live in VRAM. One block per query
+// head (blockDim == headDim); GQA maps query head h -> kv head h/(nHeads/nKv). Computes
+// softmax(qK^T / sqrt(headDim)) V over cached positions 0..seqLen-1. Correct-and-clear (per-t
+// block reduce + serial softmax); FlashAttention-style tiling is the later optimization.
+// Shared memory: (seqLen + headDim) floats.
+__global__ void attentionDecodeKernel(float* __restrict__ out, const float* __restrict__ q,
+                                      const float* __restrict__ K, const float* __restrict__ V,
+                                      int nHeads, int nKv, int headDim, int seqLen, int kvDim) {
+  const int h = blockIdx.x;
+  if (h >= nHeads) return;
+  const int kvHead = h / (nHeads / nKv);
+  const int tid = threadIdx.x;  // 0..headDim-1
+  const float* qh = q + static_cast<std::size_t>(h) * headDim;
+  const float invSqrt = rsqrtf(static_cast<float>(headDim));
+
+  extern __shared__ float sh[];
+  float* scores = sh;               // seqLen
+  float* red = sh + seqLen;         // headDim (reduction scratch)
+
+  // scores[t] = (qh . K[t][kvHead]) * invSqrt
+  for (int t = 0; t < seqLen; ++t) {
+    const float* kt = K + static_cast<std::size_t>(t) * kvDim + kvHead * headDim;
+    red[tid] = qh[tid] * kt[tid];
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      if (tid < s) red[tid] += red[tid + s];
+      __syncthreads();
+    }
+    if (tid == 0) scores[t] = red[0] * invSqrt;
+    __syncthreads();
+  }
+
+  // softmax over scores (serial on lane 0 — seqLen is small per decode step)
+  if (tid == 0) {
+    float mx = scores[0];
+    for (int t = 1; t < seqLen; ++t) mx = fmaxf(mx, scores[t]);
+    float sum = 0.0f;
+    for (int t = 0; t < seqLen; ++t) {
+      scores[t] = expf(scores[t] - mx);
+      sum += scores[t];
+    }
+    const float inv = 1.0f / sum;
+    for (int t = 0; t < seqLen; ++t) scores[t] *= inv;
+  }
+  __syncthreads();
+
+  // out[h][d] = sum_t scores[t] * V[t][kvHead][d]
+  float acc = 0.0f;
+  for (int t = 0; t < seqLen; ++t) {
+    const float* vt = V + static_cast<std::size_t>(t) * kvDim + kvHead * headDim;
+    acc += scores[t] * vt[tid];
+  }
+  out[static_cast<std::size_t>(h) * headDim + tid] = acc;
+}
+
 }  // namespace
 
 bool builtWithCuda() noexcept { return true; }
@@ -466,6 +521,76 @@ SelfTestResult opsSelfTest() {
   const bool ok = maxErr < 1e-3f;
   return {true, ok,
           (ok ? "rmsnorm/rope/swiglu/add match CPU (max err " : "GPU ops disagree with CPU (max err ") +
+              std::to_string(maxErr) + ")"};
+}
+
+SelfTestResult attentionSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  // GQA: 4 query heads, 2 kv heads, head_dim 8, 5 cached positions.
+  const int nHeads = 4, nKv = 2, headDim = 8, seqLen = 5;
+  const int kvDim = nKv * headDim;
+  const int group = nHeads / nKv;
+  std::vector<float> q(static_cast<std::size_t>(nHeads) * headDim);
+  std::vector<float> K(static_cast<std::size_t>(seqLen) * kvDim);
+  std::vector<float> V(static_cast<std::size_t>(seqLen) * kvDim);
+  for (std::size_t i = 0; i < q.size(); ++i) q[i] = 0.05f * ((i % 11) - 5);
+  for (std::size_t i = 0; i < K.size(); ++i) K[i] = 0.03f * ((i % 13) - 6);
+  for (std::size_t i = 0; i < V.size(); ++i) V[i] = 0.04f * ((i % 7) - 3);
+
+  // CPU reference.
+  std::vector<float> ref(static_cast<std::size_t>(nHeads) * headDim, 0.0f), gpu(ref.size());
+  const float invSqrt = 1.0f / std::sqrt(static_cast<float>(headDim));
+  for (int h = 0; h < nHeads; ++h) {
+    const int kvHead = h / group;
+    std::vector<float> sc(seqLen);
+    for (int t = 0; t < seqLen; ++t) {
+      float dot = 0.0f;
+      for (int d = 0; d < headDim; ++d)
+        dot += q[h * headDim + d] * K[t * kvDim + kvHead * headDim + d];
+      sc[t] = dot * invSqrt;
+    }
+    float mx = sc[0];
+    for (int t = 1; t < seqLen; ++t) mx = std::max(mx, sc[t]);
+    float sum = 0.0f;
+    for (int t = 0; t < seqLen; ++t) {
+      sc[t] = std::exp(sc[t] - mx);
+      sum += sc[t];
+    }
+    for (int d = 0; d < headDim; ++d) {
+      float acc = 0.0f;
+      for (int t = 0; t < seqLen; ++t)
+        acc += (sc[t] / sum) * V[t * kvDim + kvHead * headDim + d];
+      ref[h * headDim + d] = acc;
+    }
+  }
+
+  float *dq = nullptr, *dK = nullptr, *dV = nullptr, *dout = nullptr;
+  cudaMalloc(&dq, q.size() * sizeof(float));
+  cudaMalloc(&dK, K.size() * sizeof(float));
+  cudaMalloc(&dV, V.size() * sizeof(float));
+  cudaMalloc(&dout, gpu.size() * sizeof(float));
+  cudaMemcpy(dq, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(dK, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(dV, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice);
+
+  const std::size_t shBytes = (seqLen + headDim) * sizeof(float);
+  attentionDecodeKernel<<<nHeads, headDim, shBytes>>>(dout, dq, dK, dV, nHeads, nKv, headDim,
+                                                      seqLen, kvDim);
+  cudaError_t e = cudaGetLastError();
+  if (e == cudaSuccess) e = cudaDeviceSynchronize();
+  cudaMemcpy(gpu.data(), dout, gpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaFree(dq);
+  cudaFree(dK);
+  cudaFree(dV);
+  cudaFree(dout);
+  if (e != cudaSuccess) return {true, false, "attention kernel launch: " + cudaErr(e)};
+
+  float maxErr = 0.0f;
+  for (std::size_t i = 0; i < ref.size(); ++i) maxErr = std::max(maxErr, std::fabs(gpu[i] - ref[i]));
+  const bool ok = maxErr < 1e-3f;
+  return {true, ok,
+          (ok ? "GQA decode attention matches CPU (max err " : "attention disagrees with CPU (max err ") +
               std::to_string(maxErr) + ")"};
 }
 

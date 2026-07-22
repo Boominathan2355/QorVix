@@ -55,4 +55,7 @@ SelfTestResult qmatmulSelfTest();
 // reference — the elementwise/norm ops the on-GPU forward pass is assembled from.
 SelfTestResult opsSelfTest();
 
+// Single-query GQA attention over a cached K/V in VRAM, checked against a CPU reference.
+SelfTestResult attentionSelfTest();
+
 }  // namespace qorvix::cuda
