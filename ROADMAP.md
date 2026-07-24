@@ -233,6 +233,23 @@ proper OpenAI object ("The capital of France is" → "the city of Paris, which i
 usage); streaming `/v1/chat/completions` emits the correct chunk sequence (role delta → content
 deltas → `finish_reason` → `[DONE]`).
 
+**Port allocation (decided 2026-07-24):** Qorvix reserves **2005–2010**, one contiguous block so a
+full deployment never collides with itself and operators can firewall one range. Defined once in
+`core/include/qorvix/ports.hpp` and pinned by tests — `kRuntime` is shipped, so renumbering it
+breaks deployed client configs and the test fails loudly to force a deliberate decision.
+
+| Port | Service | Status |
+|------|---------|--------|
+| 2005 | Qorvix Runtime (`qorvix serve`) | ✅ shipped (was 8080) |
+| 2006 | Qorvix Gateway (auth, rate limit, model routing) | reserved — Phase 13 |
+| 2007 | Qorvix Dashboard (web UI) | reserved — Phase 12 |
+| 2008 | Qorvix Admin API (load/unload, introspection) | reserved |
+| 2009 | Qorvix Metrics (Prometheus `/metrics`) | reserved — Phase 12 |
+| 2010 | Qorvix gRPC | reserved — not yet scheduled |
+
+Admin and Metrics are deliberately separate ports from the inference endpoint so metrics can be
+scraped, and control operations firewalled, without exposing either through the other.
+
 **Known follow-ups:** chat quality needs the model's own chat template (GGUF
 `tokenizer.chat_template`) — the current generic `user:/assistant:` template mismatches
 instruction-tuned models, so use `/v1/completions` for faithful output meanwhile. The server is

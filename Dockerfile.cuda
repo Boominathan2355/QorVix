@@ -105,5 +105,9 @@ COPY --from=builder /src/build/linux-release/plugins/example/qorvix_plugin_examp
 
 USER qorvix
 
+# Qorvix reserves 2005-2010; this image only serves the Runtime. Metadata only — publish with
+# `docker run --gpus all -p 2005:2005 ... serve <model.gguf>`.
+EXPOSE 2005
+
 ENTRYPOINT ["qorvix"]
 CMD ["help"]

@@ -3,6 +3,7 @@ find_package(Catch2 3 CONFIG QUIET)
 if(Catch2_FOUND)
   add_executable(qorvix_tests
     core_smoke_test.cpp
+    ports_test.cpp
     model_registry_test.cpp
     model_watcher_test.cpp
     plugin_registry_test.cpp

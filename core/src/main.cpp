@@ -15,6 +15,7 @@
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
+#include "qorvix/ports.hpp"
 #include "qorvix/runtime/dequant.hpp"
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
@@ -416,7 +417,7 @@ int cmdServe(const std::vector<std::string_view>& args) {
     std::cerr << "usage: qorvix serve <file.gguf> [--port N] [--max-concurrent N] [--ctx N]\n";
     return 1;
   }
-  int port = 8080, maxConcurrent = 4, ctx = 4096;
+  int port = qorvix::ports::kRuntime, maxConcurrent = 4, ctx = 4096;
   if (auto v = flagValue(args, "--port"); !v.empty()) port = std::stoi(v);
   if (auto v = flagValue(args, "--max-concurrent"); !v.empty()) maxConcurrent = std::stoi(v);
   if (auto v = flagValue(args, "--ctx"); !v.empty()) ctx = std::stoi(v);
@@ -450,6 +451,11 @@ int cmdServe(const std::vector<std::string_view>& args) {
   api::HttpServer server(port);
   if (!server.start(err)) {
     std::cerr << "error: " << err << "\n";
+    // A bind failure on one of our own reserved ports is nearly always a second Qorvix service
+    // already running, so name it rather than leaving the operator to look the number up.
+    if (const auto svc = qorvix::ports::serviceName(port); !svc.empty())
+      std::cerr << "note: port " << port << " is the default for " << svc
+                << " — is one already running? Override with --port N.\n";
     return 1;
   }
   std::cout << "qorvix serving " << path << " on http://0.0.0.0:" << port << "\n"
@@ -695,6 +701,9 @@ int printUsage() {
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
             << "  generate <file> --prompt \"...\"   Generate text from a GGUF model\n"
             << "  serve <file> [--port N]         Start the OpenAI-compatible HTTP server\n"
+            << "                                  (default port " << qorvix::ports::kRuntime
+            << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
+            << qorvix::ports::kRangeLast << ")\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
