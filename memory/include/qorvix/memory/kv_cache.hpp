@@ -7,6 +7,11 @@
 
 namespace qorvix::memory {
 
+// Storage precision for cached K/V.
+// NOTE: only F32 is implemented today. Constructing with a quantized type yields an unusable
+// cache (open() returns kInvalidSession) rather than silently storing F32 at F32 cost — the
+// quantized layouts need the page arena to be byte-addressed and the CPU attention path to read
+// K/V through accessors instead of raw kSlot()/vSlot() pointers.
 enum class KvCacheQuantType { F32, Q8_0, Q4_0 };
 
 // Configuration for a GlobalKvCache. A "page" holds `tokensPerPage` tokens of K and V for a

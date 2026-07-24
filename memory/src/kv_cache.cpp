@@ -6,6 +6,12 @@ namespace qorvix::memory {
 
 GlobalKvCache::GlobalKvCache(KvCacheConfig config, std::size_t poolBytes) : config_(config) {
   if (config_.layers <= 0 || config_.kvDim <= 0 || config_.tokensPerPage <= 0) return;
+  // Only F32 storage is implemented. The arena is std::vector<float> and store/fetch are plain
+  // copies, so a quantized type would silently give F32 layout with none of the memory saving —
+  // worse than not offering it. Refuse instead, matching the "degenerate config" contract on
+  // open(); real quantization needs the page arena to become bytes and every kSlot/vSlot consumer
+  // (the CPU attention path) to go through accessors.
+  if (config_.quantType != KvCacheQuantType::F32) return;
 
   const std::size_t perPage = pageFloats();
   totalPages_ = poolBytes / (perPage * sizeof(float));

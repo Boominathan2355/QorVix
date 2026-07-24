@@ -10,6 +10,7 @@ if(Catch2_FOUND)
     gguf_file_test.cpp
     memory_test.cpp
     kv_cache_test.cpp
+    kv_share_test.cpp
     transfer_test.cpp
     cuda_test.cpp
     tensor_parallel_test.cpp
