@@ -91,53 +91,64 @@ std::string buildChatPrompt(const std::vector<ChatMessage>& messages) {
   return out;
 }
 
-std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages, const std::string& chatTemplate) {
-  if (chatTemplate.find("<|im_start|>") != std::string::npos || chatTemplate.find("chatml") != std::string::npos) {
-    std::string out;
-    for (const auto& m : messages) {
-      const std::string r = m.role.empty() ? "user" : m.role;
-      out += "<|im_start|>" + r + "\n" + m.content + "<|im_end|>\n";
-    }
+std::string detectChatTemplateFamily(const std::string& t) {
+  auto has = [&](const char* n) { return t.find(n) != std::string::npos; };
+  // Ordered most-specific first: several families share the "<|user|>" marker and differ only in
+  // how a turn is CLOSED, so the discriminating token must be tested before the shared one.
+  if (has("<|im_start|>")) return "chatml";
+  if (has("start_header_id") || has("eot_id")) return "llama3";
+  if (has("start_of_turn")) return "gemma";
+  if (has("<|end|>")) return "phi3";     // Phi-3: "<|user|>" closed by "<|end|>"
+  if (has("<|user|>")) return "zephyr";  // Zephyr/TinyLlama: "<|user|>" closed by eos_token
+  if (has("[INST]")) return "mistral";
+  return "generic";
+}
+
+std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages,
+                                        const std::string& chatTemplate,
+                                        const std::string& eosToken) {
+  const std::string family = detectChatTemplateFamily(chatTemplate);
+  auto roleOf = [](const ChatMessage& m) { return m.role.empty() ? std::string("user") : m.role; };
+  std::string out;
+
+  if (family == "chatml") {
+    for (const auto& m : messages)
+      out += "<|im_start|>" + roleOf(m) + "\n" + m.content + "<|im_end|>\n";
     out += "<|im_start|>assistant\n";
     return out;
   }
-  if (chatTemplate.find("start_header_id") != std::string::npos || chatTemplate.find("eot_id") != std::string::npos) {
-    std::string out;
-    for (const auto& m : messages) {
-      const std::string r = m.role.empty() ? "user" : m.role;
-      out += "<|start_header_id|>" + r + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>";
-    }
+  if (family == "llama3") {
+    for (const auto& m : messages)
+      out += "<|start_header_id|>" + roleOf(m) + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>";
     out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
     return out;
   }
-  if (chatTemplate.find("start_of_turn") != std::string::npos || chatTemplate.find("gemma") != std::string::npos) {
-    std::string out;
+  if (family == "gemma") {
+    // Gemma names the assistant turn "model", not "assistant".
     for (const auto& m : messages) {
-      const std::string r = m.role.empty() ? "user" : m.role;
+      const std::string r = roleOf(m) == "assistant" ? std::string("model") : roleOf(m);
       out += "<start_of_turn>" + r + "\n" + m.content + "<end_of_turn>\n";
     }
-    out += "<start_of_turn>assistant\n";
+    out += "<start_of_turn>model\n";
     return out;
   }
-  if (chatTemplate.find("<|user|>") != std::string::npos || chatTemplate.find("phi") != std::string::npos) {
-    std::string out;
-    for (const auto& m : messages) {
-      const std::string r = m.role.empty() ? "user" : m.role;
-      out += "<|" + r + "|>\n" + m.content + "<|end|>\n";
-    }
+  if (family == "phi3") {
+    for (const auto& m : messages) out += "<|" + roleOf(m) + "|>\n" + m.content + "<|end|>\n";
     out += "<|assistant|>\n";
     return out;
   }
-  if (chatTemplate.find("[INST]") != std::string::npos) {
-    std::string out;
+  if (family == "zephyr") {
+    // TinyLlama/Zephyr close each turn with the model's EOS piece, not a literal marker.
+    const std::string eos = eosToken.empty() ? std::string("</s>") : eosToken;
+    for (const auto& m : messages) out += "<|" + roleOf(m) + "|>\n" + m.content + eos + "\n";
+    out += "<|assistant|>\n";
+    return out;
+  }
+  if (family == "mistral") {
+    // Only user turns are bracketed; assistant turns are emitted bare.
     for (const auto& m : messages) {
-      if (m.role == "user") {
-        out += "[INST] " + m.content + " [/INST]";
-      } else if (m.role == "assistant") {
-        out += m.content;
-      } else {
-        out += "[INST] " + m.content + " [/INST]";
-      }
+      if (roleOf(m) == "assistant") out += m.content;
+      else out += "[INST] " + m.content + " [/INST]";
     }
     return out;
   }

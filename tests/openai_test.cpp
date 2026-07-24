@@ -94,3 +94,68 @@ TEST_CASE("SSE framing", "[openai]") {
   REQUIRE(line.substr(line.size() - 2) == "\n\n");
   REQUIRE(sseDone() == "data: [DONE]\n\n");
 }
+
+// ---- chat templates (GGUF tokenizer.chat_template) -------------------------------------------
+// The stored template is Jinja2, which we do not evaluate; we identify the family by its marker
+// tokens and emit that format. These pin the detection, because several families share the
+// "<|user|>" marker and only differ in how a turn is CLOSED — getting that wrong runs messages
+// together or truncates them, which looks like a model quality problem, not a prompt bug.
+
+TEST_CASE("detects chat template families by their marker tokens", "[openai][chat]") {
+  REQUIRE(detectChatTemplateFamily("{% for m %}<|im_start|>{{m.role}}") == "chatml");
+  REQUIRE(detectChatTemplateFamily("<|start_header_id|>{{role}}<|end_header_id|>") == "llama3");
+  REQUIRE(detectChatTemplateFamily("{{ '<start_of_turn>' + role }}") == "gemma");
+  REQUIRE(detectChatTemplateFamily("[INST] {{ content }} [/INST]") == "mistral");
+  REQUIRE(detectChatTemplateFamily("") == "generic");
+  REQUIRE(detectChatTemplateFamily("something entirely unknown") == "generic");
+
+  // The discriminating case: both close a "<|user|>" turn, but differently.
+  REQUIRE(detectChatTemplateFamily("<|user|>\n{{content}}<|end|>\n") == "phi3");
+  REQUIRE(detectChatTemplateFamily("<|user|>\n{{content}}{{eos_token}}\n") == "zephyr");
+}
+
+TEST_CASE("renders each family in its own format", "[openai][chat]") {
+  const std::vector<ChatMessage> msgs{{"user", "hi"}, {"assistant", "hello"}, {"user", "bye"}};
+
+  const std::string chatml = buildChatPromptWithTemplate(msgs, "<|im_start|>");
+  REQUIRE(chatml.rfind("<|im_start|>user\nhi<|im_end|>\n", 0) == 0);
+  REQUIRE(chatml.substr(chatml.size() - 22) == "<|im_start|>assistant\n");
+
+  const std::string l3 = buildChatPromptWithTemplate(msgs, "<|start_header_id|>");
+  REQUIRE(l3.find("<|start_header_id|>user<|end_header_id|>\n\nhi<|eot_id|>") == 0);
+
+  const std::string mistral = buildChatPromptWithTemplate(msgs, "[INST]");
+  REQUIRE(mistral == "[INST] hi [/INST]hello[INST] bye [/INST]");  // assistant turns unbracketed
+
+  // Gemma renames the assistant turn to "model".
+  const std::string gemma = buildChatPromptWithTemplate(msgs, "<start_of_turn>");
+  REQUIRE(gemma.find("<start_of_turn>model\nhello<end_of_turn>") != std::string::npos);
+  REQUIRE(gemma.find("<start_of_turn>assistant") == std::string::npos);
+}
+
+TEST_CASE("zephyr templates close turns with the model's own eos piece", "[openai][chat]") {
+  const std::vector<ChatMessage> msgs{{"user", "hi"}};
+  // TinyLlama is this family; passing the wrong terminator is what made its chat output poor.
+  const std::string out = buildChatPromptWithTemplate(msgs, "<|user|>{{eos_token}}", "</s>");
+  REQUIRE(out == "<|user|>\nhi</s>\n<|assistant|>\n");
+
+  // A different model's eos must be honoured, not hard-coded.
+  const std::string other = buildChatPromptWithTemplate(msgs, "<|user|>{{eos_token}}", "<|endoftext|>");
+  REQUIRE(other == "<|user|>\nhi<|endoftext|>\n<|assistant|>\n");
+
+  // Empty eos falls back to the SPM default rather than emitting nothing.
+  REQUIRE(buildChatPromptWithTemplate(msgs, "<|user|>{{eos_token}}", "") ==
+          "<|user|>\nhi</s>\n<|assistant|>\n");
+}
+
+TEST_CASE("an unknown template falls back to the generic prompt", "[openai][chat]") {
+  const std::vector<ChatMessage> msgs{{"user", "hi"}};
+  REQUIRE(buildChatPromptWithTemplate(msgs, "") == buildChatPrompt(msgs));
+  REQUIRE(buildChatPromptWithTemplate(msgs, "no markers here") == buildChatPrompt(msgs));
+}
+
+TEST_CASE("empty role defaults to user in every family", "[openai][chat]") {
+  const std::vector<ChatMessage> msgs{{"", "hi"}};
+  REQUIRE(buildChatPromptWithTemplate(msgs, "<|im_start|>").find("<|im_start|>user\n") == 0);
+  REQUIRE(buildChatPromptWithTemplate(msgs, "<|user|>{{eos_token}}").find("<|user|>\n") == 0);
+}

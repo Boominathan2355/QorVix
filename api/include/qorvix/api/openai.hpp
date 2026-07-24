@@ -54,7 +54,23 @@ CompletionRequest parseCompletionRequest(const json::Value& body, std::string& e
 // ("<role>:\n<content>\n\n" then an "assistant:" turn); exact per-model chat templates
 // (from GGUF metadata) are a later refinement — use /v1/completions for full prompt control.
 std::string buildChatPrompt(const std::vector<ChatMessage>& messages);
-std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages, const std::string& chatTemplate = "");
+// Renders `messages` using the model's own chat template, read from the GGUF
+// `tokenizer.chat_template` metadata key.
+//
+// The stored template is Jinja2, which this does NOT evaluate. Instead it identifies the family
+// by the marker tokens the template contains and emits that family's format directly — enough to
+// cover the templates real GGUF chat models ship, without embedding a Jinja engine. An unknown
+// template falls back to buildChatPrompt's generic "role:\n" form.
+//
+// `eosToken` is the model's EOS piece (e.g. "</s>"); Zephyr/TinyLlama-style templates interpolate
+// it after every message, so passing it wrong truncates or runs messages together.
+std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages,
+                                        const std::string& chatTemplate = "",
+                                        const std::string& eosToken = "");
+
+// Which family buildChatPromptWithTemplate detected — for logging and tests.
+// One of: "chatml", "llama3", "gemma", "phi3", "zephyr", "mistral", "generic".
+std::string detectChatTemplateFamily(const std::string& chatTemplate);
 
 // ---- responses (return JSON values; the server serializes + frames them) -------------------
 

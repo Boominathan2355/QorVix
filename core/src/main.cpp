@@ -438,6 +438,7 @@ int cmdServe(const std::vector<std::string_view>& args) {
   std::optional<qorvix::runtime::TextModel> cpuModel;
   std::unique_ptr<qorvix::GpuEngine> gpuEngine;
   qorvix::runtime::IInferenceEngine* engine = nullptr;
+  std::string chatTemplate;
   try {
     auto file = qorvix::gguf::GgufFile::open(path);
     tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
@@ -445,6 +446,10 @@ int cmdServe(const std::vector<std::string_view>& args) {
       std::cerr << "error: tokenizer: " << err << "\n";
       return 1;
     }
+    // The model's own chat template. Must be read before `file` is moved into the CPU model.
+    // Without it every model got the generic "role:\n" prompt, which instruction-tuned models
+    // were not trained on — the single biggest cause of poor /v1/chat/completions output.
+    chatTemplate = file.getString("tokenizer.chat_template").value_or("");
     if (useGpu) {
       const auto mc = qorvix::runtime::configFromGguf(file, err);
       if (!mc.valid()) { std::cerr << "error: config: " << err << "\n"; return 1; }
@@ -496,9 +501,16 @@ int cmdServe(const std::vector<std::string_view>& args) {
                 << " — is one already running? Override with --port N.\n";
     return 1;
   }
+  // Zephyr-style templates interpolate the model's EOS piece between turns, so resolve it once.
+  const std::string eosPiece =
+      tok->special().eos >= 0 ? tok->decodeToken(tok->special().eos) : std::string("</s>");
+  const std::string chatFamily = api::detectChatTemplateFamily(chatTemplate);
+
   std::cout << "qorvix serving " << path << " on http://0.0.0.0:" << port << "\n"
             << "  backend: " << engine->backendName() << " | max-concurrent: " << maxConcurrent
             << " | ctx: " << ctx << "\n"
+            << "  chat template: " << chatFamily
+            << (chatTemplate.empty() ? " (model has none; using generic prompt)" : "") << "\n"
             << "  POST /v1/chat/completions   POST /v1/completions   GET /v1/models\n"
             << "  (Ctrl-C to stop)\n";
 
@@ -540,7 +552,7 @@ int cmdServe(const std::vector<std::string_view>& args) {
         res.send(400, "application/json", api::errorResponse(perr).dump());
         return;
       }
-      prompt = api::buildChatPromptWithTemplate(cr.messages);
+      prompt = api::buildChatPromptWithTemplate(cr.messages, chatTemplate, eosPiece);
       stream = cr.stream;
       rp = toRequestParams(cr.sampling);
       if (!cr.model.empty()) respModel = cr.model;
