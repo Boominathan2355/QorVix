@@ -11,6 +11,7 @@
 #include "qorvix/api/openai.hpp"
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
+#include "qorvix/cuda/multi_gpu.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
@@ -650,9 +651,36 @@ int cmdGpu() {
   const auto fwd = qorvix::cuda::gpuForwardSelfTest();
   std::cout << "Self-test (GPU forward):  " << (fwd.passed ? "PASS" : (fwd.ran ? "FAIL" : "skip"))
             << " - " << fwd.message << "\n";
+  const auto tp = qorvix::cuda::tensorParallelSelfTest();
+  std::cout << "Self-test (tensor-par):   " << (tp.passed ? "PASS" : (tp.ran ? "FAIL" : "skip"))
+            << " - " << tp.message << "\n";
+
+  // Multi-GPU topology (Phase 10). With one device this reports a world size of 1, which is the
+  // honest answer — tensor parallelism needs >= 2 devices to do anything, but the sharding math
+  // above is verified regardless.
+  const auto topo = qorvix::cuda::queryTopology();
+  std::cout << "\nTopology: " << topo.deviceCount << " device(s)"
+            << ", NCCL " << (qorvix::cuda::builtWithNccl() ? "built in" : "not built in") << "\n";
+  if (topo.deviceCount > 1) {
+    std::cout << "  peer access matrix (rows = src, cols = dst; . none, P pcie, N nvlink):\n";
+    for (int a = 0; a < topo.deviceCount; ++a) {
+      std::cout << "    [" << a << "] ";
+      for (int b = 0; b < topo.deviceCount; ++b) {
+        const auto l = topo.link(a, b);
+        std::cout << (l == qorvix::cuda::PeerLink::Nvlink   ? 'N'
+                      : l == qorvix::cuda::PeerLink::Pcie   ? 'P'
+                                                            : '.');
+      }
+      std::cout << "\n";
+    }
+    std::cout << "  fully connected: " << (topo.fullyConnected(topo.deviceCount) ? "yes" : "no")
+              << " | min free VRAM: " << humanBytes(topo.minFreeMem)
+              << " | aggregate free: " << humanBytes(topo.totalFreeMem) << "\n";
+  }
+
   return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ||
                  (q4k.ran && !q4k.passed) || (q6k.ran && !q6k.passed) || (ops.ran && !ops.passed) ||
-                 (attn.ran && !attn.passed) || (fwd.ran && !fwd.passed)
+                 (attn.ran && !attn.passed) || (fwd.ran && !fwd.passed) || (tp.ran && !tp.passed)
              ? 1
              : 0;
 }

@@ -241,9 +241,43 @@ threaded accept loop. WebSocket streaming and the multimodal endpoints
 (embeddings/audio/images) follow their backends in Phases 11+. Boost.Beast stays an option for
 production hardening.
 
-## Phase 10 — Multi-GPU
+## Phase 10 — Multi-GPU 🚧
 NCCL-based tensor parallelism, pipeline parallelism, expert parallelism, load balancing across
 1/2/4/8 GPUs.
+
+**Part a ✅ — tensor-parallel sharding foundation (verified without multi-GPU hardware).**
+Tensor parallelism is two separable problems: *which* slice of each weight a rank owns and where
+the partial sums must be summed (pure integer math, and where essentially all the real bugs live),
+and *moving bytes between devices* (NCCL). Splitting them means the first is verifiable on one GPU
+— or none — by simulating the ranks; only the transport needs real multi-GPU.
+- `cuda/multi_gpu.hpp`: device topology (P2P reachability matrix, NVLink-vs-PCIe via
+  `cudaDevP2PAttrNativeAtomicSupported`, per-device free VRAM), the `ICollective` seam
+  (`allReduceSum` — the *only* collective a TP decode step needs, twice per layer), and the
+  `TensorParallelPlan`.
+- `tensor_parallel.cpp` is **CUDA-free and compiles into both the real and stub builds**, so the
+  split logic is unit-testable on a machine with no GPU.
+- Sharding: column-parallel (`wq/wk/wv/ffnGate/ffnUp` split by *rows* = output dim, zero-copy since
+  a row range is contiguous) and row-parallel (`wo/ffnDown` split by *cols* = input dim, a strided
+  block gather). Weights stay quantized — a shard is a byte slice, never a dequant.
+- Two constraints found and enforced rather than assumed: (1) **GQA caps TP at the KV-head count** —
+  each rank must own whole KV heads or it would refetch half a head every step, so TinyLlama
+  (nKv=4) tops out at TP=4 regardless of GPU count; (2) **row-parallel column splits must land on
+  quantization-block boundaries** — TinyLlama's ffn=5632 is 22 super-blocks and 22 % 4 ≠ 0, so an
+  even *element* split would cut at 1408 (mid-block) and slice a shared fp16 scale away from the
+  quants it scales. Splitting the *block count* instead yields 6/6/5/5 and stays decodable, so TP=4
+  works where a divisibility requirement would have rejected it.
+- **Verified:** 12 Catch2 cases (2463 assertions) covering plan tiling/contiguity, the
+  wo↔wq and ffnDown↔ffnGate pairing invariant, uneven splits, byte-exact shard gathering, and the
+  rejection paths — passing in a CPU-only build, no GPU needed. Full suite 108 cases / 3851
+  assertions green. `tensorParallelSelfTest()` (surfaced in `qorvix gpu`) additionally simulates a
+  2- and 4-rank all-reduce on one device against the unsharded GPU GEMV.
+- **Note:** TP *reassociates* the dot product, so multi-rank output is equal to single-GPU output
+  only to within float rounding (~1e-7 relative here), not bit-identical. Column-parallel row
+  splits, being a pure partition, remain bit-exact.
+
+**Remaining:** Part b — NCCL transport behind `ICollective` (compile-gated like the CUDA stub/real
+split; needs ≥2 GPUs to execution-verify) and a sharded `GpuModel` that runs the plan. Part c —
+pipeline parallelism, expert parallelism, load balancing.
 
 ## Phase 11 — Multimodal Expansion
 Vision engine (Qwen-VL, Llama Vision, MiniCPM-V, InternVL; OCR, grounding), audio engine

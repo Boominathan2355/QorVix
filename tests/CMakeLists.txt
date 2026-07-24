@@ -11,6 +11,7 @@ if(Catch2_FOUND)
     kv_cache_test.cpp
     transfer_test.cpp
     cuda_test.cpp
+    tensor_parallel_test.cpp
     ops_test.cpp
     dequant_test.cpp
     qmatmul_test.cpp

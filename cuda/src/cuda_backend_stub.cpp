@@ -5,6 +5,7 @@
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_memory.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
+#include "qorvix/cuda/multi_gpu.hpp"
 
 namespace qorvix::cuda {
 
@@ -45,6 +46,13 @@ SelfTestResult attentionSelfTest() {
 SelfTestResult gpuForwardSelfTest() {
   return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
 }
+SelfTestResult tensorParallelSelfTest() {
+  return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
+}
+
+// No devices to probe. The sharding math itself (planTensorParallel / shardRows / shardCols in
+// tensor_parallel.cpp) IS available in this build — it needs no GPU.
+DeviceTopology queryTopology() { return {}; }
 
 std::unique_ptr<memory::ISlabAllocator> makeGpuSlabAllocator() { return nullptr; }
 std::unique_ptr<memory::ITransferEngine> makeCudaTransferEngine() { return nullptr; }

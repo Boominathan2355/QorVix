@@ -17,6 +17,7 @@
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_memory.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
+#include "qorvix/cuda/multi_gpu.hpp"
 #include "qorvix/memory/disk_allocator.hpp"
 #include "qorvix/memory/slab_allocator.hpp"
 
@@ -1527,6 +1528,181 @@ std::unique_ptr<memory::ISlabAllocator> makeGpuSlabAllocator() {
 
 std::unique_ptr<memory::ITransferEngine> makeCudaTransferEngine() {
   return std::make_unique<CudaTransferEngine>();
+}
+
+// ---- multi-GPU: topology + tensor-parallel verification (Phase 10) --------------------------
+
+DeviceTopology queryTopology() {
+  DeviceTopology t;
+  const int n = deviceCount();
+  if (n <= 0) return t;
+  t.deviceCount = n;
+  t.peers.assign(static_cast<std::size_t>(n) * n, PeerLink::None);
+  for (int a = 0; a < n; ++a) {
+    for (int b = 0; b < n; ++b) {
+      if (a == b) { t.peers[static_cast<std::size_t>(a) * n + b] = PeerLink::Nvlink; continue; }
+      int can = 0;
+      if (cudaDeviceCanAccessPeer(&can, a, b) != cudaSuccess || !can) continue;
+      // p2pAttrNativeAtomicSupported distinguishes NVLink from PCIe P2P on every arch this
+      // project targets: PCIe P2P cannot do native device atomics, NVLink can.
+      int nativeAtomics = 0;
+      cudaDeviceGetP2PAttribute(&nativeAtomics, cudaDevP2PAttrNativeAtomicSupported, a, b);
+      t.peers[static_cast<std::size_t>(a) * n + b] =
+          nativeAtomics ? PeerLink::Nvlink : PeerLink::Pcie;
+    }
+    std::size_t freeB = 0, totalB = 0;
+    if (cudaSetDevice(a) == cudaSuccess && cudaMemGetInfo(&freeB, &totalB) == cudaSuccess) {
+      t.totalFreeMem += freeB;
+      t.minFreeMem = (a == 0) ? freeB : std::min(t.minFreeMem, freeB);
+    }
+  }
+  cudaSetDevice(0);
+  return t;
+}
+
+// Verifies the tensor-parallel sharding math on ONE device by simulating the ranks.
+//
+// The check that matters: a row-parallel (column-split) matmul must, after summing the ranks'
+// partials, reproduce the unsharded result — that is the all-reduce contract. And a
+// column-parallel (row-split) matmul must reproduce it by concatenation. If either fails, real
+// multi-GPU would produce wrong logits; catching it here needs no second GPU.
+//
+// Note on exactness: splitting a dot product and summing the pieces REASSOCIATES the addition, so
+// tensor-parallel output is not bit-identical to single-GPU output — only equal to within float
+// rounding. That is inherent to TP, not a defect, so this gates on relative error.
+SelfTestResult tensorParallelSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  auto encodeHalf = [](float f) {
+    __half h = __float2half(f);
+    unsigned short b;
+    std::memcpy(&b, &h, 2);
+    return b;
+  };
+  // A deterministic Q4_K super-block, same construction the Q4_K self-test uses.
+  auto fillBlock = [&](std::uint8_t* blk, int seed) {
+    const unsigned short dh = encodeHalf(0.02f * (seed % 5 + 1));
+    const unsigned short mh = encodeHalf(0.01f);
+    blk[0] = dh & 0xFF; blk[1] = dh >> 8;
+    blk[2] = mh & 0xFF; blk[3] = mh >> 8;
+    for (int i = 0; i < 12; ++i) blk[4 + i] = static_cast<std::uint8_t>((seed * 3 + i * 5) & 0x3F);
+    for (int i = 0; i < 128; ++i) blk[16 + i] = static_cast<std::uint8_t>((seed + i) & 0xFF);
+  };
+
+  // out = W @ x on the device, for a Q4_K weight given as host bytes.
+  auto gemv = [](const void* W, std::size_t wBytes, const float* x, int rows, int cols,
+                 std::vector<float>& out) -> cudaError_t {
+    out.assign(rows, 0.0f);
+    std::uint8_t* dW = nullptr;
+    float *dX = nullptr, *dOut = nullptr;
+    if (cudaMalloc(&dW, wBytes) != cudaSuccess) return cudaErrorMemoryAllocation;
+    cudaMalloc(&dX, static_cast<std::size_t>(cols) * sizeof(float));
+    cudaMalloc(&dOut, static_cast<std::size_t>(rows) * sizeof(float));
+    cudaMemcpy(dW, W, wBytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dX, x, static_cast<std::size_t>(cols) * sizeof(float), cudaMemcpyHostToDevice);
+    qmatmulQ4_KKernel<<<qmatmulGridBlocks(rows), kWarpsPerBlock * 32>>>(dOut, dW, dX, rows, cols);
+    cudaError_t e = cudaGetLastError();
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    cudaMemcpy(out.data(), dOut, static_cast<std::size_t>(rows) * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    cudaFree(dW); cudaFree(dX); cudaFree(dOut);
+    return e;
+  };
+
+  const int rows = 64, nSB = 4, cols = nSB * kQKK;  // 64 x 1024, 4 super-blocks per row
+  std::vector<std::uint8_t> W(static_cast<std::size_t>(rows) * nSB * kQ4KBytes);
+  for (int r = 0; r < rows; ++r)
+    for (int sb = 0; sb < nSB; ++sb)
+      fillBlock(W.data() + (static_cast<std::size_t>(r) * nSB + sb) * kQ4KBytes, r * 7 + sb);
+  std::vector<float> x(cols);
+  for (int i = 0; i < cols; ++i) x[i] = 0.02f * ((i % 9) - 4);
+
+  const GpuWeight full{W.data(), 12u, rows, cols};
+  std::vector<float> ref;
+  if (cudaError_t e = gemv(W.data(), W.size(), x.data(), rows, cols, ref); e != cudaSuccess)
+    return {true, false, "reference GEMV: " + cudaErr(e)};
+  float maxRef = 1e-6f;
+  for (float v : ref) maxRef = std::max(maxRef, std::fabs(v));
+
+  float worst = 0.0f;
+  std::string detail;
+  for (int world : {2, 4}) {
+    // --- row-parallel: split the INPUT dim, sum the ranks' partial sums (the all-reduce) -----
+    std::vector<float> acc(rows, 0.0f);
+    for (int r = 0; r < world; ++r) {
+      const int perRank = nSB / world;
+      const Slice cs{r * perRank * kQKK, perRank * kQKK};
+      WeightShard sh;
+      std::string err;
+      if (!shardCols(full, cs, sh, err)) return {true, false, "shardCols(world=" +
+                                                 std::to_string(world) + "): " + err};
+      std::vector<float> part;
+      if (cudaError_t e = gemv(sh.data(), sh.bytes(), x.data() + cs.begin, sh.rows(), sh.cols(),
+                               part);
+          e != cudaSuccess)
+        return {true, false, "partial GEMV: " + cudaErr(e)};
+      for (int i = 0; i < rows; ++i) acc[i] += part[i];  // stands in for allReduceSum
+    }
+    for (int i = 0; i < rows; ++i) worst = std::max(worst, std::fabs(acc[i] - ref[i]));
+
+    // --- column-parallel: split the OUTPUT dim, concatenate the ranks' slices ----------------
+    std::vector<float> cat(rows, 0.0f);
+    for (int r = 0; r < world; ++r) {
+      const Slice rs{r * (rows / world), rows / world};
+      WeightShard sh;
+      std::string err;
+      if (!shardRows(full, rs, sh, err)) return {true, false, "shardRows(world=" +
+                                                 std::to_string(world) + "): " + err};
+      std::vector<float> part;
+      if (cudaError_t e = gemv(sh.data(), sh.bytes(), x.data(), sh.rows(), sh.cols(), part);
+          e != cudaSuccess)
+        return {true, false, "row-shard GEMV: " + cudaErr(e)};
+      for (int i = 0; i < rs.count; ++i) cat[rs.begin + i] = part[i];
+    }
+    // A row split is a pure partition of the output — no reassociation, so this must be EXACT.
+    for (int i = 0; i < rows; ++i)
+      if (cat[i] != ref[i])
+        return {true, false, "column-parallel row split changed the result at index " +
+                                 std::to_string(i) + " (world=" + std::to_string(world) + ")"};
+  }
+
+  // --- plan invariants on a TinyLlama-shaped config -----------------------------------------
+  GpuModelConfig cfg;
+  cfg.nLayers = 22; cfg.dModel = 2048; cfg.nHeads = 32; cfg.headDim = 64;
+  cfg.nKv = 4; cfg.ffn = 5632; cfg.vocab = 32000; cfg.maxSeq = 2048;
+  const int maxWorld = maxTensorParallelWorld(cfg);
+  for (int world = 1; world <= maxWorld; world *= 2) {
+    int coveredFfn = 0, coveredHeads = 0;
+    for (int r = 0; r < world; ++r) {
+      TensorParallelPlan p;
+      std::string err;
+      if (!planTensorParallel(cfg, world, r, 12u, 12u, p, err))
+        return {true, false, "planTensorParallel(world=" + std::to_string(world) +
+                                 ", rank=" + std::to_string(r) + "): " + err};
+      // The pairing invariant: a rank's column-parallel output must be exactly the input its
+      // own row-parallel weight consumes, or the two would need a reshuffle between them.
+      if (p.woCols.begin != p.qRows.begin || p.woCols.count != p.qRows.count)
+        return {true, false, "wo column slice does not match wq row slice"};
+      if (p.ffnDownCols.begin != p.ffnRows.begin || p.ffnDownCols.count != p.ffnRows.count)
+        return {true, false, "ffnDown column slice does not match ffnGate/ffnUp row slice"};
+      if (p.ffnRows.count % kQKK != 0)
+        return {true, false, "ffn slice not block-aligned at world=" + std::to_string(world)};
+      coveredFfn += p.ffnRows.count;
+      coveredHeads += p.qHeads.count;
+    }
+    // The shards must tile the whole tensor: no gaps, no overlap.
+    if (coveredFfn != cfg.ffn || coveredHeads != cfg.nHeads)
+      return {true, false, "shards do not tile the tensor at world=" + std::to_string(world)};
+  }
+
+  const float rel = worst / maxRef;
+  const bool ok = rel < 1e-5f;
+  return {true, ok,
+          (ok ? "tensor-parallel sharding verified (simulated 2- and 4-rank all-reduce, rel err "
+              : "tensor-parallel all-reduce disagrees with unsharded (rel err ") +
+              std::to_string(rel) + "); max TP for TinyLlama shape = " +
+              std::to_string(maxTensorParallelWorld(cfg)) + " (bounded by " +
+              std::to_string(cfg.nKv) + " KV heads)"};
 }
 
 std::unique_ptr<memory::MemoryManager> makeGpuMemoryManager(std::size_t vramBudgetBytes,

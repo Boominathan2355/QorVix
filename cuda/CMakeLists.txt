@@ -4,6 +4,11 @@
 #   * cuda_backend_stub.cpp — CPU stub otherwise (reports "no CUDA", returns null factories)
 add_library(qorvix_cuda STATIC "")
 
+# Tensor-parallel sharding math (Phase 10) is plain C++ with no CUDA dependency, so it compiles
+# into BOTH configurations: the split logic is where multi-GPU bugs actually live, and keeping it
+# toolkit-free means it stays unit-testable on a machine with no GPU.
+target_sources(qorvix_cuda PRIVATE src/tensor_parallel.cpp)
+
 target_include_directories(qorvix_cuda PUBLIC include)
 target_compile_features(qorvix_cuda PUBLIC cxx_std_23)
 target_link_libraries(qorvix_cuda PUBLIC qorvix_memory)
