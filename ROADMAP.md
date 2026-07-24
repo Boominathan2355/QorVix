@@ -61,7 +61,7 @@ Full GGUF v1/v2/v3 parser in the `gguf` module:
   *reported* (largestFreeBlock) but not yet compacted; prefetch/predictive loading arrive with
   real workloads. Thread safety is one coarse mutex until the scheduler exists to profile it.
 
-## Phase 4 — CUDA Backend Bring-Up ✅ (code complete; GPU-run pending hardware)
+## Phase 4 — CUDA Backend Bring-Up ✅ (execution-verified on a Tesla T4 in Phase 8)
 New `cuda` module — a backend facade callable from any build, plus the GpuVram memory tier:
 - Device management (enumerate/select, compute capability, SM count, free/total VRAM)
 - "Hello tensor" self-test: host→device→host round-trip through a scale kernel; cuBLAS SGEMM
@@ -86,7 +86,7 @@ Deferred to the CUDA performance pass (Phase 8): pinned host memory, async strea
 transfers, CUDA graphs, FlashAttention, CUTLASS. Bring-up establishes the device + memory tier
 first; the fast paths come once there's a pipeline to profile.
 
-## Phase 5 — Text Runtime, End-to-End 🚧 (in progress)
+## Phase 5 — Text Runtime, End-to-End ✅
 **Decision:** built as a **CPU reference runtime** first (no GPU on this dev box or CI, so
 GPU-only numerical code couldn't be *run* — only compile-checked, which is worthless for math).
 Compute lives behind a small op layer so the CUDA kernels (Phase 6/8) reproduce the same results.
@@ -209,9 +209,29 @@ forward pass dispatching per quant type; `qorvix gpu-check` gates correctness ag
 at ~66 tok/s vs the CPU's ~0.7 tok/s (~90×)**. The Colab notebook builds, self-tests, gpu-checks,
 and benchmarks all of this on real hardware.
 
-**Remaining (tuning — now directly raises tok/s):** coalesced/vectorized K-quant loads (or dp4a),
-FlashAttention-style attention, CUDA graphs / kernel fusion, multi-token prefill batching, and
-wiring the GPU path into the scheduler + HTTP server. Benchmark each against this ~66 tok/s floor.
+**Part c 🚧 — performance campaign (target ≥250 tok/s decode on the T4; currently ~87–89).**
+Every change is gated on `gpu-check` argmax staying identical to the CPU, or it does not ship.
+- ✅ Q6_K kernel optimization: 39 → 81–96 GB/s (~2×), generate 86.8 tok/s.
+- ✅ CUDA Graphs (`1b6a015`): the decode forward is captured once and replayed per token, with
+  token/pos routed through a device param buffer. Bit-identical, but only **+2.5%** (→ 89 tok/s) —
+  launch overhead was not the bottleneck.
+- ↩️ Vectorized Q4_K uint32 loads (`a341822`, reverted in `f9a02eb`): correct (argmax held) but
+  **0% gain**. Load width is not the limiter.
+- **Diagnosis:** decode is weight-bandwidth bound — 640 MB/token ÷ 11.2 ms ≈ **57 GB/s effective,
+  only ~18% of the T4's ~320 GB/s peak**. Reaching ~160 GB/s would hit the 250 tok/s target.
+- **Open blocker:** *why* the GEMV kernels sit so far below peak. Registers are not the limiter
+  (theoretical occupancy 100%). It is likely not a pure DRAM ceiling either: Q6_K is the heavier
+  format (210 B/super-block vs Q4_K's 144 B) yet reaches *higher* GB/s (75–92 vs 41–58) — if both
+  were at the memory wall they would be equal. That points at latency / insufficient memory-level
+  parallelism. Earlier ncu runs profiled the tiny cache-resident correctness matrix (DRAM ~1%) and
+  were meaningless; `QORVIX_NO_GRAPH=1` + `scripts/colab_ncu_profile.sh` (`cd2119b`) now target the
+  real generate workload. **Awaiting that T4 run** — the warp-stall breakdown picks the fix:
+  *Long Scoreboard* → multi-row-per-warp GEMV (more independent load streams); *Barrier/MIO* → the
+  per-super-block `__shfl` header broadcast that stalls all 32 lanes on lane 0.
+
+**Remaining beyond the campaign:** FlashAttention-style attention, multi-token prefill batching,
+and **wiring the GPU path into the scheduler + HTTP server** — today `serve` reaches only the CPU
+`TextModel`, so the fast path is unreachable over HTTP (see the architecture note below).
 
 ## Phase 9 — API Layer 🚧
 **Part a ✅ — OpenAI protocol layer (`api` module, zero external deps → builds in every preset):**
@@ -316,12 +336,34 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status:** Phases 0–9 substantially complete; **Qorvix runs correct GPU inference on real models.**
-CPU path: correct text generation from real GGUF models with native quantized weights (~0.8 GB RAM),
-a paged multi-session KV cache, a continuous-batching scheduler, and an OpenAI-compatible HTTP
-server (`qorvix serve`). GPU path (Phase 8): every forward-pass kernel (Q4_K/Q6_K/Q8_0/F32 matmul,
-RMSNorm, RoPE, GQA attention, SwiGLU) verified on a Tesla T4, and **`generate --gpu` produces
-correct text on real TinyLlama at ~66 tok/s — ~90× the CPU** (gpu-check: rel err 3.7e-06 vs the CPU
-runtime). The Colab notebook builds/self-tests/benchmarks it all on real hardware. Remaining work is
-optimization (tuned kernels, FlashAttention, CUDA graphs, prefill batching), multi-GPU (Phase 10),
-and the multimodal engines (Phase 11+) — the un-tuned GPU kernels mean ~66 tok/s is a floor.
+**Status (2026-07-24):** Phases 0–9 complete, Phase 10 started. **Qorvix runs correct GPU inference
+on real models at ~87–89 tok/s on a Tesla T4** (gpu-check: rel err 3.7e-06, argmax identical at
+every position vs the CPU runtime). Test suite: **112 cases / 3879 assertions green**; both the
+CUDA and CPU-only builds compile and link.
+
+- **CPU path ✅** — correct text generation from real GGUF models with native quantized weights
+  (~0.8 GB RAM), paged multi-session KV cache, continuous-batching scheduler, OpenAI-compatible
+  HTTP server on port 2005.
+- **GPU path ✅ correct, 🚧 fast** — every forward-pass kernel verified on a T4; CUDA Graphs
+  shipped. The decode is bandwidth-bound at ~18% of peak, and the profiling run that identifies
+  *why* is the current blocker (Phase 8 Part c).
+- **Multi-GPU 🚧** — tensor-parallel sharding math built and verified without multi-GPU hardware
+  (Phase 10 Part a); NCCL transport still to come.
+- **Not started** — the `agents/`, `audio/`, `embeddings/`, `image/`, `rag/`, `vision/`, `ui/`,
+  `monitoring/`, and `cli/` directories are empty placeholders for Phases 11–12.
+
+### Known architectural gap (worth fixing before Phase 10 Part b)
+
+The layering is real for the CPU stack but **short-circuited for the GPU stack** — there are two
+parallel paths, not one:
+
+- `serve` → Scheduler → paged KV → CPU `TextModel` → CPU qmatmul  *(~0.8 tok/s, reachable over HTTP)*
+- `generate --gpu` → `GpuModel` directly, own loop, own flat VRAM KV  *(~87 tok/s, CLI only)*
+
+`scheduler/` and `api/` contain **zero** CUDA references. Consequences: (1) the fast path cannot be
+served over HTTP, so the scheduler/batching work currently drives only the slow path; (2) the
+vLLM-style paged KV cache does not exist on the GPU, which flat `dKc_/dVc_` VRAM replaces; (3) there
+is no `IExecutionEngine` seam — CUDA is a compile-time on/off with a stub, so a second backend
+(ROCm/Metal/Vulkan) would mean a parallel namespace, not an interface implementation. Multi-GPU
+tensor parallelism is serving infrastructure, so wiring the GPU path into the scheduler first
+avoids building a second story onto a staircase that does not connect.
