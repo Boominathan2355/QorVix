@@ -11,7 +11,7 @@ namespace qorvix::cuda {
 
 std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig&, const float*, const float*,
                                          const GpuWeight&, const std::vector<GpuLayer>&,
-                                         std::string& error) {
+                                         std::string& error, int) {
   error = "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)";
   return nullptr;
 }

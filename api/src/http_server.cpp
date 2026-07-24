@@ -21,6 +21,8 @@ using socket_t = int;
 static constexpr socket_t kInvalid = -1;
 #endif
 
+#include <thread>
+
 namespace qorvix::api {
 
 namespace {
@@ -190,15 +192,17 @@ void HttpServer::run(const HttpHandler& handler) {
       if (!running_) break;
       continue;
     }
-    HttpRequest req;
-    if (readRequest(client, req)) {
-      HttpResponder responder(static_cast<std::uint64_t>(client));
-      handler(req, responder);
-      if (!responder.responded()) {
-        responder.send(500, "text/plain", "no response produced\n");
+    std::thread([client, handler] {
+      HttpRequest req;
+      if (readRequest(client, req)) {
+        HttpResponder responder(static_cast<std::uint64_t>(client));
+        handler(req, responder);
+        if (!responder.responded()) {
+          responder.send(500, "text/plain", "no response produced\n");
+        }
       }
-    }
-    closeSock(client);
+      closeSock(client);
+    }).detach();
   }
 }
 

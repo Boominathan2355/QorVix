@@ -190,6 +190,9 @@ class ICollective {
 // Always available, including in CPU-only builds.
 std::unique_ptr<ICollective> makeSingleRankCollective();
 
+// Simulated multi-rank collective for multi-rank testing without hardware.
+std::unique_ptr<ICollective> makeSimulatedCollective(int worldSize, int rank);
+
 // True iff this binary was built against NCCL.
 bool builtWithNccl() noexcept;
 

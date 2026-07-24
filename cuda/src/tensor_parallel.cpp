@@ -221,10 +221,27 @@ class SingleRankCollective final : public ICollective {
   bool barrier() override { return true; }
   std::string backendName() const override { return "single-rank"; }
 };
+
+class SimulatedMultiRankCollective final : public ICollective {
+ public:
+  SimulatedMultiRankCollective(int worldSize, int rank) : worldSize_(worldSize), rank_(rank) {}
+  int worldSize() const override { return worldSize_; }
+  int rank() const override { return rank_; }
+  bool allReduceSum(float*, std::size_t) override { return true; }
+  bool barrier() override { return true; }
+  std::string backendName() const override { return "simulated-multirank"; }
+ private:
+  int worldSize_ = 1;
+  int rank_ = 0;
+};
 }  // namespace
 
 std::unique_ptr<ICollective> makeSingleRankCollective() {
   return std::make_unique<SingleRankCollective>();
+}
+
+std::unique_ptr<ICollective> makeSimulatedCollective(int worldSize, int rank) {
+  return std::make_unique<SimulatedMultiRankCollective>(worldSize, rank);
 }
 
 #ifndef QORVIX_WITH_NCCL

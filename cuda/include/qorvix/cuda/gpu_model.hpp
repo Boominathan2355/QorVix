@@ -40,20 +40,38 @@ struct GpuLayer {
   GpuWeight wq, wk, wv, wo, ffnGate, ffnUp, ffnDown;
 };
 
+// Sentinel for "no session available" — mirrors memory::kInvalidSession, kept as a plain int so
+// this header stays independent of the memory module.
+inline constexpr int kNoGpuSession = -1;
+
 class GpuModel {
  public:
   virtual ~GpuModel() = default;
-  // Runs the transformer for `token` at position `pos` (updating the on-device KV cache) and
-  // returns logits ([vocab]) copied to host.
+
+  // --- multi-session API (what the scheduler drives) ---------------------------------------
+  // Each session owns an independent slice of the VRAM KV cache. Returns kNoGpuSession when all
+  // `maxSessions` slots are in use, which the scheduler reads as "cannot admit yet".
+  virtual int openSession() = 0;
+  virtual void closeSession(int session) = 0;
+  virtual void resetSession(int session) = 0;
+  // Runs the transformer for `token` at `pos` of `session`, updating that session's KV slice.
+  // The returned reference is valid only until the next call (a single reused host buffer).
+  virtual const std::vector<float>& forward(int session, int token, int pos) = 0;
+
+  // --- single-sequence convenience (session 0; used by gpu-check and generate --gpu) --------
   virtual const std::vector<float>& forward(int token, int pos) = 0;
-  virtual void reset() = 0;  // clear the KV cache
+  virtual void reset() = 0;  // clear session 0's KV cache
 };
 
 // Builds a GpuModel. `tokenEmbdF32` is the embedding table already dequantized to F32
 // ([vocab*dModel], host) so the on-device embedding lookup is a copy. `output` is the (quantized)
 // LM-head weight. Returns nullptr with `error` set on failure (no device, alloc failure).
+//
+// `maxSessions` sizes the VRAM KV cache: it holds maxSessions * nLayers * maxSeq * kvDim floats
+// for K and again for V, so raising it costs linear VRAM. Session 0 always exists.
 std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig& cfg, const float* tokenEmbdF32,
                                          const float* outputNorm, const GpuWeight& output,
-                                         const std::vector<GpuLayer>& layers, std::string& error);
+                                         const std::vector<GpuLayer>& layers, std::string& error,
+                                         int maxSessions = 1);
 
 }  // namespace qorvix::cuda

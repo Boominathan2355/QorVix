@@ -1230,11 +1230,14 @@ struct DevWeight {
 
 class GpuModelImpl final : public GpuModel {
  public:
-  explicit GpuModelImpl(const GpuModelConfig& cfg) : cfg_(cfg) {}
+  GpuModelImpl(const GpuModelConfig& cfg, int maxSessions)
+      : cfg_(cfg), maxSessions_(maxSessions < 1 ? 1 : maxSessions) {}
 
   ~GpuModelImpl() override {
-    if (graphExec_) cudaGraphExecDestroy(graphExec_);
-    if (graph_) cudaGraphDestroy(graph_);
+    for (auto& g : graphExecs_)
+      if (g) cudaGraphExecDestroy(g);
+    for (auto& g : graphs_)
+      if (g) cudaGraphDestroy(g);
     if (stream_) cudaStreamDestroy(stream_);
     if (hParams_) cudaFreeHost(hParams_);
     if (dParams_) cudaFree(dParams_);
@@ -1290,7 +1293,9 @@ class GpuModelImpl final : public GpuModel {
     }
 
     auto alloc = [](float*& p, std::size_t n) { return cudaMalloc(&p, n * sizeof(float)) == cudaSuccess; };
-    const std::size_t kvAll = static_cast<std::size_t>(cfg_.nLayers) * cfg_.maxSeq * kvDim;
+    // KV is [maxSessions][nLayers][maxSeq][kvDim]; each session owns an independent slice.
+    kvPerSession_ = static_cast<std::size_t>(cfg_.nLayers) * cfg_.maxSeq * kvDim;
+    const std::size_t kvAll = kvPerSession_ * maxSessions_;
     if (!alloc(dx_, d) || !alloc(dxn_, d) || !alloc(dq_, cfg_.nHeads * cfg_.headDim) ||
         !alloc(dk_, kvDim) || !alloc(dv_, kvDim) || !alloc(dattn_, cfg_.nHeads * cfg_.headDim) ||
         !alloc(dtmp_, d) || !alloc(dg_, ffn) || !alloc(du_, ffn) || !alloc(dact_, ffn) ||
@@ -1314,22 +1319,47 @@ class GpuModelImpl final : public GpuModel {
         cudaMallocHost(&hParams_, 2 * sizeof(int)) != cudaSuccess) {
       useGraph_ = false;  // graph unavailable; eager path still works
     }
+    // One captured graph per session. A graph bakes in the KV base pointer it was captured
+    // with, so sessions cannot share one; capturing per session keeps the replay-per-token win
+    // without adding a session indirection to every KV kernel.
+    graphs_.assign(maxSessions_, nullptr);
+    graphExecs_.assign(maxSessions_, nullptr);
+    graphReady_.assign(maxSessions_, false);
+    sessionUsed_.assign(maxSessions_, false);
+    sessionUsed_[0] = true;  // session 0 always exists (single-sequence convenience API)
     return true;
   }
 
-  void reset() override { /* KV slots are overwritten per position; nothing to clear */ }
+  void reset() override { resetSession(0); }
+  // KV slots are overwritten per position, so a reset only needs to invalidate nothing on device;
+  // the caller restarts at pos 0 and every read is bounded by pos.
+  void resetSession(int) override {}
 
-  const std::vector<float>& forward(int token, int pos) override {
-    if (useGraph_) return forwardGraph(token, pos);
-    return forwardEager(token, pos);
+  int openSession() override {
+    for (int i = 0; i < maxSessions_; ++i)
+      if (!sessionUsed_[i]) { sessionUsed_[i] = true; return i; }
+    return kNoGpuSession;  // all slots busy — scheduler reads this as "cannot admit yet"
+  }
+  void closeSession(int session) override {
+    if (session > 0 && session < maxSessions_) sessionUsed_[session] = false;
+  }
+
+  const std::vector<float>& forward(int token, int pos) override { return forward(0, token, pos); }
+
+  const std::vector<float>& forward(int session, int token, int pos) override {
+    if (session < 0 || session >= maxSessions_) session = 0;
+    if (useGraph_) return forwardGraph(session, token, pos);
+    return forwardEager(session, token, pos);
   }
 
   // Eager path: one host-issued launch per kernel on the default stream. Kept as the reference and
   // as the fallback when graph capture is unavailable.
-  const std::vector<float>& forwardEager(int token, int pos) {
+  const std::vector<float>& forwardEager(int session, int token, int pos) {
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
     const int hd = cfg_.headDim, mx = cfg_.maxSeq;
     auto g = [](int n) { return (n + 255) / 256; };
+    float* Kbase = dKc_ + static_cast<std::size_t>(session) * kvPerSession_;
+    float* Vbase = dVc_ + static_cast<std::size_t>(session) * kvPerSession_;
 
     embedRowKernel<<<g(d), 256>>>(dx_, dTokEmbd_, token, d);
     for (int l = 0; l < cfg_.nLayers; ++l) {
@@ -1340,10 +1370,10 @@ class GpuModelImpl final : public GpuModel {
       matmul(dv_, w.wv, dxn_);
       ropeNeoxKernel<<<g(cfg_.nHeads * hd / 2), 256>>>(dq_, cfg_.nHeads, hd, pos, cfg_.ropeFreqBase);
       ropeNeoxKernel<<<g(cfg_.nKv * hd / 2), 256>>>(dk_, cfg_.nKv, hd, pos, cfg_.ropeFreqBase);
-      kvStoreKernel<<<g(kvDim), 256>>>(dKc_, dk_, l, pos, mx, kvDim);
-      kvStoreKernel<<<g(kvDim), 256>>>(dVc_, dv_, l, pos, mx, kvDim);
-      float* Kl = dKc_ + static_cast<std::size_t>(l) * mx * kvDim;
-      float* Vl = dVc_ + static_cast<std::size_t>(l) * mx * kvDim;
+      kvStoreKernel<<<g(kvDim), 256>>>(Kbase, dk_, l, pos, mx, kvDim);
+      kvStoreKernel<<<g(kvDim), 256>>>(Vbase, dv_, l, pos, mx, kvDim);
+      float* Kl = Kbase + static_cast<std::size_t>(l) * mx * kvDim;
+      float* Vl = Vbase + static_cast<std::size_t>(l) * mx * kvDim;
       const std::size_t sh = (static_cast<std::size_t>(pos + 1) + hd) * sizeof(float);
       attentionDecodeKernel<<<cfg_.nHeads, hd, sh>>>(dattn_, dq_, Kl, Vl, cfg_.nHeads, cfg_.nKv, hd, pos + 1, kvDim);
       matmul(dtmp_, w.wo, dattn_);
@@ -1364,34 +1394,36 @@ class GpuModelImpl final : public GpuModel {
   // Graph path: capture the whole forward once (token/pos read from dParams_ so the structure is
   // static), then replay it with a single cudaGraphLaunch per token. Eliminates ~350 per-token
   // host launches. Bit-identical to the eager path — same kernels, same math.
-  const std::vector<float>& forwardGraph(int token, int pos) {
+  const std::vector<float>& forwardGraph(int session, int token, int pos) {
     hParams_[0] = token;
     hParams_[1] = pos;
-    if (!graphReady_) {
+    if (!graphReady_[session]) {
       cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal);
-      recordForward();
-      cudaError_t ce = cudaStreamEndCapture(stream_, &graph_);
+      recordForward(session);
+      cudaError_t ce = cudaStreamEndCapture(stream_, &graphs_[session]);
       if (ce != cudaSuccess ||
-          cudaGraphInstantiate(&graphExec_, graph_, 0) != cudaSuccess) {
+          cudaGraphInstantiate(&graphExecs_[session], graphs_[session], 0) != cudaSuccess) {
         useGraph_ = false;  // capture/instantiate failed — fall back permanently
-        return forwardEager(token, pos);
+        return forwardEager(session, token, pos);
       }
-      graphReady_ = true;
+      graphReady_[session] = true;
     }
     // Update params on the capture stream, then replay. Same-stream ordering guarantees the copy
     // lands before any kernel reads dParams_.
     cudaMemcpyAsync(dParams_, hParams_, 2 * sizeof(int), cudaMemcpyHostToDevice, stream_);
-    cudaGraphLaunch(graphExec_, stream_);
+    cudaGraphLaunch(graphExecs_[session], stream_);
     cudaStreamSynchronize(stream_);
     return hostLogits_;
   }
 
   // Records the forward pass onto stream_ for graph capture: every launch is on stream_, token/pos
   // come from dParams_ via the *P kernels, and attention shared memory is fixed at attnShMax_.
-  void recordForward() {
+  void recordForward(int session) {
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
     const int hd = cfg_.headDim, mx = cfg_.maxSeq;
     auto g = [](int n) { return (n + 255) / 256; };
+    float* Kbase = dKc_ + static_cast<std::size_t>(session) * kvPerSession_;
+    float* Vbase = dVc_ + static_cast<std::size_t>(session) * kvPerSession_;
 
     embedRowKernelP<<<g(d), 256, 0, stream_>>>(dx_, dTokEmbd_, dParams_, d);
     for (int l = 0; l < cfg_.nLayers; ++l) {
@@ -1402,10 +1434,10 @@ class GpuModelImpl final : public GpuModel {
       matmulS(dv_, w.wv, dxn_);
       ropeNeoxKernelP<<<g(cfg_.nHeads * hd / 2), 256, 0, stream_>>>(dq_, cfg_.nHeads, hd, dParams_, cfg_.ropeFreqBase);
       ropeNeoxKernelP<<<g(cfg_.nKv * hd / 2), 256, 0, stream_>>>(dk_, cfg_.nKv, hd, dParams_, cfg_.ropeFreqBase);
-      kvStoreKernelP<<<g(kvDim), 256, 0, stream_>>>(dKc_, dk_, l, dParams_, mx, kvDim);
-      kvStoreKernelP<<<g(kvDim), 256, 0, stream_>>>(dVc_, dv_, l, dParams_, mx, kvDim);
-      float* Kl = dKc_ + static_cast<std::size_t>(l) * mx * kvDim;
-      float* Vl = dVc_ + static_cast<std::size_t>(l) * mx * kvDim;
+      kvStoreKernelP<<<g(kvDim), 256, 0, stream_>>>(Kbase, dk_, l, dParams_, mx, kvDim);
+      kvStoreKernelP<<<g(kvDim), 256, 0, stream_>>>(Vbase, dv_, l, dParams_, mx, kvDim);
+      float* Kl = Kbase + static_cast<std::size_t>(l) * mx * kvDim;
+      float* Vl = Vbase + static_cast<std::size_t>(l) * mx * kvDim;
       attentionDecodeKernelP<<<cfg_.nHeads, hd, attnShMax_, stream_>>>(dattn_, dq_, Kl, Vl, cfg_.nHeads, cfg_.nKv, hd, dParams_, kvDim);
       matmulS(dtmp_, w.wo, dattn_);
       addKernel<<<g(d), 256, 0, stream_>>>(dx_, dtmp_, d);
@@ -1462,25 +1494,30 @@ class GpuModelImpl final : public GpuModel {
 
   // CUDA Graph state. The graph is captured on the first forwardGraph() call and replayed after.
   cudaStream_t stream_ = nullptr;
-  cudaGraph_t graph_ = nullptr;
-  cudaGraphExec_t graphExec_ = nullptr;
+  std::vector<cudaGraph_t> graphs_;          // one per session
+  std::vector<cudaGraphExec_t> graphExecs_;  // one per session
+  std::vector<bool> graphReady_;             // captured+instantiated, per session
   int* dParams_ = nullptr;    // device {token, pos}, read by the *P kernels
   int* hParams_ = nullptr;    // pinned host mirror, copied to dParams_ per token
   std::size_t attnShMax_ = 0; // fixed attention shared-mem size (max sequence)
   bool useGraph_ = true;      // false disables capture and uses the eager path
-  bool graphReady_ = false;   // true once the graph is captured + instantiated
+
+  int maxSessions_ = 1;
+  std::size_t kvPerSession_ = 0;   // floats of K (and again V) per session
+  std::vector<bool> sessionUsed_;  // slot allocator for openSession/closeSession
 };
 
 }  // namespace
 
 std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig& cfg, const float* tokenEmbdF32,
                                          const float* outputNorm, const GpuWeight& output,
-                                         const std::vector<GpuLayer>& layers, std::string& error) {
+                                         const std::vector<GpuLayer>& layers, std::string& error,
+                                         int maxSessions) {
   if (deviceCount() <= 0) {
     error = "no CUDA device present";
     return nullptr;
   }
-  auto m = std::make_unique<GpuModelImpl>(cfg);
+  auto m = std::make_unique<GpuModelImpl>(cfg, maxSessions);
   if (!m->init(tokenEmbdF32, outputNorm, output, layers, error)) return nullptr;
   return m;
 }

@@ -7,12 +7,15 @@
 
 namespace qorvix::memory {
 
+enum class KvCacheQuantType { F32, Q8_0, Q4_0 };
+
 // Configuration for a GlobalKvCache. A "page" holds `tokensPerPage` tokens of K and V for a
 // single layer, so a sequence of length L needs ceil(L/tokensPerPage) pages per layer.
 struct KvCacheConfig {
   int layers = 0;
   int kvDim = 0;           // n_kv_heads * head_dim (elements of K or V per token per layer)
   int tokensPerPage = 128;
+  KvCacheQuantType quantType = KvCacheQuantType::F32;
 };
 
 using SessionId = std::uint32_t;
@@ -51,6 +54,15 @@ class GlobalKvCache {
   float* kSlot(SessionId session, int layer, int pos);
   float* vSlot(SessionId session, int layer, int pos);
 
+  // Quantized store/fetch APIs for K and V vectors (kvDim floats).
+  bool storeK(SessionId session, int layer, int pos, const float* src);
+  bool storeV(SessionId session, int layer, int pos, const float* src);
+  bool fetchK(SessionId session, int layer, int pos, float* dst);
+  bool fetchV(SessionId session, int layer, int pos, float* dst);
+
+  // Reuses matching prefix pages from sourceSession into targetSession.
+  bool sharePrefix(SessionId targetSession, SessionId sourceSession, int prefixTokenCount);
+
   std::size_t totalPages() const noexcept { return totalPages_; }
   std::size_t pagesInUse() const noexcept { return totalPages_ - freePages_.size(); }
   std::size_t pagesFree() const noexcept { return freePages_.size(); }
@@ -74,6 +86,7 @@ class GlobalKvCache {
   std::size_t totalPages_ = 0;
   std::vector<std::uint32_t> freePages_;  // stack of available page ids
   std::unordered_map<SessionId, Session> sessions_;
+  std::unordered_map<std::uint32_t, int> pageRefCounts_;
   SessionId nextSession_ = 1;
 };
 

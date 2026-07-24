@@ -91,6 +91,59 @@ std::string buildChatPrompt(const std::vector<ChatMessage>& messages) {
   return out;
 }
 
+std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages, const std::string& chatTemplate) {
+  if (chatTemplate.find("<|im_start|>") != std::string::npos || chatTemplate.find("chatml") != std::string::npos) {
+    std::string out;
+    for (const auto& m : messages) {
+      const std::string r = m.role.empty() ? "user" : m.role;
+      out += "<|im_start|>" + r + "\n" + m.content + "<|im_end|>\n";
+    }
+    out += "<|im_start|>assistant\n";
+    return out;
+  }
+  if (chatTemplate.find("start_header_id") != std::string::npos || chatTemplate.find("eot_id") != std::string::npos) {
+    std::string out;
+    for (const auto& m : messages) {
+      const std::string r = m.role.empty() ? "user" : m.role;
+      out += "<|start_header_id|>" + r + "<|end_header_id|>\n\n" + m.content + "<|eot_id|>";
+    }
+    out += "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    return out;
+  }
+  if (chatTemplate.find("start_of_turn") != std::string::npos || chatTemplate.find("gemma") != std::string::npos) {
+    std::string out;
+    for (const auto& m : messages) {
+      const std::string r = m.role.empty() ? "user" : m.role;
+      out += "<start_of_turn>" + r + "\n" + m.content + "<end_of_turn>\n";
+    }
+    out += "<start_of_turn>assistant\n";
+    return out;
+  }
+  if (chatTemplate.find("<|user|>") != std::string::npos || chatTemplate.find("phi") != std::string::npos) {
+    std::string out;
+    for (const auto& m : messages) {
+      const std::string r = m.role.empty() ? "user" : m.role;
+      out += "<|" + r + "|>\n" + m.content + "<|end|>\n";
+    }
+    out += "<|assistant|>\n";
+    return out;
+  }
+  if (chatTemplate.find("[INST]") != std::string::npos) {
+    std::string out;
+    for (const auto& m : messages) {
+      if (m.role == "user") {
+        out += "[INST] " + m.content + " [/INST]";
+      } else if (m.role == "assistant") {
+        out += m.content;
+      } else {
+        out += "[INST] " + m.content + " [/INST]";
+      }
+    }
+    return out;
+  }
+  return buildChatPrompt(messages);
+}
+
 json::Value modelsResponse(const std::vector<std::string>& modelIds) {
   json::Value root = json::Value::object();
   root["object"] = "list";

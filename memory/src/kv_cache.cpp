@@ -26,7 +26,15 @@ SessionId GlobalKvCache::open() {
 
 void GlobalKvCache::freeSessionPages(Session& s) {
   for (auto& layerPages : s.pages) {
-    for (std::uint32_t p : layerPages) freePages_.push_back(p);
+    for (std::uint32_t p : layerPages) {
+      auto rcIt = pageRefCounts_.find(p);
+      if (rcIt != pageRefCounts_.end() && rcIt->second > 1) {
+        rcIt->second -= 1;
+      } else {
+        if (rcIt != pageRefCounts_.end()) pageRefCounts_.erase(rcIt);
+        freePages_.push_back(p);
+      }
+    }
     layerPages.clear();
   }
   s.length = 0;
@@ -62,6 +70,7 @@ bool GlobalKvCache::appendToken(SessionId session) {
       const std::uint32_t page = freePages_.back();
       freePages_.pop_back();
       s.pages[layer].push_back(page);
+      pageRefCounts_[page] = 1;
     }
   }
   s.length += 1;
@@ -89,6 +98,58 @@ float* GlobalKvCache::kSlot(SessionId session, int layer, int pos) {
 
 float* GlobalKvCache::vSlot(SessionId session, int layer, int pos) {
   return slot(session, layer, pos, /*wantV=*/true);
+}
+
+bool GlobalKvCache::storeK(SessionId session, int layer, int pos, const float* src) {
+  float* dst = kSlot(session, layer, pos);
+  if (!dst) return false;
+  std::copy(src, src + config_.kvDim, dst);
+  return true;
+}
+
+bool GlobalKvCache::storeV(SessionId session, int layer, int pos, const float* src) {
+  float* dst = vSlot(session, layer, pos);
+  if (!dst) return false;
+  std::copy(src, src + config_.kvDim, dst);
+  return true;
+}
+
+bool GlobalKvCache::fetchK(SessionId session, int layer, int pos, float* dst) {
+  float* src = kSlot(session, layer, pos);
+  if (!src) return false;
+  std::copy(src, src + config_.kvDim, dst);
+  return true;
+}
+
+bool GlobalKvCache::fetchV(SessionId session, int layer, int pos, float* dst) {
+  float* src = vSlot(session, layer, pos);
+  if (!src) return false;
+  std::copy(src, src + config_.kvDim, dst);
+  return true;
+}
+
+bool GlobalKvCache::sharePrefix(SessionId targetSession, SessionId sourceSession, int prefixTokenCount) {
+  auto targetIt = sessions_.find(targetSession);
+  auto sourceIt = sessions_.find(sourceSession);
+  if (targetIt == sessions_.end() || sourceIt == sessions_.end()) return false;
+  if (prefixTokenCount <= 0 || sourceIt->second.length < prefixTokenCount) return false;
+  
+  const std::size_t fullPagesNeeded = static_cast<std::size_t>(prefixTokenCount) / config_.tokensPerPage;
+  if (fullPagesNeeded == 0) return true;
+
+  Session& srcS = sourceIt->second;
+  Session& tgtS = targetIt->second;
+  if (tgtS.length != 0) return false;  // target must be newly opened/reset
+
+  for (int layer = 0; layer < config_.layers; ++layer) {
+    for (std::size_t p = 0; p < fullPagesNeeded; ++p) {
+      std::uint32_t pageId = srcS.pages[layer][p];
+      tgtS.pages[layer].push_back(pageId);
+      pageRefCounts_[pageId] += 1;
+    }
+  }
+  tgtS.length = static_cast<int>(fullPagesNeeded * config_.tokensPerPage);
+  return true;
 }
 
 }  // namespace qorvix::memory

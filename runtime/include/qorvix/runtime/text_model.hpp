@@ -7,6 +7,7 @@
 
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/memory/kv_cache.hpp"
+#include "qorvix/runtime/inference_engine.hpp"
 #include "qorvix/runtime/model_config.hpp"
 #include "qorvix/runtime/weights.hpp"
 
@@ -15,7 +16,7 @@ namespace qorvix::runtime {
 // CPU reference forward pass for a Llama-family decoder. Holds the (dequantized) weights and a
 // contiguous KV cache sized to maxSeqLen. Single-sequence, one token at a time — the batched,
 // paged, GPU-accelerated path is built on top of this ground truth in later phases.
-class TextModel {
+class TextModel final : public IInferenceEngine {
  public:
   // In-memory construction (tests / synthetic models). Weights may be owned-F32 WeightMats.
   // The KV pool is sized to hold `maxSessions` concurrent sequences of up to `maxSeqLen` tokens.
@@ -28,18 +29,19 @@ class TextModel {
                                            std::uint32_t maxSeqLen = 4096,
                                            std::uint32_t maxSessions = 1);
 
-  const ModelConfig& config() const noexcept { return cfg_; }
-  std::uint32_t maxSeqLen() const noexcept { return maxSeq_; }
+  const ModelConfig& config() const noexcept override { return cfg_; }
+  std::uint32_t maxSeqLen() const noexcept override { return maxSeq_; }
+  std::string backendName() const override { return "cpu"; }
 
   // --- multi-session API (the scheduler drives many sessions against the shared KV pool) ---
-  memory::SessionId openSession() { return kv_.open(); }
-  void closeSession(memory::SessionId s) { kv_.close(s); }
-  void resetSession(memory::SessionId s) { kv_.reset(s); }
+  memory::SessionId openSession() override { return kv_.open(); }
+  void closeSession(memory::SessionId s) override { kv_.close(s); }
+  void resetSession(memory::SessionId s) override { kv_.reset(s); }
   int sessionLength(memory::SessionId s) const { return kv_.length(s); }
 
   // Runs the transformer for `token` at position `pos` of `session`, updating that session's KV
   // cache, and returns logits ([vocabSize]). `pos` must equal the session's current length.
-  const std::vector<float>& forward(memory::SessionId session, int token, int pos);
+  const std::vector<float>& forward(memory::SessionId session, int token, int pos) override;
 
   // --- single-sequence convenience (uses a default session opened at construction) ---
   void reset() { kv_.reset(session_); }

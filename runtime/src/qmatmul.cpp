@@ -1,5 +1,9 @@
 #include "qorvix/runtime/qmatmul.hpp"
 
+#if defined(__AVX2__) || defined(_M_AMD64) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "qorvix/gguf/gguf_types.hpp"
 #include "qorvix/runtime/dequant.hpp"
 
@@ -8,6 +12,37 @@ namespace qorvix::runtime {
 namespace {
 // Largest block size across all supported types (K-quants use 256).
 constexpr int kMaxBlock = 256;
+
+static inline float vecDotF32(const float* a, const float* b, int n) {
+#if defined(__AVX2__)
+  __m256 sum0 = _mm256_setzero_ps();
+  __m256 sum1 = _mm256_setzero_ps();
+  int i = 0;
+  for (; i + 15 < n; i += 16) {
+    __m256 va0 = _mm256_loadu_ps(a + i);
+    __m256 vb0 = _mm256_loadu_ps(b + i);
+    sum0 = _mm256_fmadd_ps(va0, vb0, sum0);
+    __m256 va1 = _mm256_loadu_ps(a + i + 8);
+    __m256 vb1 = _mm256_loadu_ps(b + i + 8);
+    sum1 = _mm256_fmadd_ps(va1, vb1, sum1);
+  }
+  for (; i + 7 < n; i += 8) {
+    __m256 va = _mm256_loadu_ps(a + i);
+    __m256 vb = _mm256_loadu_ps(b + i);
+    sum0 = _mm256_fmadd_ps(va, vb, sum0);
+  }
+  sum0 = _mm256_add_ps(sum0, sum1);
+  alignas(32) float tmp[8];
+  _mm256_storeu_ps(tmp, sum0);
+  float res = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+  for (; i < n; ++i) res += a[i] * b[i];
+  return res;
+#else
+  float res = 0.0f;
+  for (int i = 0; i < n; ++i) res += a[i] * b[i];
+  return res;
+#endif
+}
 }  // namespace
 
 bool qmatmulSupports(std::uint32_t ggmlType) {
@@ -34,7 +69,7 @@ bool qmatmul(float* out, const void* weight, std::uint32_t ggmlType, const float
       // Dequantize one block into the stack buffer, then fold it into the running dot product.
       dequantize(ggmlType, rowPtr + static_cast<std::size_t>(b) * traits->typeSize, buf, blockSize);
       const float* xb = x + static_cast<std::size_t>(b) * blockSize;
-      for (int i = 0; i < blockSize; ++i) acc += buf[i] * xb[i];
+      acc += vecDotF32(buf, xb, blockSize);
     }
     out[r] = acc;
   }

@@ -1,5 +1,7 @@
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <mutex>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -13,6 +15,7 @@
 #include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/cuda/multi_gpu.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
+#include "qorvix/gpu_engine.hpp"
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
 #include "qorvix/ports.hpp"
@@ -239,7 +242,7 @@ bool hasFlag(const std::vector<std::string_view>& args, std::string_view flag) {
 // embedding table to F32 for the on-device lookup; layer weights stay quantized.
 std::unique_ptr<qorvix::cuda::GpuModel> buildGpuModel(const qorvix::runtime::ModelConfig& cfg,
                                                       const qorvix::runtime::Weights& w, int maxSeq,
-                                                      std::string& err) {
+                                                      std::string& err, int maxSessions = 1) {
   namespace rt = qorvix::runtime;
   namespace cu = qorvix::cuda;
   const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
@@ -269,7 +272,7 @@ std::unique_ptr<qorvix::cuda::GpuModel> buildGpuModel(const qorvix::runtime::Mod
              toGpuWeight(L.wv), toGpuWeight(L.wo), toGpuWeight(L.ffnGate), toGpuWeight(L.ffnUp),
              toGpuWeight(L.ffnDown)};
   }
-  return cu::createGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err);
+  return cu::createGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err, maxSessions);
 }
 
 // GPU generation loop: drives the on-device GpuModel with the tokenizer + sampler.
@@ -414,17 +417,27 @@ int cmdServe(const std::vector<std::string_view>& args) {
   namespace api = qorvix::api;
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   if (path.empty()) {
-    std::cerr << "usage: qorvix serve <file.gguf> [--port N] [--max-concurrent N] [--ctx N]\n";
+    std::cerr << "usage: qorvix serve <file.gguf> [--gpu] [--port N] [--max-concurrent N] "
+                 "[--ctx N]\n";
     return 1;
   }
+  const bool useGpu = hasFlag(args, "--gpu");
   int port = qorvix::ports::kRuntime, maxConcurrent = 4, ctx = 4096;
   if (auto v = flagValue(args, "--port"); !v.empty()) port = std::stoi(v);
   if (auto v = flagValue(args, "--max-concurrent"); !v.empty()) maxConcurrent = std::stoi(v);
   if (auto v = flagValue(args, "--ctx"); !v.empty()) ctx = std::stoi(v);
 
+  if (useGpu && (!qorvix::cuda::builtWithCuda() || qorvix::cuda::deviceCount() == 0)) {
+    std::cerr << "error: --gpu requested but no CUDA device is available "
+                 "(build with -DQORVIX_ENABLE_CUDA=ON on a GPU host)\n";
+    return 1;
+  }
+
   std::string err;
   std::optional<qorvix::tokenizer::Tokenizer> tok;
-  std::optional<qorvix::runtime::TextModel> model;
+  std::optional<qorvix::runtime::TextModel> cpuModel;
+  std::unique_ptr<qorvix::GpuEngine> gpuEngine;
+  qorvix::runtime::IInferenceEngine* engine = nullptr;
   try {
     auto file = qorvix::gguf::GgufFile::open(path);
     tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
@@ -432,21 +445,46 @@ int cmdServe(const std::vector<std::string_view>& args) {
       std::cerr << "error: tokenizer: " << err << "\n";
       return 1;
     }
-    model = qorvix::runtime::TextModel::fromGguf(std::move(file), err,
-                                                 static_cast<std::uint32_t>(ctx),
-                                                 static_cast<std::uint32_t>(maxConcurrent));
-    if (!model) {
-      std::cerr << "error: model: " << err << "\n";
-      return 1;
+    if (useGpu) {
+      const auto mc = qorvix::runtime::configFromGguf(file, err);
+      if (!mc.valid()) { std::cerr << "error: config: " << err << "\n"; return 1; }
+      auto weights = qorvix::runtime::loadWeights(file, mc, err);
+      if (!weights) { std::cerr << "error: weights: " << err << "\n"; return 1; }
+      // One KV slot per concurrent request. createGpuModel copies every weight into VRAM, so the
+      // mmap'd `file` and the borrowing `weights` may both die at the end of this scope.
+      auto gm = buildGpuModel(mc, *weights, ctx, err, maxConcurrent);
+      if (!gm) { std::cerr << "error: GPU model: " << err << "\n"; return 1; }
+      gpuEngine = std::make_unique<qorvix::GpuEngine>(std::move(gm), mc,
+                                                      static_cast<std::uint32_t>(ctx));
+      engine = gpuEngine.get();
+    } else {
+      cpuModel = qorvix::runtime::TextModel::fromGguf(std::move(file), err,
+                                                      static_cast<std::uint32_t>(ctx),
+                                                      static_cast<std::uint32_t>(maxConcurrent));
+      if (!cpuModel) {
+        std::cerr << "error: model: " << err << "\n";
+        return 1;
+      }
+      engine = &*cpuModel;
     }
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;
   }
 
-  const std::string modelId = model->config().architecture + "/" + path;
-  qorvix::scheduler::Scheduler sched(*model, *tok, {maxConcurrent});
-  long long idCounter = 0;
+  const std::string modelId = engine->config().architecture + "/" + path;
+  qorvix::scheduler::Scheduler sched(*engine, *tok, {maxConcurrent});
+  std::atomic<long long> idCounter{0};
+
+  // The HTTP server now handles each connection on its own detached thread, but Scheduler is
+  // explicitly single-threaded (priority queue, active-request vector) and every engine hands
+  // back a reference to ONE reused logits buffer. Concurrent handlers would corrupt both. This
+  // mutex serializes the scheduler section so requests queue instead of racing.
+  //
+  // Note this bounds real concurrency at one in-flight generation: the accept loop no longer
+  // blocks, but generations still run one at a time. Overlapping them needs the scheduler to
+  // batch across requests (IInferenceEngine::forwardBatch) rather than draining per request.
+  std::mutex schedMutex;
 
   api::HttpServer server(port);
   if (!server.start(err)) {
@@ -459,6 +497,8 @@ int cmdServe(const std::vector<std::string_view>& args) {
     return 1;
   }
   std::cout << "qorvix serving " << path << " on http://0.0.0.0:" << port << "\n"
+            << "  backend: " << engine->backendName() << " | max-concurrent: " << maxConcurrent
+            << " | ctx: " << ctx << "\n"
             << "  POST /v1/chat/completions   POST /v1/completions   GET /v1/models\n"
             << "  (Ctrl-C to stop)\n";
 
@@ -500,7 +540,7 @@ int cmdServe(const std::vector<std::string_view>& args) {
         res.send(400, "application/json", api::errorResponse(perr).dump());
         return;
       }
-      prompt = api::buildChatPrompt(cr.messages);
+      prompt = api::buildChatPromptWithTemplate(cr.messages);
       stream = cr.stream;
       rp = toRequestParams(cr.sampling);
       if (!cr.model.empty()) respModel = cr.model;
@@ -521,11 +561,15 @@ int cmdServe(const std::vector<std::string_view>& args) {
     if (stream) {
       res.beginStream(200, "text/event-stream");
       if (isChat) res.writeChunk(api::sseData(api::chatChunk(id, respModel, "", true, "")));
-      sched.submit(prompt, rp, [&](qorvix::scheduler::RequestId, const std::string& piece) {
-        res.writeChunk(api::sseData(isChat ? api::chatChunk(id, respModel, piece, false, "")
-                                           : api::completionChunk(id, respModel, piece, "")));
-      });
-      auto results = sched.runToCompletion();
+      std::vector<qorvix::scheduler::RequestResult> results;
+      {
+        std::lock_guard<std::mutex> lock(schedMutex);
+        sched.submit(prompt, rp, [&](qorvix::scheduler::RequestId, const std::string& piece) {
+          res.writeChunk(api::sseData(isChat ? api::chatChunk(id, respModel, piece, false, "")
+                                             : api::completionChunk(id, respModel, piece, "")));
+        });
+        results = sched.runToCompletion();
+      }
       const bool eos = !results.empty() && results.front().hitEos;
       const std::string finish = eos ? "stop" : "length";
       res.writeChunk(api::sseData(isChat ? api::chatChunk(id, respModel, "", false, finish)
@@ -533,8 +577,12 @@ int cmdServe(const std::vector<std::string_view>& args) {
       res.writeChunk(api::sseDone());
       res.endStream();
     } else {
-      sched.submit(prompt, rp);
-      auto results = sched.runToCompletion();
+      std::vector<qorvix::scheduler::RequestResult> results;
+      {
+        std::lock_guard<std::mutex> lock(schedMutex);
+        sched.submit(prompt, rp);
+        results = sched.runToCompletion();
+      }
       if (results.empty()) {
         res.send(500, "application/json", api::errorResponse("generation produced no result", "server_error").dump());
         return;
@@ -700,7 +748,7 @@ int printUsage() {
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
             << "  generate <file> --prompt \"...\"   Generate text from a GGUF model\n"
-            << "  serve <file> [--port N]         Start the OpenAI-compatible HTTP server\n"
+            << "  serve <file> [--gpu] [--port N] Start the OpenAI-compatible HTTP server\n"
             << "                                  (default port " << qorvix::ports::kRuntime
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
             << qorvix::ports::kRangeLast << ")\n"

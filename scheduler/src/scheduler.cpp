@@ -25,7 +25,7 @@ struct Scheduler::Request {
   RequestResult result;
 };
 
-Scheduler::Scheduler(runtime::TextModel& model, const tokenizer::Tokenizer& tok,
+Scheduler::Scheduler(runtime::IInferenceEngine& model, const tokenizer::Tokenizer& tok,
                      SchedulerConfig config)
     : model_(model), tok_(tok), config_(config) {}
 
@@ -99,34 +99,39 @@ std::vector<RequestResult> Scheduler::step() {
         }
       }
       req->state = RequestState::Decoding;
-      continue;  // emit the first decoded token on the next step
     }
+  }
 
-    if (req->state != RequestState::Decoding) continue;
-
-    // Decode one token.
-    if (req->nextToken == eos) {
-      req->result.hitEos = true;
-      req->state = RequestState::Done;
-      continue;
+  // Batched decode round across all active decoding requests.
+  std::vector<runtime::ForwardStep> decodeSteps;
+  std::vector<Request*> decodingReqs;
+  for (auto& req : active_) {
+    if (req->state == RequestState::Decoding) {
+      if (req->nextToken != eos && req->generatedCount < req->params.maxNewTokens && req->pos < maxSeq) {
+        decodeSteps.push_back({req->session, req->nextToken, req->pos});
+        decodingReqs.push_back(req.get());
+      } else {
+        if (req->nextToken == eos) req->result.hitEos = true;
+        req->state = RequestState::Done;
+      }
     }
-    if (req->generatedCount >= req->params.maxNewTokens || req->pos >= maxSeq) {
-      req->state = RequestState::Done;
-      continue;
+  }
+
+  if (!decodeSteps.empty()) {
+    auto batchLogits = model_.forwardBatch(decodeSteps);
+    for (std::size_t i = 0; i < decodingReqs.size(); ++i) {
+      auto* req = decodingReqs[i];
+      const std::string piece = tok_.decodeToken(req->nextToken);
+      req->result.text += piece;
+      req->result.tokens.push_back(req->nextToken);
+      req->generatedCount++;
+      if (req->onToken) req->onToken(req->id, piece);
+
+      std::vector<int> history = req->promptTokens;
+      history.insert(history.end(), req->result.tokens.begin(), req->result.tokens.end());
+      req->pos++;
+      req->nextToken = req->sampler->sample(batchLogits[i], history);
     }
-
-    const std::string piece = tok_.decodeToken(req->nextToken);
-    req->result.text += piece;
-    req->result.tokens.push_back(req->nextToken);
-    req->generatedCount++;
-    if (req->onToken) req->onToken(req->id, piece);
-
-    std::vector<int> history = req->promptTokens;
-    history.insert(history.end(), req->result.tokens.begin(), req->result.tokens.end());
-    const auto& logits = model_.forward(req->session, req->nextToken, req->pos);
-    req->pos++;
-    std::vector<float> l(logits.begin(), logits.end());
-    req->nextToken = req->sampler->sample(l, history);
   }
 
   // Retire finished requests, freeing their sessions so the queue can be admitted next round.

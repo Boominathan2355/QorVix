@@ -54,6 +54,7 @@ CompletionRequest parseCompletionRequest(const json::Value& body, std::string& e
 // ("<role>:\n<content>\n\n" then an "assistant:" turn); exact per-model chat templates
 // (from GGUF metadata) are a later refinement — use /v1/completions for full prompt control.
 std::string buildChatPrompt(const std::vector<ChatMessage>& messages);
+std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages, const std::string& chatTemplate = "");
 
 // ---- responses (return JSON values; the server serializes + frames them) -------------------
 

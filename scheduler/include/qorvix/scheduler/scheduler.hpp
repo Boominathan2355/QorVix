@@ -8,11 +8,9 @@
 #include <vector>
 
 #include "qorvix/memory/kv_cache.hpp"
+#include "qorvix/runtime/inference_engine.hpp"
 #include "qorvix/runtime/sampler.hpp"
 
-namespace qorvix::runtime {
-class TextModel;
-}
 namespace qorvix::tokenizer {
 class Tokenizer;
 }
@@ -49,11 +47,15 @@ struct SchedulerConfig {
 // prefilled), then advanced one token per step; finished requests free their session so waiting
 // ones are admitted — requests join and leave the running set without draining it.
 //
+// Drives any runtime::IInferenceEngine, so the same scheduling/batching logic runs on the CPU
+// reference model or the CUDA path without change.
+//
 // This is the orchestration layer; each step still runs per-session forwards sequentially (fusing
 // them into one batched matmul is a later GPU optimization). Single-threaded / not thread-safe.
 class Scheduler {
  public:
-  Scheduler(runtime::TextModel& model, const tokenizer::Tokenizer& tok, SchedulerConfig config);
+  Scheduler(runtime::IInferenceEngine& model, const tokenizer::Tokenizer& tok,
+            SchedulerConfig config);
   ~Scheduler();
 
   // Enqueues a request; returns its id. `onToken`, if set, streams each decoded piece.
@@ -78,7 +80,7 @@ class Scheduler {
   void admitFromQueue(std::vector<RequestResult>& rejected);
   void retire(std::unique_ptr<Request> req, bool rejected, std::vector<RequestResult>& out);
 
-  runtime::TextModel& model_;
+  runtime::IInferenceEngine& model_;
   const tokenizer::Tokenizer& tok_;
   SchedulerConfig config_;
   RequestId nextId_ = 1;
