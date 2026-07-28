@@ -309,21 +309,33 @@ int generateGpu(const std::string& path, const std::string& prompt,
 
     std::cout << prompt << std::flush;
     const auto tGen0 = clock::now();
+    // Split the per-token wall time into GPU-forward (kernels + graph replay + the D2H logits
+    // copy + sync), host sampling, and stdout I/O. A 17% faster GEMV moved tok/s by ~0%, so most
+    // of the ~11 ms/token is NOT kernel compute — this says which of the three it actually is,
+    // without depending on a profiler.
+    double tFwd = 0, tSample = 0, tIo = 0;
+    auto since = [&](const std::chrono::steady_clock::time_point& t0) {
+      return std::chrono::duration<double>(clock::now() - t0).count();
+    };
     int pos = 0;
     std::vector<float> logits;
-    for (std::size_t i = 0; i < promptIds.size() && pos < maxSeq; ++i, ++pos)
+    for (std::size_t i = 0; i < promptIds.size() && pos < maxSeq; ++i, ++pos) {
+      const auto t = clock::now();
       logits = gpu->forward(promptIds[i], pos);
-    int next = sampler.sample(logits, history);
+      tFwd += since(t);
+    }
+    int next;
+    { const auto t = clock::now(); next = sampler.sample(logits, history); tSample += since(t); }
 
     int generated = 0;
     bool hitEos = false;
     for (int n = 0; n < cfg.maxNewTokens && pos < maxSeq; ++n) {
       if (next == eos) { hitEos = true; break; }
-      std::cout << tok->decodeToken(next) << std::flush;
+      { const auto t = clock::now(); std::cout << tok->decodeToken(next) << std::flush; tIo += since(t); }
       history.push_back(next);
       ++generated;
-      logits = gpu->forward(next, pos++);
-      next = sampler.sample(logits, history);
+      { const auto t = clock::now(); logits = gpu->forward(next, pos++); tFwd += since(t); }
+      { const auto t = clock::now(); next = sampler.sample(logits, history); tSample += since(t); }
     }
     const double genSec = std::chrono::duration<double>(clock::now() - tGen0).count();
     const int forwards = static_cast<int>(promptIds.size()) + generated;
@@ -332,6 +344,11 @@ int generateGpu(const std::string& path, const std::string& prompt,
               << "[load " << std::fixed << std::setprecision(1) << loadSec << "s | " << forwards
               << " forwards in " << genSec << "s = " << std::setprecision(2)
               << (genSec > 0 ? forwards / genSec : 0.0) << " tok/s]\n";
+    const double perFwdMs = forwards > 0 ? 1000.0 * tFwd / forwards : 0.0;
+    std::cout << "[time split: gpu-forward " << std::setprecision(1) << 100.0 * tFwd / genSec
+              << "% (" << std::setprecision(2) << perFwdMs << " ms/fwd) | sampling "
+              << std::setprecision(1) << 100.0 * tSample / genSec << "% | stdout "
+              << 100.0 * tIo / genSec << "%]\n";
     return 0;
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";
