@@ -111,41 +111,28 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
   float sum = 0.0f;
   for (int sb = 0; sb < nSB; ++sb) {
     const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ4KBytes;
-    // This kernel was tuned from ncu profiles of the real decode workload, in two steps:
-    //   1. It was MIO-pipe bound (L1TEX ~88%, DRAM ~26%, stall = MIO throttle) from ~18 warp
-    //      shuffles per super-block. Fix: every lane decodes d/dmin and its sub-block scale itself
-    //      (redundant ALU) instead of shuffling. That step is bit-identical to the shuffle version.
-    //   2. With the shuffles gone the bottleneck moved to LG Throttle (global-load instruction
-    //      queue). Fix: load each lane's 4 qs bytes as one uint32 (below) — 4x fewer load
-    //      instructions. That step reassociates the sum, so argmax parity is the gate, not bit-eq.
+    // ncu on the real decode workload showed this kernel is MIO-pipe / L1TEX-throughput bound
+    // (L1TEX ~88%, DRAM only ~26%, dominant stall = MIO throttle), NOT DRAM- or occupancy-bound.
+    // The MIO pressure was the warp shuffles: the old code broadcast d/dmin (2 shfl) and the 8
+    // sub-block scales (16 shfl) per super-block. Every lane now decodes the header and its own
+    // sub-block's scale directly instead — cheap redundant ALU on the FMA pipe in place of ~18
+    // MIO shuffles per super-block. Element i = lane + k*32 always lies in sub-block k (lane < 32),
+    // and the arithmetic ((d*sc)*nib - (dmin*m))*x is left-associative exactly as before, so this
+    // is bit-identical to the shuffle version — the gpu-check argmax gate still holds exactly.
     const float d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
     const float dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
 
     const std::uint8_t* qs = blk + 16;
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
-    // Vectorized weight load. After the shuffle fix, ncu showed the bottleneck moved to LG Throttle
-    // (the L1 instruction queue for global loads). The old inner loop issued 4 coalesced byte-loads
-    // per lane per super-block; each lane now pulls its 4 qs bytes as ONE uint32 (qs is 16 B into a
-    // 144-B block off a 256-B-aligned base, so it is 4-byte aligned), cutting the load-instruction
-    // count 4x. A lane's 4 bytes all lie in one 32-byte chunk, so their low nibbles feed sub-block
-    // 2*chunk and their high nibbles sub-block 2*chunk+1 — two scales, decoded once per lane. Every
-    // element contributes the same value as before, but the per-lane summation order changes, so
-    // this REASSOCIATES the dot product: not bit-identical (unlike the shuffle removal), so argmax
-    // parity is the gate (gpu-check on-device; the self-test checks it against the host reference).
-    const int chunk = lane >> 3;    // 0..3; this lane's 4 bytes all lie in this 32-byte chunk
-    const int r0 = (lane & 7) * 4;  // position of the first of those bytes within the chunk
-    unsigned char scLo, mLo, scHi, mHi;
-    getScaleMinK4(2 * chunk, blk + 4, scLo, mLo);      // low nibbles  -> sub-block 2*chunk
-    getScaleMinK4(2 * chunk + 1, blk + 4, scHi, mHi);  // high nibbles -> sub-block 2*chunk+1
-    const float dscLo = d * scLo, dmnLo = dmin * mLo;
-    const float dscHi = d * scHi, dmnHi = dmin * mHi;
-    const std::uint32_t wbytes = reinterpret_cast<const std::uint32_t*>(qs)[lane];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const int qbyte = (wbytes >> (8 * j)) & 0xFF;
-      const int eLo = chunk * 64 + r0 + j;  // low-nibble element; high-nibble element is eLo + 32
-      sum += (dscLo * (qbyte & 0xF) - dmnLo) * xb[eLo];
-      sum += (dscHi * (qbyte >> 4) - dmnHi) * xb[eLo + 32];
+    for (int k = 0; k < 8; ++k) {  // element i = lane + k*32 lives in sub-block k
+      const int i = lane + k * 32;
+      const int chunk = i / 64, local = i % 64;
+      const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
+      const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
+      unsigned char sc, m;
+      getScaleMinK4(k, blk + 4, sc, m);
+      sum += (d * sc * nib - dmin * m) * xb[i];
     }
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
