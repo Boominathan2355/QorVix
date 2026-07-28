@@ -72,6 +72,21 @@ echo "############## end-to-end decode throughput (tok/s) ##############"
 "${BIN}" generate "${MODEL}" --gpu --prompt "The capital of France is" --temp 0 --max 40 2>&1 \
   | grep -iE "tok/s|forwards"
 
+# --- whole-forward time breakdown -----------------------------------------------------------
+# The single most important table: where the per-token time ACTUALLY goes across all kernels.
+# Micro-optimizing one GEMV is pointless if it is a small slice of the forward — this ranks every
+# kernel by total GPU time so the real bottleneck is obvious. nsys sees individual kernels with
+# graphs off; profile several tokens for stable averages.
+if command -v nsys >/dev/null 2>&1; then
+  echo ""
+  echo "############## per-kernel time breakdown (whole forward, nsys) ##############"
+  nsys profile -o /tmp/qorvix_prof --force-overwrite true --stats=true \
+      env QORVIX_NO_GRAPH=1 "${BIN}" generate "${MODEL}" --gpu --prompt "hi" --temp 0 --max 8 \
+      2>/dev/null | sed -n '/CUDA GPU Kernel Summary/,/Summary/{/CUDA GPU MemOps Summary/q;p}'
+else
+  echo "(nsys not found — skipping whole-forward breakdown)"
+fi
+
 # The generate workload with graphs OFF so ncu sees individual kernel launches.
 GEN=(env QORVIX_NO_GRAPH=1 "${BIN}" generate "${MODEL}" --gpu --prompt "hi" --temp 0 --max 2)
 SECTIONS=(--section SpeedOfLight --section Occupancy --section WarpStateStats \
