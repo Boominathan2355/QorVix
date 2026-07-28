@@ -75,16 +75,36 @@ echo "############## end-to-end decode throughput (tok/s) ##############"
 # --- whole-forward time breakdown -----------------------------------------------------------
 # The single most important table: where the per-token time ACTUALLY goes across all kernels.
 # Micro-optimizing one GEMV is pointless if it is a small slice of the forward — this ranks every
-# kernel by total GPU time so the real bottleneck is obvious. nsys sees individual kernels with
-# graphs off; profile several tokens for stable averages.
-if command -v nsys >/dev/null 2>&1; then
-  echo ""
-  echo "############## per-kernel time breakdown (whole forward, nsys) ##############"
-  nsys profile -o /tmp/qorvix_prof --force-overwrite true --stats=true \
+# kernel by total GPU time so the real bottleneck is obvious.
+echo ""
+echo "############## per-kernel time breakdown (whole forward) ##############"
+# Prefer nsys (clean summary table). It ships with the CUDA toolkit but is often not on PATH on
+# Colab, so search the usual install dirs, and try a quiet apt install as a last resort.
+NSYS="$(command -v nsys 2>/dev/null || true)"
+[ -z "${NSYS}" ] && NSYS="$(ls /opt/nvidia/nsight-systems/*/target-linux-x64/nsys 2>/dev/null | head -1 || true)"
+[ -z "${NSYS}" ] && NSYS="$(ls /usr/local/cuda*/bin/nsys 2>/dev/null | head -1 || true)"
+if [ -z "${NSYS}" ]; then
+  apt-get -qq install -y nsight-systems-cli >/dev/null 2>&1 || true
+  NSYS="$(command -v nsys 2>/dev/null || true)"
+fi
+
+if [ -n "${NSYS}" ]; then
+  echo "(using nsys: ${NSYS})"
+  "${NSYS}" profile -o /tmp/qorvix_prof --force-overwrite true --stats=true \
       env QORVIX_NO_GRAPH=1 "${BIN}" generate "${MODEL}" --gpu --prompt "hi" --temp 0 --max 8 \
-      2>/dev/null | sed -n '/CUDA GPU Kernel Summary/,/Summary/{/CUDA GPU MemOps Summary/q;p}'
+      2>/dev/null | sed -n '/CUDA GPU Kernel Summary/,/CUDA GPU MemOps Summary/p'
 else
-  echo "(nsys not found — skipping whole-forward breakdown)"
+  # Fallback that always works: ncu times one metric across a token's worth of launches and
+  # aggregates total GPU time per kernel. ncu replays each launch, so bound the count.
+  echo "(nsys unavailable — ncu per-kernel duration summary instead)"
+  ncu --target-processes all --launch-skip 22 --launch-count 200 \
+      --metrics gpu__time_duration.sum --csv \
+      env QORVIX_NO_GRAPH=1 "${BIN}" generate "${MODEL}" --gpu --prompt "hi" --temp 0 --max 4 \
+      2>/dev/null \
+    | awk -F'","' 'NR>1 { name=$5; val=$NF; gsub(/"/,"",val); sum[name]+=val; n[name]++ }
+        END { for (k in sum) printf "%12.1f us total  x%-4d  %s\n", sum[k]/1000.0, n[k], k }' \
+    | sort -rn \
+    || echo "(ncu duration summary failed)"
 fi
 
 # The generate workload with graphs OFF so ncu sees individual kernel launches.
