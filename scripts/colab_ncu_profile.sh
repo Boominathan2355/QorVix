@@ -60,6 +60,18 @@ if [ ! -f "${MODEL}" ]; then
     https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 fi
 
+# Correctness + speed on THIS clone, before profiling — so a single `curl | bash` answers all
+# three questions (argmax parity, tok/s, and the stall breakdown) on the same commit. This exists
+# because running the profiler alone left the fix's on-device argmax and tok/s unmeasured while the
+# notebook's gpu-check/generate cells rebuilt an older clone.
+echo ""
+echo "############## correctness gate: GPU vs CPU argmax ##############"
+"${BIN}" gpu-check "${MODEL}" 2>&1 | grep -iE "Argmax|rel err|RESULT"
+echo ""
+echo "############## end-to-end decode throughput (tok/s) ##############"
+"${BIN}" generate "${MODEL}" --gpu --prompt "The capital of France is" --temp 0 --max 40 2>&1 \
+  | grep -iE "tok/s|forwards"
+
 # The generate workload with graphs OFF so ncu sees individual kernel launches.
 GEN=(env QORVIX_NO_GRAPH=1 "${BIN}" generate "${MODEL}" --gpu --prompt "hi" --temp 0 --max 2)
 SECTIONS=(--section SpeedOfLight --section Occupancy --section WarpStateStats \
