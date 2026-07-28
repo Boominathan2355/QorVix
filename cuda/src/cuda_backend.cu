@@ -111,22 +111,16 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
   float sum = 0.0f;
   for (int sb = 0; sb < nSB; ++sb) {
     const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ4KBytes;
-    // Decode d/dmin once (lane 0) and precompute the 8 sub-block (d*scale, dmin*min) pairs once
-    // (lanes 0..7), instead of per element — reassociated identically, so bit-for-bit the same.
-    float d = 0.0f, dmin = 0.0f;
-    if (lane == 0) {
-      d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
-      dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
-    }
-    d = __shfl_sync(0xffffffffu, d, 0);
-    dmin = __shfl_sync(0xffffffffu, dmin, 0);
-    float dscale = 0.0f, dmn = 0.0f;
-    if (lane < 8) {
-      unsigned char sc, m;
-      getScaleMinK4(lane, blk + 4, sc, m);
-      dscale = d * sc;
-      dmn = dmin * m;
-    }
+    // ncu on the real decode workload showed this kernel is MIO-pipe / L1TEX-throughput bound
+    // (L1TEX ~88%, DRAM only ~26%, dominant stall = MIO throttle), NOT DRAM- or occupancy-bound.
+    // The MIO pressure was the warp shuffles: the old code broadcast d/dmin (2 shfl) and the 8
+    // sub-block scales (16 shfl) per super-block. Every lane now decodes the header and its own
+    // sub-block's scale directly instead — cheap redundant ALU on the FMA pipe in place of ~18
+    // MIO shuffles per super-block. Element i = lane + k*32 always lies in sub-block k (lane < 32),
+    // and the arithmetic ((d*sc)*nib - (dmin*m))*x is left-associative exactly as before, so this
+    // is bit-identical to the shuffle version — the gpu-check argmax gate still holds exactly.
+    const float d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
+    const float dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
 
     const std::uint8_t* qs = blk + 16;
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
@@ -136,9 +130,9 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
       const int chunk = i / 64, local = i % 64;
       const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
       const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
-      const float ds = __shfl_sync(0xffffffffu, dscale, k);
-      const float dm = __shfl_sync(0xffffffffu, dmn, k);
-      sum += (ds * nib - dm) * xb[i];
+      unsigned char sc, m;
+      getScaleMinK4(k, blk + 4, sc, m);
+      sum += (d * sc * nib - dmin * m) * xb[i];
     }
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
