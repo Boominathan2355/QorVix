@@ -108,19 +108,26 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
   const std::size_t rowBytes = static_cast<std::size_t>(nSB) * kQ4KBytes;
   const std::uint8_t* rowPtr = W + static_cast<std::size_t>(row) * rowBytes;
 
+  // Per-warp scratch for the 16 header bytes: d(2) + dmin(2) + 12 packed sub-block scales.
+  // ncu on the real decode workload showed this kernel is L1TEX-throughput bound (L1TEX ~88%,
+  // DRAM only ~26%), NOT DRAM- or occupancy-bound. The prior version removed the MIO warp shuffles
+  // by having every one of the 32 lanes decode these 16 header bytes locally — but they are
+  // IDENTICAL across the warp, so that turned into 32x-redundant broadcast loads through the L1TEX
+  // data pipe every super-block, which is the current bound. Load them cooperatively ONCE per warp
+  // into shared, then read from shared: no global broadcast, and no warp shuffle either (MIO stays
+  // clean). The per-lane arithmetic below reads exactly the same byte values as before, so the
+  // result is bit-identical to the previous version and the gpu-check argmax gate still holds.
+  __shared__ std::uint8_t hdrS[kWarpsPerBlock][16];
+  std::uint8_t* hdr = hdrS[warp];
+
   float sum = 0.0f;
   for (int sb = 0; sb < nSB; ++sb) {
     const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ4KBytes;
-    // ncu on the real decode workload showed this kernel is MIO-pipe / L1TEX-throughput bound
-    // (L1TEX ~88%, DRAM only ~26%, dominant stall = MIO throttle), NOT DRAM- or occupancy-bound.
-    // The MIO pressure was the warp shuffles: the old code broadcast d/dmin (2 shfl) and the 8
-    // sub-block scales (16 shfl) per super-block. Every lane now decodes the header and its own
-    // sub-block's scale directly instead — cheap redundant ALU on the FMA pipe in place of ~18
-    // MIO shuffles per super-block. Element i = lane + k*32 always lies in sub-block k (lane < 32),
-    // and the arithmetic ((d*sc)*nib - (dmin*m))*x is left-associative exactly as before, so this
-    // is bit-identical to the shuffle version — the gpu-check argmax gate still holds exactly.
-    const float d = __half2float(__ushort_as_half(blk[0] | (static_cast<unsigned short>(blk[1]) << 8)));
-    const float dmin = __half2float(__ushort_as_half(blk[2] | (static_cast<unsigned short>(blk[3]) << 8)));
+    if (lane < 16) hdr[lane] = blk[lane];  // one coalesced 16-byte load per warp, not per lane
+    __syncwarp();
+
+    const float d = __half2float(__ushort_as_half(hdr[0] | (static_cast<unsigned short>(hdr[1]) << 8)));
+    const float dmin = __half2float(__ushort_as_half(hdr[2] | (static_cast<unsigned short>(hdr[3]) << 8)));
 
     const std::uint8_t* qs = blk + 16;
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
@@ -131,9 +138,10 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
       const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
       const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
       unsigned char sc, m;
-      getScaleMinK4(k, blk + 4, sc, m);
+      getScaleMinK4(k, hdr + 4, sc, m);
       sum += (d * sc * nib - dmin * m) * xb[i];
     }
+    __syncwarp();  // all lanes done reading hdr before the next super-block overwrites it
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
   if (lane == 0) out[row] = sum;
