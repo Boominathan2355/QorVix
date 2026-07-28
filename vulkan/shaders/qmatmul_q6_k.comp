@@ -1,0 +1,71 @@
+#version 450
+
+// Q6_K quantized GEMV. Q6_K packs 256 elements per super-block in 210 bytes:
+//   [ ql(128) | qh(64) | scales(16 int8) | d(2 fp16) ]
+// Each 6-bit quant is (low 4 bits from ql) | (high 2 bits from qh), biased by -32, scaled by one of
+// 16 int8 sub-scales times d. The ql/qh addressing (half/quarter/l/is) mirrors the CUDA
+// qmatmulQ6_KKernel and the CPU reference exactly.
+//
+// Correctness-first: one invocation computes one full output row. Bytes are extracted from a uint[]
+// SSBO by shifting.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer WBuf { uint W[]; };
+layout(std430, binding = 1) readonly buffer XBuf { float X[]; };
+layout(std430, binding = 2) writeonly buffer OBuf { float O[]; };
+
+layout(push_constant) uniform PC {
+  uint rows;
+  uint cols;
+} pc;
+
+uint gb(uint a) { return (W[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu; }
+int sgn8(uint b) { return (b < 128u) ? int(b) : int(b) - 256; }  // int8 sign-extend
+
+void main() {
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= pc.rows) return;
+
+  uint nSB = pc.cols / 256u;
+  uint rowBytes = nSB * 210u;
+  uint base = row * rowBytes;
+
+  float sum = 0.0;
+  for (uint sb = 0u; sb < nSB; ++sb) {
+    uint blk = base + sb * 210u;
+    uint ql = blk;          // 128 bytes
+    uint qh = blk + 128u;   // 64 bytes
+    uint scb = blk + 192u;  // 16 int8 scales
+    float d = unpackHalf2x16(gb(blk + 208u) | (gb(blk + 209u) << 8u)).x;
+
+    for (uint i = 0u; i < 256u; ++i) {
+      uint hlf = i >> 7u;          // which 128-element half
+      uint p = i & 127u;
+      uint l = p & 31u;
+      uint quarter = p >> 5u;
+      uint isub = l >> 4u;
+      uint qlh = ql + hlf * 64u;
+      uint qhh = qh + hlf * 32u;
+      uint lo, hi;
+      if (quarter == 0u) {
+        lo = gb(qlh + l) & 0xFu;
+        hi = (gb(qhh + l) >> 0u) & 3u;
+      } else if (quarter == 1u) {
+        lo = gb(qlh + l + 32u) & 0xFu;
+        hi = (gb(qhh + l) >> 2u) & 3u;
+      } else if (quarter == 2u) {
+        lo = gb(qlh + l) >> 4u;
+        hi = (gb(qhh + l) >> 4u) & 3u;
+      } else {
+        lo = gb(qlh + l + 32u) >> 4u;
+        hi = (gb(qhh + l) >> 6u) & 3u;
+      }
+      int q = int(lo | (hi << 4u)) - 32;
+      uint scaleIdx = hlf * 8u + isub + quarter * 2u;
+      int scv = sgn8(gb(scb + scaleIdx));
+      sum += d * float(scv) * float(q) * X[sb * 256u + i];
+    }
+  }
+  O[row] = sum;
+}

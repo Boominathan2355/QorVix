@@ -1,0 +1,68 @@
+#version 450
+
+// Q4_K quantized GEMV. Q4_K packs 256 elements per super-block in 144 bytes:
+//   [ d(2) | dmin(2) | scales(12) | qs(128) ]
+// d, dmin are fp16; the 12 scale bytes hold eight 6-bit (scale, min) pairs (getScaleMinK4, verbatim
+// from ggml); qs holds 256 4-bit quants. Dequant: value = d*scale*nibble - dmin*min. This mirrors
+// the CUDA qmatmulQ4_KKernel and the CPU reference exactly (same sub-block/nibble addressing).
+//
+// Correctness-first: one invocation computes one full output row. Weights are read from a uint[]
+// SSBO and bytes extracted by shifting (8-bit storage is an optional Vulkan feature).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer WBuf { uint W[]; };
+layout(std430, binding = 1) readonly buffer XBuf { float X[]; };
+layout(std430, binding = 2) writeonly buffer OBuf { float O[]; };
+
+layout(push_constant) uniform PC {
+  uint rows;
+  uint cols;
+} pc;
+
+uint gb(uint a) { return (W[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu; }
+
+// 6-bit (scale, min) unpack for sub-block j from the 12 scale bytes based at address s.
+void getScaleMinK4(uint j, uint s, out uint sc, out uint m) {
+  if (j < 4u) {
+    sc = gb(s + j) & 63u;
+    m = gb(s + j + 4u) & 63u;
+  } else {
+    sc = (gb(s + j + 4u) & 0xFu) | ((gb(s + j - 4u) >> 6u) << 4u);
+    m = (gb(s + j + 4u) >> 4u) | ((gb(s + j) >> 6u) << 4u);
+  }
+}
+
+void main() {
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= pc.rows) return;
+
+  uint nSB = pc.cols / 256u;
+  uint rowBytes = nSB * 144u;
+  uint base = row * rowBytes;
+
+  float sum = 0.0;
+  for (uint sb = 0u; sb < nSB; ++sb) {
+    uint blk = base + sb * 144u;
+    float d = unpackHalf2x16(gb(blk) | (gb(blk + 1u) << 8u)).x;
+    float dmin = unpackHalf2x16(gb(blk + 2u) | (gb(blk + 3u) << 8u)).x;
+    uint sbase = blk + 4u;
+    uint qs = blk + 16u;
+
+    for (uint j = 0u; j < 8u; ++j) {  // element i = j*32 + t lives in sub-block j
+      uint sc, m;
+      getScaleMinK4(j, sbase, sc, m);
+      float dl = d * float(sc);
+      float ml = dmin * float(m);
+      for (uint t = 0u; t < 32u; ++t) {
+        uint i = j * 32u + t;
+        uint chunk = i / 64u;
+        uint local = i % 64u;
+        uint qbyte = gb(qs + chunk * 32u + (local & 31u));
+        uint nib = (local < 32u) ? (qbyte & 0xFu) : (qbyte >> 4u);
+        sum += (dl * float(nib) - ml) * X[sb * 256u + i];
+      }
+    }
+  }
+  O[row] = sum;
+}

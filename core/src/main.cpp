@@ -810,8 +810,17 @@ int cmdVulkan() {
   const auto q8 = qorvix::vulkan::qmatmulQ8_0SelfTest();
   std::cout << "Self-test (Q8_0 matmul):  " << (q8.passed ? "PASS" : (q8.ran ? "FAIL" : "skip"))
             << " - " << q8.message << "\n";
+  const auto q4k = qorvix::vulkan::qmatmulQ4_KSelfTest();
+  std::cout << "Self-test (Q4_K matmul):  " << (q4k.passed ? "PASS" : (q4k.ran ? "FAIL" : "skip"))
+            << " - " << q4k.message << "\n";
+  const auto q6k = qorvix::vulkan::qmatmulQ6_KSelfTest();
+  std::cout << "Self-test (Q6_K matmul):  " << (q6k.passed ? "PASS" : (q6k.ran ? "FAIL" : "skip"))
+            << " - " << q6k.message << "\n";
 
-  return (self.ran && !self.passed) || (q8.ran && !q8.passed) ? 1 : 0;
+  return (self.ran && !self.passed) || (q8.ran && !q8.passed) || (q4k.ran && !q4k.passed) ||
+                 (q6k.ran && !q6k.passed)
+             ? 1
+             : 0;
 }
 
 int printUsage() {

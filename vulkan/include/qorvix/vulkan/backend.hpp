@@ -58,4 +58,9 @@ SelfTestResult selfTest();
 // timed on a large one. The Vulkan analogue of qorvix::cuda::qmatmulSelfTest().
 SelfTestResult qmatmulQ8_0SelfTest();
 
+// Native Q4_K / Q6_K matmul compute shaders (the weight types real GGUF models use), each checked
+// against a host reference. The Vulkan analogue of qorvix::cuda::qmatmulQ4_K/Q6_KSelfTest().
+SelfTestResult qmatmulQ4_KSelfTest();
+SelfTestResult qmatmulQ6_KSelfTest();
+
 }  // namespace qorvix::vulkan
