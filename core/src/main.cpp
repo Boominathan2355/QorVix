@@ -14,6 +14,7 @@
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/cuda/multi_gpu.hpp"
+#include "qorvix/vulkan/backend.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/gpu_engine.hpp"
 #include "qorvix/model_registry.hpp"
@@ -768,6 +769,51 @@ int cmdGpu() {
              : 0;
 }
 
+// Vulkan compute backend: devices + self-tests. The Vulkan analogue of `qorvix gpu`. This backend
+// runs on any vendor (NVIDIA, AMD, Apple via MoltenVK, Intel) and its correctness is checked
+// headlessly on Mesa's software device (lavapipe), so this command is meaningful even on a host
+// with no discrete GPU.
+int cmdVulkan() {
+  if (!qorvix::vulkan::builtWithVulkan()) {
+    std::cout << "Vulkan support: not built in.\n"
+              << "Rebuild with -DQORVIX_ENABLE_VULKAN=ON (needs the Vulkan loader + glslang) to "
+                 "enable the cross-vendor GPU backend.\n";
+    return 0;
+  }
+
+  const int count = qorvix::vulkan::deviceCount();
+  std::cout << "Vulkan support: built in.\n";
+  const auto devs = qorvix::vulkan::enumerateDevices();
+  std::cout << "Physical devices: " << devs.size() << " (usable compute: " << count << ")\n";
+  static const char* kType[] = {"other", "integrated-gpu", "discrete-gpu", "virtual-gpu", "cpu"};
+  for (const auto& d : devs) {
+    const char* t = (d.deviceType >= 0 && d.deviceType <= 4) ? kType[d.deviceType] : "other";
+    // Decode the packed VkVersion (major:10 | minor:10 | patch:12) without pulling in vulkan.h,
+    // which the facade keeps out of this translation unit so the no-Vulkan build still compiles.
+    const unsigned vMaj = d.apiVersion >> 22, vMin = (d.apiVersion >> 12) & 0x3FF,
+                   vPat = d.apiVersion & 0xFFF;
+    std::cout << "\n  [" << d.index << "] " << d.name << "\n"
+              << "      type               : " << t << "\n"
+              << "      Vulkan API         : " << vMaj << "." << vMin << "." << vPat << "\n"
+              << "      vendor/device ID   : 0x" << std::hex << d.vendorID << " / 0x" << d.deviceID
+              << std::dec << "\n"
+              << "      device-local mem   : " << humanBytes(d.deviceLocalMem) << "\n";
+  }
+  if (devs.empty()) {
+    std::cout << "No Vulkan devices detected on this host.\n";
+    return 0;
+  }
+
+  const auto self = qorvix::vulkan::selfTest();
+  std::cout << "\nSelf-test (compute):      " << (self.passed ? "PASS" : (self.ran ? "FAIL" : "skip"))
+            << " - " << self.message << "\n";
+  const auto q8 = qorvix::vulkan::qmatmulQ8_0SelfTest();
+  std::cout << "Self-test (Q8_0 matmul):  " << (q8.passed ? "PASS" : (q8.ran ? "FAIL" : "skip"))
+            << " - " << q8.message << "\n";
+
+  return (self.ran && !self.passed) || (q8.ran && !q8.passed) ? 1 : 0;
+}
+
 int printUsage() {
   std::cout << qorvix::startupBanner() << "\n\n"
             << "Usage: qorvix <command> [args]\n\n"
@@ -782,6 +828,7 @@ int printUsage() {
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
             << qorvix::ports::kRangeLast << ")\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
+            << "  vulkan              Show Vulkan devices and run compute-backend self-tests\n"
             << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
@@ -810,6 +857,7 @@ int main(int argc, char** argv) {
   if (command == "generate") return cmdGenerate(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
+  if (command == "vulkan") return cmdVulkan();
   if (command == "gpu-check") return cmdGpuCheck(arg1);
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 

@@ -1,0 +1,51 @@
+#version 450
+
+// Q8_0 quantized GEMV: out[row] = sum_i dequant(W[row][i]) * x[i].
+//
+// Q8_0 packs 32 int8 weights per block behind one fp16 scale d, block = 34 bytes:
+//   [ d.lo, d.hi, q0, q1, ..., q31 ].
+// The weight buffer is bound as a uint[] (32-bit) SSBO — Vulkan storage buffers are typed and
+// 8-bit storage is an optional feature, so bytes are extracted from the uint words by shifting.
+// This mirrors the CPU/CUDA reference (dequantize in registers, never materialize F32 weights).
+//
+// Correctness-first: one invocation computes one full output row (no cross-thread reduction). This
+// is the shape the argmax-parity gate is proven against; throughput tuning (cooperative loads,
+// subgroup reductions) comes in later milestones without changing the math.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer WBuf { uint W[]; };
+layout(std430, binding = 1) readonly buffer XBuf { float X[]; };
+layout(std430, binding = 2) writeonly buffer OBuf { float O[]; };
+
+layout(push_constant) uniform PC {
+  uint rows;
+  uint cols;
+} pc;
+
+// Byte at absolute address `a` in the weight buffer (little-endian word packing).
+uint getByte(uint a) {
+  return (W[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu;
+}
+
+void main() {
+  uint row = gl_GlobalInvocationID.x;
+  if (row >= pc.rows) return;
+
+  uint nBlocks = pc.cols / 32u;
+  uint rowBytes = nBlocks * 34u;
+  uint base = row * rowBytes;
+
+  float sum = 0.0;
+  for (uint b = 0u; b < nBlocks; ++b) {
+    uint blk = base + b * 34u;
+    // fp16 scale sits in the low 16 bits; unpackHalf2x16 decodes it exactly like __half2float.
+    float d = unpackHalf2x16(getByte(blk) | (getByte(blk + 1u) << 8u)).x;
+    for (uint i = 0u; i < 32u; ++i) {
+      int q = int(getByte(blk + 2u + i));
+      if (q > 127) q -= 256;  // sign-extend the int8
+      sum += d * float(q) * X[b * 32u + i];
+    }
+  }
+  O[row] = sum;
+}
