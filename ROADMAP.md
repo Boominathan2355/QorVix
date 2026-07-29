@@ -336,34 +336,95 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status (2026-07-24):** Phases 0–9 complete, Phase 10 started. **Qorvix runs correct GPU inference
-on real models at ~87–89 tok/s on a Tesla T4** (gpu-check: rel err 3.7e-06, argmax identical at
-every position vs the CPU runtime). Test suite: **112 cases / 3879 assertions green**; both the
-CUDA and CPU-only builds compile and link.
+**Status (2026-07-29):** Phases 0–9 complete, Phase 8.5 (cross-vendor + unified engine) complete,
+Phase 10 started. **Qorvix runs correct inference on real models across three backends behind one
+seam** — CPU, CUDA (~87–89 tok/s on a T4, rel err 3.7e-06), and Vulkan (cross-vendor, argmax parity
+verified GPU-free on lavapipe, rel err 2.6e-06). Test suite: **128 cases / 4413 assertions green**;
+the CPU-only, CUDA, and Vulkan builds all compile and link.
 
-- **CPU path ✅** — correct text generation from real GGUF models with native quantized weights
-  (~0.8 GB RAM), paged multi-session KV cache, continuous-batching scheduler, OpenAI-compatible
-  HTTP server on port 2005.
-- **GPU path ✅ correct, 🚧 fast** — every forward-pass kernel verified on a T4; CUDA Graphs
-  shipped. The decode is bandwidth-bound at ~18% of peak, and the profiling run that identifies
-  *why* is the current blocker (Phase 8 Part c).
-- **Multi-GPU 🚧** — tensor-parallel sharding math built and verified without multi-GPU hardware
-  (Phase 10 Part a); NCCL transport still to come.
-- **Not started** — the `agents/`, `audio/`, `embeddings/`, `image/`, `rag/`, `vision/`, `ui/`,
-  `monitoring/`, and `cli/` directories are empty placeholders for Phases 11–12.
+- **Unified backend ✅** — one `IInferenceEngine` seam, three implementations (CPU/CUDA/Vulkan), one
+  `createEngine` factory, one generation loop. `generate` and `serve` reach any backend via
+  `--gpu` / `--vulkan` / `--auto`; `qorvix backends` lists them.
+- **CPU path ✅** — correct generation from real GGUF with native quantized weights (~0.8 GB RAM),
+  paged multi-session KV cache, continuous-batching scheduler, OpenAI-compatible HTTP server.
+- **CUDA path ✅ correct, 🚧 fast** — every kernel verified on a T4; CUDA Graphs shipped; decode
+  bandwidth-bound (Phase 8c).
+- **Vulkan path ✅ correct, 🚧 fast** — full forward verified on lavapipe; single-session and
+  correctness-first (throughput pass — device-local buffers, command-buffer reuse, subgroups — is
+  future work).
+- **Multi-GPU 🚧** — tensor-parallel sharding math verified without hardware (Phase 10a); NCCL to come.
+- **Not started** — `agents/`, `audio/`, `embeddings/`, `image/`, `rag/`, `vision/`, `ui/`,
+  `monitoring/`, `cli/` are placeholders for Phases 11–12 (see the status-annotated backlog above).
 
-### Known architectural gap (worth fixing before Phase 10 Part b)
+## Phase 8.5 — Cross-vendor Vulkan backend + unified engine ✅ (retrofit)
 
-The layering is real for the CPU stack but **short-circuited for the GPU stack** — there are two
-parallel paths, not one:
+Added a second GPU backend so Qorvix runs on **any vendor** (NVIDIA / AMD / Apple via MoltenVK /
+Intel), not NVIDIA-only, and unified all backends behind one seam — closing the architectural gap
+that was noted here previously.
 
-- `serve` → Scheduler → paged KV → CPU `TextModel` → CPU qmatmul  *(~0.8 tok/s, reachable over HTTP)*
-- `generate --gpu` → `GpuModel` directly, own loop, own flat VRAM KV  *(~87 tok/s, CLI only)*
+**Vulkan compute backend (`vulkan` module).** GLSL compute shaders → SPIR-V, embedded at build time
+via glslang. Q8_0/Q4_K/Q6_K GEMV (tree-reduction, one workgroup/row), rmsnorm/rope/swiglu/add/GQA
+attention, plus embed/kv-store/matmul-f32, chained into a full per-token forward in one command
+buffer with the KV cache resident. `VulkanModel`/`createVulkanModel` mirror the CUDA `GpuModel`.
+Verified **GPU-free** on Mesa's software device (lavapipe/llvmpipe) in Docker — the same argmax-vs-CPU
+gate CUDA gets on a T4, but on CPU: `vulkan-check` on real TinyLlama 1.1B Q4_K_M matches the CPU
+runtime (rel err 2.6e-06, argmax identical everywhere), and `generate --vulkan` produces identical
+text. Two bugs the lavapipe loop caught that the self-tests missed: a RoPE dispatch under-launch
+(64-lane workgroup sized with a /256 group count) and sequential-fp32 GEMV accumulation drift
+(~16%, argmax-preserving) — both fixed. Throughput on the software device is a correctness figure,
+not a perf one; real-hardware tuning is future work.
 
-`scheduler/` and `api/` contain **zero** CUDA references. Consequences: (1) the fast path cannot be
-served over HTTP, so the scheduler/batching work currently drives only the slow path; (2) the
-vLLM-style paged KV cache does not exist on the GPU, which flat `dKc_/dVc_` VRAM replaces; (3) there
-is no `IExecutionEngine` seam — CUDA is a compile-time on/off with a stub, so a second backend
-(ROCm/Metal/Vulkan) would mean a parallel namespace, not an interface implementation. Multi-GPU
-tensor parallelism is serving infrastructure, so wiring the GPU path into the scheduler first
-avoids building a second story onto a staircase that does not connect.
+**Unified backend (one seam, one factory, one path).** `runtime::IInferenceEngine` is the single
+seam; CPU (`TextModel`), CUDA (`GpuEngine`), and Vulkan (`VulkanEngine`) are its three
+implementations. `core/include/qorvix/backend.hpp` is the one construction point —
+`createEngine(Backend, GgufFile, maxSeq, maxSessions)` returns a `unique_ptr<IInferenceEngine>`
+(CPU keeps the mmap; device backends upload + release it), with `backendAvailable` /
+`selectBestBackend` (auto = CUDA > Vulkan > CPU). `runGenerate()` is one backend-agnostic loop;
+`generate` and `serve` both go through the factory — no per-backend branch or parallel loop remains
+above the seam, and `serve` now reaches Vulkan too. New `qorvix backends` command; `--gpu` /
+`--vulkan` / `--auto` flags. **This resolves the former gap** below: there is now a real
+`IExecutionEngine`-style seam, a second backend is an interface implementation (not a parallel
+namespace), and every backend is reachable over HTTP.
+
+**Still open from the old gap:** the GPU/Vulkan paths use flat device-resident KV, not the
+vLLM-style paged `GlobalKvCache` (that remains CPU-only); the Vulkan engine is single-session until
+`VulkanModel` gains per-session KV slices like `GpuModel`; and real batching across requests
+(`forwardBatch`) is still sequential.
+
+### Cross-cutting backlog (status-annotated)
+
+Consolidated from a feature audit. **Legend:** ✅ done · 🟡 partial · 🖥️ needs GPU hardware to build
+or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
+
+- **Performance:** Vulkan kernel opt ⬜ · CUDA throughput 🟡 (Phase 8c, T4) · command-buffer reuse /
+  graph replay (Vulkan) ⬜ · device-local buffers + staging ⬜ · subgroup/warp opt ⬜ · kernel
+  fusion ⬜ · per-GPU autotune ⬜. *(All 🖥️ for real numbers — lavapipe perf is meaningless.)*
+- **Backends:** CUDA ✅ · Vulkan ✅ (cross-vendor) · native HIP/ROCm ⬜🖥️ · native Metal ⬜🖥️ ·
+  SYCL/OpenCL ⬜. *(Vulkan already covers AMD/Apple/Intel; native backends are a perf option.)*
+- **Inference:** continuous batching ✅ (Phase 7) · paged KV ✅ (CPU) · prefix cache ✅ (`sharePrefix`)
+  · scheduler ✅ · sliding-window attn ⬜ · speculative decoding ⬜ · multi-GPU 🟡 (TP math done,
+  NCCL 🖥️).
+- **Models:** GGUF F16/BF16/Q4_0..Q8_0/K-quants ✅ · more quant formats (IQ-quants) ⬜ · MoE ⬜ ·
+  vision ⬜ · embeddings/reranker ⬜ (Phase 11).
+- **Serving:** OpenAI API ✅ · SSE streaming ✅ · WebSocket ⬜ · auth ⬜ (Phase 13, port 2006) ·
+  Prometheus `/metrics` ⬜ (Phase 12, port 2009) · rate limiting ⬜.
+- **Memory:** paged KV + eviction/offload ✅ · GPU memory pooling 🟡 · zero-copy 🟡 · prefetch ⬜ ·
+  graceful OOM ⬜.
+- **Testing:** unit suite ✅ (128 cases) · cross-vendor bench ⬜🖥️ · perf regression ⬜🖥️ ·
+  multi-GPU CI ⬜🖥️ · long-context validation ⬜.
+- **Dev-ex:** `backends`/self-tests ✅ · backend auto-select ✅ · benchmark tool ⬜ · profiler
+  integration 🟡 (`colab_ncu_profile.sh`) · runtime config ⬜ · docs 🟡.
+- **Platform:** Linux ✅ · Windows/macOS/AMD/Intel GPU validation ⬜🖥️.
+- **Production:** model hot-swap/cache ⬜ · graceful OOM ⬜ · fault recovery ⬜ · telemetry ⬜.
+
+### Former architectural gap (now resolved by Phase 8.5)
+
+The layering was real for the CPU stack but **short-circuited for the GPU stack** — two parallel
+paths, not one:
+
+- `serve` → Scheduler → paged KV → CPU `TextModel` → CPU qmatmul  *(reachable over HTTP)*
+- `generate --gpu` → `GpuModel` directly, own loop, own flat VRAM KV  *(CLI only)*
+
+`scheduler/` and `api/` contained **zero** CUDA references. Phase 8.5's unified engine fixes the
+seam problem (a backend is now an `IInferenceEngine` implementation, reachable over HTTP via
+`createEngine`); the GPU paged-KV and true batched `forwardBatch` items remain (listed above).
