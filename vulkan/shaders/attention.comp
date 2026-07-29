@@ -22,6 +22,8 @@ layout(push_constant) uniform PC {
   uint headDim;
   uint seqLen;
   uint kvDim;
+  uint layer;   // KV cache is one buffer shared across layers; slot = (layer*maxSeq + t)
+  uint maxSeq;
 } pc;
 
 const uint MAX_SEQ = 4096u;
@@ -39,7 +41,7 @@ void main() {
 
   // scores[t] = (q_h . K[t][kvHead]) * invSqrt
   for (uint t = 0u; t < pc.seqLen; ++t) {
-    uint kbase = t * pc.kvDim + kvHead * hd;
+    uint kbase = (pc.layer * pc.maxSeq + t) * pc.kvDim + kvHead * hd;
     red[tid] = (tid < hd) ? q[qbase + tid] * K[kbase + tid] : 0.0;
     barrier();
     for (uint s = 64u; s > 0u; s >>= 1u) {
@@ -68,7 +70,7 @@ void main() {
   if (tid < hd) {
     float acc = 0.0;
     for (uint t = 0u; t < pc.seqLen; ++t) {
-      uint vbase = t * pc.kvDim + kvHead * hd;
+      uint vbase = (pc.layer * pc.maxSeq + t) * pc.kvDim + kvHead * hd;
       acc += scores[t] * Vv[vbase + tid];
     }
     o[h * hd + tid] = acc;

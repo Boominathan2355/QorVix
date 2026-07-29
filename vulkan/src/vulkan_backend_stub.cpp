@@ -25,4 +25,6 @@ SelfTestResult opsSelfTest() { return {false, false, "Vulkan support not compile
 
 SelfTestResult attentionSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
 
+SelfTestResult forwardSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
+
 }  // namespace qorvix::vulkan

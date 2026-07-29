@@ -1,0 +1,33 @@
+#version 450
+
+// F32 GEMV: out[r] = dot(W[r,:], x). One workgroup per row, block reduce. The forward driver uses
+// this for any F32-typed weight; quantized weights use the qmatmul_* shaders. Mirrors matmulF32Kernel.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) writeonly buffer OBuf { float o[]; };
+layout(std430, binding = 1) readonly buffer WBuf { float w[]; };
+layout(std430, binding = 2) readonly buffer XBuf { float x[]; };
+
+layout(push_constant) uniform PC {
+  uint rows;
+  uint cols;
+} pc;
+
+shared float red[256];
+
+void main() {
+  uint row = gl_WorkGroupID.x;
+  if (row >= pc.rows) return;
+  uint tid = gl_LocalInvocationID.x;
+  uint base = row * pc.cols;
+  float partial = 0.0;
+  for (uint c = tid; c < pc.cols; c += 256u) partial += w[base + c] * x[c];
+  red[tid] = partial;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (tid < s) red[tid] += red[tid + s];
+    barrier();
+  }
+  if (tid == 0u) o[row] = red[0];
+}

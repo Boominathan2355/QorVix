@@ -822,9 +822,13 @@ int cmdVulkan() {
   const auto attn = qorvix::vulkan::attentionSelfTest();
   std::cout << "Self-test (attention):    " << (attn.passed ? "PASS" : (attn.ran ? "FAIL" : "skip"))
             << " - " << attn.message << "\n";
+  const auto fwd = qorvix::vulkan::forwardSelfTest();
+  std::cout << "Self-test (forward pass): " << (fwd.passed ? "PASS" : (fwd.ran ? "FAIL" : "skip"))
+            << " - " << fwd.message << "\n";
 
   return (self.ran && !self.passed) || (q8.ran && !q8.passed) || (q4k.ran && !q4k.passed) ||
-                 (q6k.ran && !q6k.passed) || (ops.ran && !ops.passed) || (attn.ran && !attn.passed)
+                 (q6k.ran && !q6k.passed) || (ops.ran && !ops.passed) || (attn.ran && !attn.passed) ||
+                 (fwd.ran && !fwd.passed)
              ? 1
              : 0;
 }

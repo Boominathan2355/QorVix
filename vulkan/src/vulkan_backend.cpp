@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,9 @@
 #include "swiglu_spv.h"        // const uint32_t swiglu_spv[]
 #include "add_spv.h"           // const uint32_t add_spv[]
 #include "attention_spv.h"     // const uint32_t attention_spv[]
+#include "matmul_f32_spv.h"    // const uint32_t matmul_f32_spv[]
+#include "embed_row_spv.h"     // const uint32_t embed_row_spv[]
+#include "kv_store_spv.h"      // const uint32_t kv_store_spv[]
 
 namespace qorvix::vulkan {
 namespace {
@@ -375,6 +379,116 @@ bool dispatch(const Context& c, const std::uint32_t* spirv, std::size_t spirvByt
   vkDestroyDescriptorSetLayout(c.device, dsl, nullptr);
   return okAll;
 }
+
+// ---- forward-pass orchestration (Milestone 4) -----------------------------------------------
+// The per-op dispatch() above builds and tears down a pipeline every call — fine for one-shot self-
+// tests, wrong for a forward pass that issues hundreds of dispatches. A `Pipe` is a compute pipeline
+// built ONCE per shader and reused; a `Recorder` records many ops (each with a fresh descriptor set
+// from a pool) into a single command buffer with a compute->compute barrier between them, so the
+// whole forward is one submit. This is the reusable core the on-device model runner is built on.
+struct Pipe {
+  VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipe = VK_NULL_HANDLE;
+  VkShaderModule mod = VK_NULL_HANDLE;
+  std::uint32_t push = 0;
+};
+
+bool makePipe(const Context& c, const std::uint32_t* spv, std::size_t bytes, std::uint32_t nBindings,
+              std::uint32_t pushSize, Pipe& out) {
+  out.push = pushSize;
+  std::vector<VkDescriptorSetLayoutBinding> binds(nBindings);
+  for (std::uint32_t i = 0; i < nBindings; ++i)
+    binds[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo dslci{};
+  dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  dslci.bindingCount = nBindings;
+  dslci.pBindings = binds.data();
+  if (vkCreateDescriptorSetLayout(c.device, &dslci, nullptr, &out.dsl) != VK_SUCCESS) return false;
+
+  VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pushSize};
+  VkPipelineLayoutCreateInfo plci{};
+  plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  plci.setLayoutCount = 1;
+  plci.pSetLayouts = &out.dsl;
+  plci.pushConstantRangeCount = pushSize ? 1 : 0;
+  plci.pPushConstantRanges = pushSize ? &pcr : nullptr;
+  if (vkCreatePipelineLayout(c.device, &plci, nullptr, &out.layout) != VK_SUCCESS) return false;
+
+  VkShaderModuleCreateInfo smci{};
+  smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+  smci.codeSize = bytes;
+  smci.pCode = spv;
+  if (vkCreateShaderModule(c.device, &smci, nullptr, &out.mod) != VK_SUCCESS) return false;
+
+  VkPipelineShaderStageCreateInfo stage{};
+  stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  stage.module = out.mod;
+  stage.pName = "main";
+  VkComputePipelineCreateInfo cpci{};
+  cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+  cpci.stage = stage;
+  cpci.layout = out.layout;
+  return vkCreateComputePipelines(c.device, VK_NULL_HANDLE, 1, &cpci, nullptr, &out.pipe) == VK_SUCCESS;
+}
+
+void destroyPipe(const Context& c, Pipe& p) {
+  if (p.pipe) vkDestroyPipeline(c.device, p.pipe, nullptr);
+  if (p.mod) vkDestroyShaderModule(c.device, p.mod, nullptr);
+  if (p.layout) vkDestroyPipelineLayout(c.device, p.layout, nullptr);
+  if (p.dsl) vkDestroyDescriptorSetLayout(c.device, p.dsl, nullptr);
+  p = {};
+}
+
+struct Recorder {
+  const Context& c;
+  VkCommandBuffer cmd;
+  VkDescriptorPool pool;
+  bool ok = true;
+
+  // Record one op: allocate+write a descriptor set for `bufs`, bind pipeline+set, push, dispatch,
+  // then a full compute->compute barrier so the next op observes the writes.
+  void op(const Pipe& p, std::initializer_list<VkBuffer> bufs, const void* push, std::uint32_t groups) {
+    if (!ok) return;
+    VkDescriptorSetAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ai.descriptorPool = pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &p.dsl;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(c.device, &ai, &set) != VK_SUCCESS) {
+      ok = false;
+      return;
+    }
+    const std::uint32_t nb = static_cast<std::uint32_t>(bufs.size());
+    std::vector<VkDescriptorBufferInfo> dbi(nb);
+    std::vector<VkWriteDescriptorSet> wr(nb);
+    std::uint32_t i = 0;
+    for (VkBuffer b : bufs) {
+      dbi[i] = {b, 0, VK_WHOLE_SIZE};
+      wr[i] = {};
+      wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      wr[i].dstSet = set;
+      wr[i].dstBinding = i;
+      wr[i].descriptorCount = 1;
+      wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      wr[i].pBufferInfo = &dbi[i];
+      ++i;
+    }
+    vkUpdateDescriptorSets(c.device, nb, wr.data(), 0, nullptr);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
+    if (p.push) vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, p.push, push);
+    vkCmdDispatch(cmd, groups, 1, 1);
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mb, 0, nullptr, 0, nullptr);
+  }
+};
 
 }  // namespace
 
@@ -878,10 +992,10 @@ SelfTestResult attentionSelfTest() {
   upload(bk, K.data(), K.size() * sizeof(float));
   upload(bv, V.data(), V.size() * sizeof(float));
   struct {
-    std::uint32_t nHeads, nKv, headDim, seqLen, kvDim;
+    std::uint32_t nHeads, nKv, headDim, seqLen, kvDim, layer, maxSeq;
   } pc{static_cast<std::uint32_t>(nHeads), static_cast<std::uint32_t>(nKv),
        static_cast<std::uint32_t>(headDim), static_cast<std::uint32_t>(seqLen),
-       static_cast<std::uint32_t>(kvDim)};
+       static_cast<std::uint32_t>(kvDim), 0u, static_cast<std::uint32_t>(seqLen)};
   const bool ran = dispatch(c, attention_spv, sizeof(attention_spv), {bo.buf, bq.buf, bk.buf, bv.buf},
                             &pc, sizeof(pc), static_cast<std::uint32_t>(nHeads));
   if (ran) download(bo, got.data(), got.size() * sizeof(float));
@@ -896,6 +1010,298 @@ SelfTestResult attentionSelfTest() {
   const bool ok = maxErr < 1e-3f;
   return {true, ok,
           (ok ? "GQA decode attention matches CPU (max err " : "attention disagrees with CPU (max err ") +
+              std::to_string(maxErr) + ") on " + dp.deviceName};
+}
+
+SelfTestResult forwardSelfTest() {
+  Context c = makeContext();
+  if (!c.ok) return {false, false, "no Vulkan device present"};
+  VkPhysicalDeviceProperties dp{};
+  vkGetPhysicalDeviceProperties(c.phys, &dp);
+
+  // Tiny synthetic Llama-style model — identical shape/values to gpuForwardSelfTest so both backends
+  // are checked against the same reference.
+  const int L = 2, d = 32, nHeads = 4, headDim = 8, nKv = 2, ffn = 64, vocab = 16, maxSeq = 8;
+  const int kvDim = nKv * headDim, qDim = nHeads * headDim, group = nHeads / nKv;
+  const float eps = 1e-5f, freqBase = 10000.0f;
+  auto gen = [](int seed, int i) { return 0.01f * (((i * 7 + seed * 13) % 17) - 8); };
+
+  std::vector<float> tokEmbd(vocab * d), outNorm(d, 1.0f), output(vocab * d);
+  for (int i = 0; i < vocab * d; ++i) tokEmbd[i] = gen(1, i);
+  for (int i = 0; i < vocab * d; ++i) output[i] = gen(2, i);
+  for (int i = 0; i < d; ++i) outNorm[i] = 1.0f + 0.01f * i;
+  struct Layer {
+    std::vector<float> attnNorm, wq, wk, wv, wo, ffnNorm, ffnGate, ffnUp, ffnDown;
+  };
+  std::vector<Layer> lw(L);
+  for (int l = 0; l < L; ++l) {
+    Layer& w = lw[l];
+    w.attnNorm.assign(d, 0.0f);
+    w.ffnNorm.assign(d, 0.0f);
+    for (int i = 0; i < d; ++i) {
+      w.attnNorm[i] = 1.0f + 0.01f * ((i + l) % 5);
+      w.ffnNorm[i] = 1.0f + 0.01f * ((i + l) % 3);
+    }
+    w.wq.resize(qDim * d);
+    w.wo.resize(d * qDim);
+    w.wk.resize(kvDim * d);
+    w.wv.resize(kvDim * d);
+    w.ffnGate.resize(ffn * d);
+    w.ffnUp.resize(ffn * d);
+    w.ffnDown.resize(d * ffn);
+    for (int i = 0; i < qDim * d; ++i) w.wq[i] = gen(10 + l, i);
+    for (int i = 0; i < d * qDim; ++i) w.wo[i] = gen(20 + l, i);
+    for (int i = 0; i < kvDim * d; ++i) w.wk[i] = gen(30 + l, i);
+    for (int i = 0; i < kvDim * d; ++i) w.wv[i] = gen(40 + l, i);
+    for (int i = 0; i < ffn * d; ++i) w.ffnGate[i] = gen(50 + l, i);
+    for (int i = 0; i < ffn * d; ++i) w.ffnUp[i] = gen(60 + l, i);
+    for (int i = 0; i < d * ffn; ++i) w.ffnDown[i] = gen(70 + l, i);
+  }
+
+  // ---- inline CPU reference (mirrors runtime/TextModel and gpuForwardSelfTest's cpuForward) ----
+  auto rms = [&](std::vector<float>& o, const std::vector<float>& x, const std::vector<float>& w, int n) {
+    double sq = 0.0;
+    for (int i = 0; i < n; ++i) sq += static_cast<double>(x[i]) * x[i];
+    const float sc = 1.0f / std::sqrt(static_cast<float>(sq / n) + eps);
+    for (int i = 0; i < n; ++i) o[i] = x[i] * sc * w[i];
+  };
+  auto mm = [&](std::vector<float>& o, const std::vector<float>& W, const std::vector<float>& x, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+      double a = 0.0;
+      for (int cc = 0; cc < cols; ++cc) a += static_cast<double>(W[r * cols + cc]) * x[cc];
+      o[r] = static_cast<float>(a);
+    }
+  };
+  auto ropeRef = [&](std::vector<float>& v, int nh, int pos) {
+    const int half = headDim / 2;
+    for (int h = 0; h < nh; ++h)
+      for (int i = 0; i < half; ++i) {
+        const float th = pos * std::pow(freqBase, -2.0f * i / headDim);
+        const float cc = std::cos(th), ss = std::sin(th);
+        const float a = v[h * headDim + i], b = v[h * headDim + i + half];
+        v[h * headDim + i] = a * cc - b * ss;
+        v[h * headDim + i + half] = a * ss + b * cc;
+      }
+  };
+  std::vector<float> hKc(static_cast<std::size_t>(L) * maxSeq * kvDim, 0.0f), hVc = hKc;
+  auto cpuForward = [&](int token, int pos, std::vector<float>& logits) {
+    std::vector<float> x(tokEmbd.begin() + token * d, tokEmbd.begin() + token * d + d);
+    std::vector<float> xn(d), q(qDim), k(kvDim), v(kvDim), attn(qDim), tmp(d), g(ffn), u(ffn), act(ffn);
+    for (int l = 0; l < L; ++l) {
+      Layer& w = lw[l];
+      rms(xn, x, w.attnNorm, d);
+      mm(q, w.wq, xn, qDim, d);
+      mm(k, w.wk, xn, kvDim, d);
+      mm(v, w.wv, xn, kvDim, d);
+      ropeRef(q, nHeads, pos);
+      ropeRef(k, nKv, pos);
+      for (int i = 0; i < kvDim; ++i) {
+        hKc[(static_cast<std::size_t>(l) * maxSeq + pos) * kvDim + i] = k[i];
+        hVc[(static_cast<std::size_t>(l) * maxSeq + pos) * kvDim + i] = v[i];
+      }
+      const float invSqrt = 1.0f / std::sqrt(static_cast<float>(headDim));
+      for (int h = 0; h < nHeads; ++h) {
+        const int kvHead = h / group;
+        std::vector<float> sc(pos + 1);
+        for (int t = 0; t <= pos; ++t) {
+          float dot = 0.0f;
+          for (int e = 0; e < headDim; ++e)
+            dot += q[h * headDim + e] * hKc[(static_cast<std::size_t>(l) * maxSeq + t) * kvDim + kvHead * headDim + e];
+          sc[t] = dot * invSqrt;
+        }
+        float mx = sc[0];
+        for (int t = 1; t <= pos; ++t) mx = std::max(mx, sc[t]);
+        float sum = 0.0f;
+        for (int t = 0; t <= pos; ++t) {
+          sc[t] = std::exp(sc[t] - mx);
+          sum += sc[t];
+        }
+        for (int e = 0; e < headDim; ++e) {
+          float a = 0.0f;
+          for (int t = 0; t <= pos; ++t)
+            a += (sc[t] / sum) * hVc[(static_cast<std::size_t>(l) * maxSeq + t) * kvDim + kvHead * headDim + e];
+          attn[h * headDim + e] = a;
+        }
+      }
+      mm(tmp, w.wo, attn, d, qDim);
+      for (int i = 0; i < d; ++i) x[i] += tmp[i];
+      rms(xn, x, w.ffnNorm, d);
+      mm(g, w.ffnGate, xn, ffn, d);
+      mm(u, w.ffnUp, xn, ffn, d);
+      for (int i = 0; i < ffn; ++i) act[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+      mm(tmp, w.ffnDown, act, d, ffn);
+      for (int i = 0; i < d; ++i) x[i] += tmp[i];
+    }
+    rms(xn, x, outNorm, d);
+    logits.resize(vocab);
+    mm(logits, output, xn, vocab, d);
+  };
+
+  // ---- build pipelines once ----
+  Pipe pEmbed{}, pMatmul{}, pRms{}, pRope{}, pKv{}, pAttn{}, pSwiglu{}, pAdd{};
+  bool pipesOk = makePipe(c, embed_row_spv, sizeof(embed_row_spv), 2, 8, pEmbed) &&
+                 makePipe(c, matmul_f32_spv, sizeof(matmul_f32_spv), 3, 8, pMatmul) &&
+                 makePipe(c, rmsnorm_spv, sizeof(rmsnorm_spv), 3, 8, pRms) &&
+                 makePipe(c, rope_spv, sizeof(rope_spv), 1, 16, pRope) &&
+                 makePipe(c, kv_store_spv, sizeof(kv_store_spv), 2, 16, pKv) &&
+                 makePipe(c, attention_spv, sizeof(attention_spv), 4, 28, pAttn) &&
+                 makePipe(c, swiglu_spv, sizeof(swiglu_spv), 3, 4, pSwiglu) &&
+                 makePipe(c, add_spv, sizeof(add_spv), 2, 4, pAdd);
+
+  // ---- device buffers ----
+  std::vector<Buffer> owned;
+  bool allocOk = true;
+  auto mkBytes = [&](VkDeviceSize bytes, const void* src, VkDeviceSize srcBytes) -> VkBuffer {
+    Buffer b{};
+    if (!makeBuffer(c, bytes, b)) {
+      allocOk = false;
+      return VK_NULL_HANDLE;
+    }
+    if (src) upload(b, src, srcBytes);
+    owned.push_back(b);
+    return owned.back().buf;
+  };
+  auto mkF = [&](const std::vector<float>& v) {
+    return mkBytes(v.size() * sizeof(float), v.data(), v.size() * sizeof(float));
+  };
+  auto mkScratch = [&](int n) { return mkBytes(static_cast<VkDeviceSize>(n) * sizeof(float), nullptr, 0); };
+
+  VkBuffer bTok = mkF(tokEmbd), bOutNorm = mkF(outNorm), bOutput = mkF(output);
+  std::vector<VkBuffer> bAttnN(L), bFfnN(L), bWq(L), bWk(L), bWv(L), bWo(L), bGate(L), bUp(L), bDown(L);
+  for (int l = 0; l < L; ++l) {
+    bAttnN[l] = mkF(lw[l].attnNorm);
+    bFfnN[l] = mkF(lw[l].ffnNorm);
+    bWq[l] = mkF(lw[l].wq);
+    bWk[l] = mkF(lw[l].wk);
+    bWv[l] = mkF(lw[l].wv);
+    bWo[l] = mkF(lw[l].wo);
+    bGate[l] = mkF(lw[l].ffnGate);
+    bUp[l] = mkF(lw[l].ffnUp);
+    bDown[l] = mkF(lw[l].ffnDown);
+  }
+  std::vector<float> zeroKv(static_cast<std::size_t>(L) * maxSeq * kvDim, 0.0f);
+  VkBuffer bKc = mkF(zeroKv), bVc = mkF(zeroKv);
+  VkBuffer bx = mkScratch(d), bxn = mkScratch(d), bq = mkScratch(qDim), bk = mkScratch(kvDim),
+           bv = mkScratch(kvDim), battn = mkScratch(qDim), btmp = mkScratch(d), bg = mkScratch(ffn),
+           bu = mkScratch(ffn), bact = mkScratch(ffn), blogits = mkScratch(vocab);
+
+  // ---- command buffer + fence + descriptor pool ----
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkCommandBufferAllocateInfo cbai{};
+  cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cbai.commandPool = c.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkFence fence = VK_NULL_HANDLE;
+  VkFenceCreateInfo fci{};
+  fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512};
+  VkDescriptorPoolCreateInfo dpci{};
+  dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+  dpci.maxSets = 128;
+  dpci.poolSizeCount = 1;
+  dpci.pPoolSizes = &dps;
+  VkDescriptorPool descPool = VK_NULL_HANDLE;
+  const bool infraOk = pipesOk && allocOk &&
+                       vkAllocateCommandBuffers(c.device, &cbai, &cmd) == VK_SUCCESS &&
+                       vkCreateFence(c.device, &fci, nullptr, &fence) == VK_SUCCESS &&
+                       vkCreateDescriptorPool(c.device, &dpci, nullptr, &descPool) == VK_SUCCESS;
+
+  const int tokens[3] = {1, 5, 9};
+  auto g256 = [](int n) { return static_cast<std::uint32_t>((n + 255) / 256); };
+  float maxErr = 0.0f;
+  bool ran = infraOk;
+
+  for (int pos = 0; pos < 3 && ran; ++pos) {
+    vkResetDescriptorPool(c.device, descPool, 0);
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    Recorder rec{c, cmd, descPool};
+    struct EmbedPC { std::uint32_t token, d; } ePC{static_cast<std::uint32_t>(tokens[pos]), (std::uint32_t)d};
+    rec.op(pEmbed, {bx, bTok}, &ePC, g256(d));
+    for (int l = 0; l < L; ++l) {
+      struct RmsPC { std::uint32_t n; float eps; };
+      struct MmPC { std::uint32_t rows, cols; };
+      struct RopePC { std::uint32_t nh, hd; std::int32_t pos; float base; };
+      struct KvPC { std::uint32_t layer, pos, maxSeq, kvDim; };
+      struct AttnPC { std::uint32_t nHeads, nKv, headDim, seqLen, kvDim, layer, maxSeq; };
+      struct NPC { std::uint32_t n; };
+      RmsPC a1{(std::uint32_t)d, eps};
+      rec.op(pRms, {bxn, bx, bAttnN[l]}, &a1, 1);
+      MmPC mq{(std::uint32_t)qDim, (std::uint32_t)d}, mkv{(std::uint32_t)kvDim, (std::uint32_t)d};
+      rec.op(pMatmul, {bq, bWq[l], bxn}, &mq, (std::uint32_t)qDim);
+      rec.op(pMatmul, {bk, bWk[l], bxn}, &mkv, (std::uint32_t)kvDim);
+      rec.op(pMatmul, {bv, bWv[l], bxn}, &mkv, (std::uint32_t)kvDim);
+      RopePC rq{(std::uint32_t)nHeads, (std::uint32_t)headDim, pos, freqBase},
+          rk{(std::uint32_t)nKv, (std::uint32_t)headDim, pos, freqBase};
+      rec.op(pRope, {bq}, &rq, g256(nHeads * headDim / 2));
+      rec.op(pRope, {bk}, &rk, g256(nKv * headDim / 2));
+      KvPC kv{(std::uint32_t)l, (std::uint32_t)pos, (std::uint32_t)maxSeq, (std::uint32_t)kvDim};
+      rec.op(pKv, {bKc, bk}, &kv, g256(kvDim));
+      rec.op(pKv, {bVc, bv}, &kv, g256(kvDim));
+      AttnPC ap{(std::uint32_t)nHeads, (std::uint32_t)nKv, (std::uint32_t)headDim,
+                (std::uint32_t)(pos + 1), (std::uint32_t)kvDim, (std::uint32_t)l, (std::uint32_t)maxSeq};
+      rec.op(pAttn, {battn, bq, bKc, bVc}, &ap, (std::uint32_t)nHeads);
+      MmPC mo{(std::uint32_t)d, (std::uint32_t)qDim};
+      rec.op(pMatmul, {btmp, bWo[l], battn}, &mo, (std::uint32_t)d);
+      NPC nd{(std::uint32_t)d};
+      rec.op(pAdd, {bx, btmp}, &nd, g256(d));
+      RmsPC a2{(std::uint32_t)d, eps};
+      rec.op(pRms, {bxn, bx, bFfnN[l]}, &a2, 1);
+      MmPC mff{(std::uint32_t)ffn, (std::uint32_t)d};
+      rec.op(pMatmul, {bg, bGate[l], bxn}, &mff, (std::uint32_t)ffn);
+      rec.op(pMatmul, {bu, bUp[l], bxn}, &mff, (std::uint32_t)ffn);
+      NPC nf{(std::uint32_t)ffn};
+      rec.op(pSwiglu, {bact, bg, bu}, &nf, g256(ffn));
+      MmPC mdn{(std::uint32_t)d, (std::uint32_t)ffn};
+      rec.op(pMatmul, {btmp, bDown[l], bact}, &mdn, (std::uint32_t)d);
+      rec.op(pAdd, {bx, btmp}, &nd, g256(d));
+    }
+    struct RmsPC2 { std::uint32_t n; float eps; } af{(std::uint32_t)d, eps};
+    rec.op(pRms, {bxn, bx, bOutNorm}, &af, 1);
+    struct MmPC2 { std::uint32_t rows, cols; } mlg{(std::uint32_t)vocab, (std::uint32_t)d};
+    rec.op(pMatmul, {blogits, bOutput, bxn}, &mlg, (std::uint32_t)vocab);
+    vkEndCommandBuffer(cmd);
+    if (!rec.ok) {
+      ran = false;
+      break;
+    }
+
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(c.queue, 1, &si, fence) != VK_SUCCESS ||
+        vkWaitForFences(c.device, 1, &fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+      ran = false;
+      break;
+    }
+    vkResetFences(c.device, 1, &fence);
+
+    std::vector<float> got(vocab), ref;
+    for (auto& b : owned)
+      if (b.buf == blogits) download(b, got.data(), vocab * sizeof(float));
+    cpuForward(tokens[pos], pos, ref);
+    for (int i = 0; i < vocab; ++i) maxErr = std::max(maxErr, std::fabs(got[i] - ref[i]));
+  }
+
+  // cleanup
+  if (descPool) vkDestroyDescriptorPool(c.device, descPool, nullptr);
+  if (fence) vkDestroyFence(c.device, fence, nullptr);
+  if (cmd) vkFreeCommandBuffers(c.device, c.pool, 1, &cmd);
+  for (auto& b : owned) b.destroy();
+  for (Pipe* p : {&pEmbed, &pMatmul, &pRms, &pRope, &pKv, &pAttn, &pSwiglu, &pAdd}) destroyPipe(c, *p);
+
+  if (!infraOk) return {true, false, "forward setup failed (pipelines/buffers)"};
+  if (!ran) return {true, false, "forward dispatch failed"};
+  const bool ok = maxErr < 2e-2f;
+  return {true, ok,
+          (ok ? "Vulkan forward pass (2-layer, 3 positions) matches CPU reference (max err "
+              : "Vulkan forward disagrees with CPU (max err ") +
               std::to_string(maxErr) + ") on " + dp.deviceName};
 }
 

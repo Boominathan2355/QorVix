@@ -1,0 +1,19 @@
+#version 450
+
+// Copy one embedding row: dst[i] = table[token*d + i]. Keeps the embedding lookup device-side.
+// Mirrors embedRowKernel. The table is the F32-dequantized token-embedding matrix.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) writeonly buffer DBuf { float dst[]; };
+layout(std430, binding = 1) readonly buffer TBuf { float table[]; };
+
+layout(push_constant) uniform PC {
+  uint token;
+  uint d;
+} pc;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i < pc.d) dst[i] = table[pc.token * pc.d + i];
+}

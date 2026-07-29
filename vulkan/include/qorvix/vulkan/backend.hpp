@@ -71,4 +71,10 @@ SelfTestResult opsSelfTest();
 // analogue of qorvix::cuda::attentionSelfTest().
 SelfTestResult attentionSelfTest();
 
+// End-to-end: a tiny synthetic transformer's forward pass run entirely on the GPU via Vulkan
+// (weights, hidden state, and KV cache in device buffers, all shaders chained per layer in one
+// command buffer), compared against an inline CPU reference over several positions. Proves the
+// assembled Vulkan forward pass is correct. The analogue of qorvix::cuda::gpuForwardSelfTest().
+SelfTestResult forwardSelfTest();
+
 }  // namespace qorvix::vulkan

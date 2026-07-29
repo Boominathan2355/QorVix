@@ -32,7 +32,8 @@ if(_vk_real)
   # Compile each .comp to a SPIR-V C header (uint32_t array named <stem>_spv) so the shader bytes
   # are embedded in the binary — no shader files to ship or locate at runtime.
   set(_spv_headers "")
-  foreach(_shader qmatmul_q8_0 qmatmul_q4_k qmatmul_q6_k rmsnorm rope swiglu add attention)
+  foreach(_shader qmatmul_q8_0 qmatmul_q4_k qmatmul_q6_k rmsnorm rope swiglu add attention
+                  matmul_f32 embed_row kv_store)
     set(_src "${_shader_dir}/${_shader}.comp")
     set(_hdr "${_gen_dir}/${_shader}_spv.h")
     if(QORVIX_GLSLANG)
