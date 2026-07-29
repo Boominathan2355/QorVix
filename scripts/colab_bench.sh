@@ -61,13 +61,20 @@ echo "############## correctness gate (argmax parity vs CPU) ##############"
 "${BIN}" gpu-check "${MODEL}" 2>&1 | grep -iE "Argmax|rel err|RESULT" || echo "(cuda gpu-check skipped)"
 
 echo ""
-echo "############## bench: same workload, every backend (JSON) ##############"
+echo "############## bench: GPU backends, same workload (JSON) ##############"
 echo "workload: prompt=${PROMPT} gen=${GEN} warmup=${WARMUP} runs=${RUNS}"
-for be in cpu cuda vulkan; do
+# GPU backends FIRST at the full workload (fast on real hardware). cuda is the NVIDIA fast path;
+# vulkan is the one cross-vendor backend that also runs here.
+for be in cuda vulkan; do
   echo -n "  ${be}: "
   "${BIN}" bench "${MODEL}" --${be} --prompt "${PROMPT}" --gen "${GEN}" \
     --warmup "${WARMUP}" --runs "${RUNS}" --json 2>/dev/null || echo "(unavailable)"
 done
+# CPU is the generalized reference, ~100x slower — a LIGHT workload only, so it never blocks the GPU
+# numbers (the full workload would take ~15+ min on CPU). Not a target; sanity/context only.
+echo -n "  cpu (light ref): "
+"${BIN}" bench "${MODEL}" --cpu --prompt 8 --gen 16 --warmup 0 --runs 1 --json 2>/dev/null \
+  || echo "(unavailable)"
 
 echo ""
 echo "==================== done — paste the JSON lines into BENCHMARKS.md ===================="

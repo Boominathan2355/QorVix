@@ -840,12 +840,14 @@ int cmdBackends() {
               << "   " << note << "\n";
   };
   std::cout << "Compute backends (one unified IInferenceEngine seam; createEngine picks one):\n";
-  row("cpu", true, 1, "reference runtime (always available)");
-  row("cuda", cudaBuilt, cudaDevs, "NVIDIA only; fastest where present");
-  row("vulkan", vkBuilt, vkDevs, "cross-vendor: NVIDIA / AMD / Apple / Intel");
-  std::cout << "\nAuto-selected default (CUDA > Vulkan > CPU): "
+  row("cpu", true, 1, "all CPUs           (generalized reference)");
+  row("vulkan", vkBuilt, vkDevs, "all GPUs           (NVIDIA / AMD / Apple / Intel — one backend)");
+  row("cuda", cudaBuilt, cudaDevs, "NVIDIA GPUs only   (the fast path where present)");
+  std::cout << "\nModel: one universal CPU backend + one universal Vulkan GPU backend, plus CUDA as\n"
+               "the NVIDIA-only fast path. `--auto` selects the FASTEST available for this hardware\n"
+               "(CUDA > Vulkan > CPU) -> "
             << qorvix::backendName(qorvix::selectBestBackend())
-            << "\n(use `generate --auto`, or force with --gpu / --vulkan / neither for CPU)\n";
+            << " here. Force with --cuda/--gpu, --vulkan, or --cpu.\n";
   return 0;
 }
 

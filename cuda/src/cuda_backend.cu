@@ -1327,8 +1327,12 @@ class GpuModelImpl final : public GpuModel {
     graphs_.assign(maxSessions_, nullptr);
     graphExecs_.assign(maxSessions_, nullptr);
     graphReady_.assign(maxSessions_, false);
+    // Session 0 is a normal openable slot — NOT reserved. The single-sequence convenience API
+    // (forward(token,pos)/reset()) uses session 0's KV directly and never consults sessionUsed_, so
+    // it works whether or not a session is open. Reserving slot 0 used to make openSession() fail on
+    // a maxSessions==1 model (the unified generate/bench path opens a session), and it silently cost
+    // serve one slot (--max-concurrent N gave N-1). Kept uniform with the CPU/Vulkan backends.
     sessionUsed_.assign(maxSessions_, false);
-    sessionUsed_[0] = true;  // session 0 always exists (single-sequence convenience API)
     return true;
   }
 
@@ -1343,7 +1347,7 @@ class GpuModelImpl final : public GpuModel {
     return kNoGpuSession;  // all slots busy — scheduler reads this as "cannot admit yet"
   }
   void closeSession(int session) override {
-    if (session > 0 && session < maxSessions_) sessionUsed_[session] = false;
+    if (session >= 0 && session < maxSessions_) sessionUsed_[session] = false;
   }
 
   const std::vector<float>& forward(int token, int pos) override { return forward(0, token, pos); }
