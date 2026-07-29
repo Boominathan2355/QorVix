@@ -240,13 +240,13 @@ bool hasFlag(const std::vector<std::string_view>& args, std::string_view flag) {
   return false;
 }
 
-// Chooses the backend from CLI flags: --gpu -> cuda, --vulkan -> vulkan, --auto -> best available,
-// otherwise CPU. One place, used by both generate and serve.
+// Chooses the backend from CLI flags: --gpu/--cuda -> cuda, --vulkan -> vulkan, --auto -> best
+// available, --cpu / (nothing) -> cpu. One place, used by generate, serve, and bench.
 qorvix::Backend backendFromArgs(const std::vector<std::string_view>& args) {
-  if (hasFlag(args, "--gpu")) return qorvix::Backend::Cuda;
+  if (hasFlag(args, "--gpu") || hasFlag(args, "--cuda")) return qorvix::Backend::Cuda;
   if (hasFlag(args, "--vulkan")) return qorvix::Backend::Vulkan;
   if (hasFlag(args, "--auto")) return qorvix::selectBestBackend();
-  return qorvix::Backend::Cpu;
+  return qorvix::Backend::Cpu;  // explicit --cpu or no flag
 }
 
 // THE generation loop — backend-agnostic. Drives any IInferenceEngine through the seam
