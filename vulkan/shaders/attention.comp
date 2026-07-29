@@ -1,0 +1,76 @@
+#version 450
+
+// Single-query (decode-step) GQA attention over a cached K/V. One workgroup per query head; GQA maps
+// query head h -> kv head h/(nHeads/nKv). Computes softmax(qK^T / sqrt(headDim)) V over cached
+// positions 0..seqLen-1. Mirrors the CUDA attentionDecodeKernel (per-t block reduce + serial
+// softmax); FlashAttention-style tiling is a later optimization.
+//
+// Fixed workgroup of 128 lanes (>= any target headDim; TinyLlama is 64). Lanes >= headDim keep a
+// zeroed reduction slot so the power-of-two reduction over 128 still yields the headDim-wide dot.
+// Shared `scores` is sized for the max supported context.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) writeonly buffer OBuf { float o[]; };
+layout(std430, binding = 1) readonly buffer QBuf { float q[]; };
+layout(std430, binding = 2) readonly buffer KBuf { float K[]; };
+layout(std430, binding = 3) readonly buffer VBuf { float Vv[]; };
+
+layout(push_constant) uniform PC {
+  uint nHeads;
+  uint nKv;
+  uint headDim;
+  uint seqLen;
+  uint kvDim;
+} pc;
+
+const uint MAX_SEQ = 4096u;
+shared float scores[MAX_SEQ];
+shared float red[128];
+
+void main() {
+  uint h = gl_WorkGroupID.x;
+  if (h >= pc.nHeads) return;
+  uint tid = gl_LocalInvocationID.x;
+  uint hd = pc.headDim;
+  uint kvHead = h / (pc.nHeads / pc.nKv);
+  float invSqrt = inversesqrt(float(hd));
+  uint qbase = h * hd;
+
+  // scores[t] = (q_h . K[t][kvHead]) * invSqrt
+  for (uint t = 0u; t < pc.seqLen; ++t) {
+    uint kbase = t * pc.kvDim + kvHead * hd;
+    red[tid] = (tid < hd) ? q[qbase + tid] * K[kbase + tid] : 0.0;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) {
+      if (tid < s) red[tid] += red[tid + s];
+      barrier();
+    }
+    if (tid == 0u) scores[t] = red[0] * invSqrt;
+    barrier();
+  }
+
+  // softmax over scores (serial on lane 0 — seqLen is small per decode step)
+  if (tid == 0u) {
+    float mx = scores[0];
+    for (uint t = 1u; t < pc.seqLen; ++t) mx = max(mx, scores[t]);
+    float sum = 0.0;
+    for (uint t = 0u; t < pc.seqLen; ++t) {
+      scores[t] = exp(scores[t] - mx);
+      sum += scores[t];
+    }
+    float inv = 1.0 / sum;
+    for (uint t = 0u; t < pc.seqLen; ++t) scores[t] *= inv;
+  }
+  barrier();
+
+  // out[h][d] = sum_t scores[t] * V[t][kvHead][d]
+  if (tid < hd) {
+    float acc = 0.0;
+    for (uint t = 0u; t < pc.seqLen; ++t) {
+      uint vbase = t * pc.kvDim + kvHead * hd;
+      acc += scores[t] * Vv[vbase + tid];
+    }
+    o[h * hd + tid] = acc;
+  }
+}

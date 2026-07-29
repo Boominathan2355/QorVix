@@ -63,4 +63,12 @@ SelfTestResult qmatmulQ8_0SelfTest();
 SelfTestResult qmatmulQ4_KSelfTest();
 SelfTestResult qmatmulQ6_KSelfTest();
 
+// Forward-pass building-block compute shaders (RMSNorm, RoPE, SwiGLU, residual add) checked against
+// a CPU reference. The Vulkan analogue of qorvix::cuda::opsSelfTest().
+SelfTestResult opsSelfTest();
+
+// Single-query GQA decode attention over a cached K/V, checked against a CPU reference. The Vulkan
+// analogue of qorvix::cuda::attentionSelfTest().
+SelfTestResult attentionSelfTest();
+
 }  // namespace qorvix::vulkan

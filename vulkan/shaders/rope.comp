@@ -1,0 +1,30 @@
+#version 450
+
+// RoPE (NeoX: rotate split-half pairs (i, i+headDim/2)) over a [nHeads*headDim] vector, in place.
+// theta = pos * freqBase^(-2i/headDim); mirrors the CUDA ropeNeoxKernel. One invocation per
+// (head, pair).
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer VBuf { float v[]; };
+
+layout(push_constant) uniform PC {
+  uint nHeads;
+  uint headDim;
+  int pos;
+  float freqBase;
+} pc;
+
+void main() {
+  uint idx = gl_GlobalInvocationID.x;
+  uint hlf = pc.headDim / 2u;
+  if (idx >= pc.nHeads * hlf) return;
+  uint h = idx / hlf;
+  uint i = idx % hlf;
+  uint b = h * pc.headDim;
+  float theta = float(pc.pos) * pow(pc.freqBase, -2.0 * float(i) / float(pc.headDim));
+  float c = cos(theta), s = sin(theta);
+  float a = v[b + i], bb = v[b + i + hlf];
+  v[b + i] = a * c - bb * s;
+  v[b + i + hlf] = a * s + bb * c;
+}

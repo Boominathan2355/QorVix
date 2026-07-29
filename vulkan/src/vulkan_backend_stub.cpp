@@ -21,4 +21,8 @@ SelfTestResult qmatmulQ4_KSelfTest() { return {false, false, "Vulkan support not
 
 SelfTestResult qmatmulQ6_KSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
 
+SelfTestResult opsSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
+
+SelfTestResult attentionSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
+
 }  // namespace qorvix::vulkan

@@ -816,9 +816,15 @@ int cmdVulkan() {
   const auto q6k = qorvix::vulkan::qmatmulQ6_KSelfTest();
   std::cout << "Self-test (Q6_K matmul):  " << (q6k.passed ? "PASS" : (q6k.ran ? "FAIL" : "skip"))
             << " - " << q6k.message << "\n";
+  const auto ops = qorvix::vulkan::opsSelfTest();
+  std::cout << "Self-test (forward ops):  " << (ops.passed ? "PASS" : (ops.ran ? "FAIL" : "skip"))
+            << " - " << ops.message << "\n";
+  const auto attn = qorvix::vulkan::attentionSelfTest();
+  std::cout << "Self-test (attention):    " << (attn.passed ? "PASS" : (attn.ran ? "FAIL" : "skip"))
+            << " - " << attn.message << "\n";
 
   return (self.ran && !self.passed) || (q8.ran && !q8.passed) || (q4k.ran && !q4k.passed) ||
-                 (q6k.ran && !q6k.passed)
+                 (q6k.ran && !q6k.passed) || (ops.ran && !ops.passed) || (attn.ran && !attn.passed)
              ? 1
              : 0;
 }
