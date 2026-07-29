@@ -1,5 +1,6 @@
 add_library(qorvix_runtime STATIC
   src/ops.cpp
+  src/cpu_features.cpp
   src/dequant.cpp
   src/qmatmul.cpp
   src/model_config.cpp

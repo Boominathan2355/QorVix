@@ -423,6 +423,14 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
   config ⬜ · docs 🟡.
 - **Extensibility:** plugin system ✅ (`plugins/` — `IPlugin`, `PluginRegistry`, hot-load/unload,
   `qorvix plugins`, example plugin + test; Phase 1).
+- **CPU generalization (one backend, best ISA at runtime — the CPU analogue of one Vulkan backend
+  for all GPUs):** runtime CPU feature detection + SIMD dispatch ✅ (`runtime/cpu_features.cpp`,
+  `qorvix cpuinfo`) — a portable default build auto-uses AVX2 on capable x86 with NO -march=native
+  (was gated behind QORVIX_NATIVE), scalar fallback everywhere; verified + tests green with AVX2
+  active. NEON/SVE (ARM/Apple Silicon) 🟡 (kernel written, aarch64-compile-gated, hardware-unverified)
+  · AVX-512 kernel ⬜ · RISC-V vector ⬜🖥️ · SIMD dequant (the actual CPU-decode bottleneck — dot is
+  already SIMD) ⬜ · NUMA-aware KV/weight placement ⬜🖥️ · thread affinity / pinning ⬜🖥️.
+  *(x86 verifiable here; ARM/RISC-V/NUMA need their own hardware, like HIP/Metal on the GPU side.)*
 - **Platform:** Linux ✅ · Windows/macOS/AMD/Intel GPU validation ⬜🖥️.
 - **Production:** model hot-swap/cache ⬜ · graceful OOM ⬜ · fault recovery ⬜ · telemetry ⬜.
 - **Empty module dirs (not started; scaffolded only when their phase begins, to keep the build free

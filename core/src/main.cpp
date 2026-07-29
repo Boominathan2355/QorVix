@@ -23,6 +23,7 @@
 #include "qorvix/plugin_registry.hpp"
 #include "qorvix/ports.hpp"
 #include "qorvix/runtime/benchmark.hpp"
+#include "qorvix/runtime/cpu_features.hpp"
 #include "qorvix/runtime/dequant.hpp"
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
@@ -926,6 +927,29 @@ int cmdBench(const std::vector<std::string_view>& args) {
   }
 }
 
+// Reports the CPU's detected ISA + which SIMD dot-product kernel the runtime dispatches to. The CPU
+// analogue of `backends`/`vulkan`: one generalized backend, best kernel chosen at runtime.
+int cmdCpuInfo() {
+  const auto& f = qorvix::runtime::cpu::features();
+  std::cout << "CPU backend (generalized — one binary, best SIMD kernel chosen at runtime):\n"
+            << "  architecture     : " << f.arch << "\n"
+            << "  hardware threads : " << f.hardwareThreads << "\n";
+  std::cout << "  SIMD features    : ";
+  if (f.arch == "x86_64") {
+    std::cout << (f.sse2 ? "sse2 " : "") << (f.avx ? "avx " : "") << (f.avx2 ? "avx2 " : "")
+              << (f.fma ? "fma " : "") << (f.avx512f ? "avx512f " : "");
+  } else if (f.arch == "aarch64") {
+    std::cout << (f.neon ? "neon " : "") << (f.sve ? "sve " : "");
+  } else {
+    std::cout << "(scalar only on this arch)";
+  }
+  std::cout << "\n  active dot kernel: " << qorvix::runtime::cpu::activeDotKernel() << "\n"
+            << "\nOne portable build runs optimally on any CPU (no -march=native). x86 AVX2 is\n"
+            << "active here; NEON/SVE (ARM/Apple), RISC-V vector, NUMA, and thread affinity are\n"
+            << "architected but need their own hardware to verify (see ROADMAP).\n";
+  return 0;
+}
+
 int printUsage() {
   std::cout << qorvix::startupBanner() << "\n\n"
             << "Usage: qorvix <command> [args]\n\n"
@@ -940,6 +964,7 @@ int printUsage() {
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
             << qorvix::ports::kRangeLast << ")\n"
             << "  backends            List compute backends (cpu/cuda/vulkan) and the auto default\n"
+            << "  cpuinfo             Show CPU arch + SIMD features + active dot kernel\n"
             << "  bench <file> [--gpu|--vulkan|--auto] [--json]   Benchmark decode throughput\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  vulkan              Show Vulkan devices and run compute-backend self-tests\n"
@@ -974,6 +999,7 @@ int main(int argc, char** argv) {
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();
   if (command == "backends") return cmdBackends();
+  if (command == "cpuinfo") return cmdCpuInfo();
   if (command == "bench") return cmdBench(args);
   if (command == "gpu-check") return cmdGpuCheck(arg1);
   if (command == "vulkan-check") return cmdVulkanCheck(arg1);
