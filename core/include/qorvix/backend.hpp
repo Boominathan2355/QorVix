@@ -1,0 +1,189 @@
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "qorvix/cuda/backend.hpp"
+#include "qorvix/cuda/gpu_model.hpp"
+#include "qorvix/gguf/gguf_file.hpp"
+#include "qorvix/gpu_engine.hpp"
+#include "qorvix/runtime/dequant.hpp"
+#include "qorvix/runtime/inference_engine.hpp"
+#include "qorvix/runtime/model_config.hpp"
+#include "qorvix/runtime/text_model.hpp"
+#include "qorvix/runtime/weights.hpp"
+#include "qorvix/vulkan/backend.hpp"
+#include "qorvix/vulkan/vulkan_model.hpp"
+#include "qorvix/vulkan_engine.hpp"
+
+// Unified backend layer. Every compute backend (CPU / CUDA / Vulkan) is one implementation of the
+// runtime::IInferenceEngine seam, and createEngine() is the single place that builds one from a
+// GGUF file. `generate`, `serve`, and the *-check commands all go through this — there is no
+// per-backend branching or parallel generation loop anywhere above this header.
+namespace qorvix {
+
+enum class Backend { Cpu, Cuda, Vulkan };
+
+inline const char* backendName(Backend b) {
+  switch (b) {
+    case Backend::Cuda: return "cuda";
+    case Backend::Vulkan: return "vulkan";
+    default: return "cpu";
+  }
+}
+
+// A backend is usable iff it is compiled in AND has a device (CPU is always usable).
+inline bool backendAvailable(Backend b) {
+  switch (b) {
+    case Backend::Cuda: return cuda::builtWithCuda() && cuda::deviceCount() > 0;
+    case Backend::Vulkan: return vulkan::builtWithVulkan() && vulkan::deviceCount() > 0;
+    default: return true;
+  }
+}
+
+// Best available backend, fastest first: CUDA > Vulkan > CPU.
+inline Backend selectBestBackend() {
+  if (backendAvailable(Backend::Cuda)) return Backend::Cuda;
+  if (backendAvailable(Backend::Vulkan)) return Backend::Vulkan;
+  return Backend::Cpu;
+}
+
+// Parse a backend name; "auto" resolves to the best available. nullopt on an unknown name.
+inline std::optional<Backend> parseBackend(std::string_view s) {
+  if (s == "cpu") return Backend::Cpu;
+  if (s == "cuda" || s == "gpu") return Backend::Cuda;
+  if (s == "vulkan") return Backend::Vulkan;
+  if (s == "auto") return selectBestBackend();
+  return std::nullopt;
+}
+
+namespace detail {
+
+// GGUF weight -> backend weight descriptor (same raw bytes, borrowed from the mmap).
+inline cuda::GpuWeight toGpuWeight(const runtime::WeightMat& m) {
+  return cuda::GpuWeight{m.quant, m.type, m.rows, m.cols};
+}
+inline vulkan::VulkanWeight toVkWeight(const runtime::WeightMat& m) {
+  return vulkan::VulkanWeight{m.quant, m.type, m.rows, m.cols};
+}
+
+// The one bridge from a loaded GGUF (runtime Weights) to a backend model config + layer list.
+// Templated over the backend's descriptor types so CUDA and Vulkan share the exact same wiring —
+// the only per-backend difference is the concrete Config/Weight/Layer structs.
+template <typename Config, typename Weight, typename Layer, typename ToWeight>
+Config makeConfig(const runtime::ModelConfig& cfg, int maxSeq) {
+  Config gc;
+  gc.nLayers = static_cast<int>(cfg.blockCount);
+  gc.dModel = static_cast<int>(cfg.embeddingLength);
+  gc.nHeads = static_cast<int>(cfg.headCount);
+  gc.headDim = static_cast<int>(cfg.headDim());
+  gc.nKv = static_cast<int>(cfg.headCountKv);
+  gc.ffn = static_cast<int>(cfg.feedForwardLength);
+  gc.vocab = static_cast<int>(cfg.vocabSize);
+  gc.maxSeq = maxSeq;
+  gc.normEps = cfg.normEpsilon;
+  gc.ropeFreqBase = cfg.ropeFreqBase;
+  return gc;
+}
+
+}  // namespace detail
+
+// Uploads a loaded GGUF model's weights to VRAM and returns a CUDA model runner (null on failure).
+// Dequantizes the embedding table to F32 for the on-device lookup; layer weights stay quantized.
+inline std::unique_ptr<cuda::GpuModel> buildGpuModel(const runtime::ModelConfig& cfg,
+                                                     const runtime::Weights& w, int maxSeq,
+                                                     std::string& err, int maxSessions = 1) {
+  namespace rt = qorvix::runtime;
+  const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+  std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
+  if (!rt::dequantize(w.tokenEmbd.type, w.tokenEmbd.quant, embF32.data(),
+                      static_cast<std::size_t>(vocab) * d)) {
+    err = "failed to dequantize token_embd";
+    return nullptr;
+  }
+  auto gc = detail::makeConfig<cuda::GpuModelConfig, cuda::GpuWeight, cuda::GpuLayer, int>(cfg, maxSeq);
+  cuda::GpuWeight output =
+      w.output.valid() ? detail::toGpuWeight(w.output) : detail::toGpuWeight(w.tokenEmbd);
+  std::vector<cuda::GpuLayer> gl(cfg.blockCount);
+  for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+    const auto& L = w.layers[l];
+    gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), detail::toGpuWeight(L.wq),
+             detail::toGpuWeight(L.wk), detail::toGpuWeight(L.wv), detail::toGpuWeight(L.wo),
+             detail::toGpuWeight(L.ffnGate), detail::toGpuWeight(L.ffnUp),
+             detail::toGpuWeight(L.ffnDown)};
+  }
+  return cuda::createGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err, maxSessions);
+}
+
+// The Vulkan twin of buildGpuModel — same bridge, cross-vendor backend.
+inline std::unique_ptr<vulkan::VulkanModel> buildVulkanModel(const runtime::ModelConfig& cfg,
+                                                             const runtime::Weights& w, int maxSeq,
+                                                             std::string& err) {
+  namespace rt = qorvix::runtime;
+  const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+  std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
+  if (!rt::dequantize(w.tokenEmbd.type, w.tokenEmbd.quant, embF32.data(),
+                      static_cast<std::size_t>(vocab) * d)) {
+    err = "failed to dequantize token_embd";
+    return nullptr;
+  }
+  auto gc =
+      detail::makeConfig<vulkan::VulkanModelConfig, vulkan::VulkanWeight, vulkan::VulkanLayer, int>(
+          cfg, maxSeq);
+  vulkan::VulkanWeight output =
+      w.output.valid() ? detail::toVkWeight(w.output) : detail::toVkWeight(w.tokenEmbd);
+  std::vector<vulkan::VulkanLayer> gl(cfg.blockCount);
+  for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+    const auto& L = w.layers[l];
+    gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), detail::toVkWeight(L.wq),
+             detail::toVkWeight(L.wk), detail::toVkWeight(L.wv), detail::toVkWeight(L.wo),
+             detail::toVkWeight(L.ffnGate), detail::toVkWeight(L.ffnUp),
+             detail::toVkWeight(L.ffnDown)};
+  }
+  return vulkan::createVulkanModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err);
+}
+
+// THE unified construction point: builds an IInferenceEngine for `backend` from an opened GGUF file
+// (moved in). For CPU the returned engine owns the file so its borrowed quantized weights stay
+// mapped; for CUDA/Vulkan the weights are uploaded to the device and the file is released here.
+// Returns nullptr with `err` set on failure (unavailable backend, bad model, alloc failure).
+inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, gguf::GgufFile file,
+                                                               std::uint32_t maxSeq,
+                                                               std::uint32_t maxSessions,
+                                                               std::string& err) {
+  namespace rt = qorvix::runtime;
+  if (!backendAvailable(backend)) {
+    err = std::string(backendName(backend)) + " backend unavailable (not built in, or no device)";
+    return nullptr;
+  }
+
+  if (backend == Backend::Cpu) {
+    auto m = rt::TextModel::fromGguf(std::move(file), err, maxSeq, maxSessions);
+    if (!m) return nullptr;
+    return std::make_unique<rt::TextModel>(std::move(*m));
+  }
+
+  // Device backends share the weight-loading front half; the file's mmap must outlive the upload.
+  const auto cfg = rt::configFromGguf(file, err);
+  if (!cfg.valid()) {
+    if (err.empty()) err = "invalid model config";
+    return nullptr;
+  }
+  auto weights = rt::loadWeights(file, cfg, err);
+  if (!weights) return nullptr;
+
+  if (backend == Backend::Cuda) {
+    auto gm = buildGpuModel(cfg, *weights, static_cast<int>(maxSeq), err,
+                            static_cast<int>(maxSessions));
+    if (!gm) return nullptr;
+    return std::make_unique<GpuEngine>(std::move(gm), cfg, maxSeq);
+  }
+  auto vm = buildVulkanModel(cfg, *weights, static_cast<int>(maxSeq), err);
+  if (!vm) return nullptr;
+  return std::make_unique<VulkanEngine>(std::move(vm), cfg, maxSeq);
+}
+
+}  // namespace qorvix
