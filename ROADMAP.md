@@ -353,8 +353,13 @@ the CPU-only, CUDA, and Vulkan builds all compile and link.
   correctness-first (throughput pass — device-local buffers, command-buffer reuse, subgroups — is
   future work).
 - **Multi-GPU 🚧** — tensor-parallel sharding math verified without hardware (Phase 10a); NCCL to come.
-- **Not started** — `agents/`, `audio/`, `embeddings/`, `image/`, `rag/`, `vision/`, `ui/`,
-  `monitoring/`, `cli/` are placeholders for Phases 11–12 (see the status-annotated backlog above).
+- **Plugins ✅** — `IPlugin` + `PluginRegistry` (hot-load/unload), example plugin, `qorvix plugins`
+  (Phase 1, tested). `plugins/` is real, not a placeholder.
+- **Measurement ✅** — `qorvix bench` (backend-agnostic, median-of-runs, JSON), BENCHMARKS.md as the
+  single source of truth, and performance-regression tests in the suite.
+- **Not started (empty dirs, 0 files each)** — `vision/`, `image/`, `monitoring/`, `agents/`,
+  `audio/`, `embeddings/`, `rag/`, `ui/`, `cli/` — Phase 11–12 placeholders, scaffolded only when
+  their phase begins (see the status-annotated backlog above).
 
 ## Phase 8.5 — Cross-vendor Vulkan backend + unified engine ✅ (retrofit)
 
@@ -412,10 +417,29 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
   graceful OOM ⬜.
 - **Testing:** unit suite ✅ (128 cases) · cross-vendor bench ⬜🖥️ · perf regression ⬜🖥️ ·
   multi-GPU CI ⬜🖥️ · long-context validation ⬜.
-- **Dev-ex:** `backends`/self-tests ✅ · backend auto-select ✅ · benchmark tool ⬜ · profiler
-  integration 🟡 (`colab_ncu_profile.sh`) · runtime config ⬜ · docs 🟡.
+- **Dev-ex:** `backends`/self-tests ✅ · backend auto-select ✅ · benchmark tool ✅ (`qorvix bench`
+  + BENCHMARKS.md + regression tests) · profiler integration 🟡 (`colab_ncu_profile.sh`) · runtime
+  config ⬜ · docs 🟡.
+- **Extensibility:** plugin system ✅ (`plugins/` — `IPlugin`, `PluginRegistry`, hot-load/unload,
+  `qorvix plugins`, example plugin + test; Phase 1).
 - **Platform:** Linux ✅ · Windows/macOS/AMD/Intel GPU validation ⬜🖥️.
 - **Production:** model hot-swap/cache ⬜ · graceful OOM ⬜ · fault recovery ⬜ · telemetry ⬜.
+- **Empty module dirs (not started; scaffolded only when their phase begins, to keep the build free
+  of content-less libraries):** `vision/` ⬜ (Phase 11 — vision models/OCR) · `image/` ⬜ (Phase 11 —
+  image generation) · `monitoring/` ⬜ (Phase 12 — Prometheus/metrics exporter, port 2009) ·
+  `audio/` · `embeddings/` · `rag/` · `agents/` · `ui/` (Phase 12) · `cli/` — all 0 files today.
+
+### Current priorities (2026-07-29)
+
+Measurement before features — everything below is validated against `qorvix bench` / BENCHMARKS.md.
+
+1. **CUDA optimization** 🟡 — *highest priority.* Phase 8c: the L1TEX-bound Q4_K GEMV on the T4.
+2. **Vulkan optimization** 🟡 — after CUDA (device-local buffers, command-buffer reuse, subgroups).
+3. **Real-hardware benchmarks** ⬜🖥️ — run `scripts/colab_bench.sh` on T4 / RTX / AMD / Intel; fill
+   the BENCHMARKS.md baselines.
+4. **Documentation & release** ⬜ — publish results once numbers stabilize.
+5. **Native HIP / Metal** ⬜🖥️ — only after cross-vendor Vulkan performance stabilizes (Vulkan
+   already covers those vendors functionally).
 
 ### Former architectural gap (now resolved by Phase 8.5)
 
