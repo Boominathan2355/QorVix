@@ -1335,6 +1335,108 @@ SelfTestResult forwardSelfTest() {
               std::to_string(maxErr) + ") on " + dp.deviceName};
 }
 
+SelfTestResult multiSessionSelfTest() {
+  // Tiny synthetic F32 model built through the real createVulkanModel path with 2 KV sessions.
+  VulkanModelConfig cfg;
+  cfg.nLayers = 2;
+  cfg.dModel = 32;
+  cfg.nHeads = 4;
+  cfg.headDim = 8;
+  cfg.nKv = 2;
+  cfg.ffn = 64;
+  cfg.vocab = 16;
+  cfg.maxSeq = 8;
+  cfg.normEps = 1e-5f;
+  cfg.ropeFreqBase = 10000.0f;
+  const int d = cfg.dModel, kvDim = cfg.nKv * cfg.headDim, ffn = cfg.ffn, vocab = cfg.vocab,
+            qDim = cfg.nHeads * cfg.headDim;
+  auto gen = [](int seed, int i) { return 0.01f * (((i * 7 + seed * 13) % 17) - 8); };
+
+  std::vector<float> tokEmbd(static_cast<std::size_t>(vocab) * d), outNorm(d, 1.0f),
+      outputW(static_cast<std::size_t>(vocab) * d);
+  for (int i = 0; i < vocab * d; ++i) {
+    tokEmbd[i] = gen(1, i);
+    outputW[i] = gen(2, i);
+  }
+  for (int i = 0; i < d; ++i) outNorm[i] = 1.0f + 0.01f * i;
+  struct LW {
+    std::vector<float> attnNorm, ffnNorm, wq, wk, wv, wo, gate, up, down;
+  };
+  std::vector<LW> lw(cfg.nLayers);
+  for (int l = 0; l < cfg.nLayers; ++l) {
+    LW& w = lw[l];
+    w.attnNorm.assign(d, 0.0f);
+    w.ffnNorm.assign(d, 0.0f);
+    for (int i = 0; i < d; ++i) {
+      w.attnNorm[i] = 1.0f + 0.01f * ((i + l) % 5);
+      w.ffnNorm[i] = 1.0f + 0.01f * ((i + l) % 3);
+    }
+    w.wq.resize(static_cast<std::size_t>(qDim) * d);
+    w.wo.resize(static_cast<std::size_t>(d) * qDim);
+    w.wk.resize(static_cast<std::size_t>(kvDim) * d);
+    w.wv.resize(static_cast<std::size_t>(kvDim) * d);
+    w.gate.resize(static_cast<std::size_t>(ffn) * d);
+    w.up.resize(static_cast<std::size_t>(ffn) * d);
+    w.down.resize(static_cast<std::size_t>(d) * ffn);
+    for (std::size_t i = 0; i < w.wq.size(); ++i) w.wq[i] = gen(10 + l, static_cast<int>(i));
+    for (std::size_t i = 0; i < w.wo.size(); ++i) w.wo[i] = gen(20 + l, static_cast<int>(i));
+    for (std::size_t i = 0; i < w.wk.size(); ++i) w.wk[i] = gen(30 + l, static_cast<int>(i));
+    for (std::size_t i = 0; i < w.wv.size(); ++i) w.wv[i] = gen(40 + l, static_cast<int>(i));
+    for (std::size_t i = 0; i < w.gate.size(); ++i) w.gate[i] = gen(50 + l, static_cast<int>(i));
+    for (std::size_t i = 0; i < w.up.size(); ++i) w.up[i] = gen(60 + l, static_cast<int>(i));
+    for (std::size_t i = 0; i < w.down.size(); ++i) w.down[i] = gen(70 + l, static_cast<int>(i));
+  }
+  auto f32 = [](const std::vector<float>& v, int rows, int cols) {
+    return VulkanWeight{v.data(), 0u, rows, cols};
+  };
+  std::vector<VulkanLayer> layers(cfg.nLayers);
+  for (int l = 0; l < cfg.nLayers; ++l)
+    layers[l] = {lw[l].attnNorm.data(), lw[l].ffnNorm.data(), f32(lw[l].wq, qDim, d),
+                 f32(lw[l].wk, kvDim, d), f32(lw[l].wv, kvDim, d), f32(lw[l].wo, d, qDim),
+                 f32(lw[l].gate, ffn, d), f32(lw[l].up, ffn, d), f32(lw[l].down, d, ffn)};
+
+  std::string err;
+  auto model = createVulkanModel(cfg, tokEmbd.data(), outNorm.data(), f32(outputW, vocab, d), layers,
+                                 err, /*maxSessions=*/2);
+  if (!model) return {true, false, "multi-session: createVulkanModel failed: " + err};
+
+  const int A[3] = {1, 5, 9}, B[3] = {2, 6, 10};
+  auto runAlone = [&](const int* seq) {
+    const int s = model->openSession();
+    std::vector<float> out;
+    for (int p = 0; p < 3; ++p) out = model->forward(s, seq[p], p);  // auto-copies (returns by ref)
+    model->closeSession(s);
+    return out;
+  };
+  const std::vector<float> refA = runAlone(A), refB = runAlone(B);
+
+  const int s0 = model->openSession(), s1 = model->openSession();
+  if (s0 == kNoVkSession || s1 == kNoVkSession || s0 == s1)
+    return {true, false, "multi-session: openSession did not yield two distinct slots"};
+  std::vector<float> gotA, gotB;
+  for (int p = 0; p < 3; ++p) {
+    const std::vector<float> la = model->forward(s0, A[p], p);
+    if (p == 2) gotA = la;
+    const std::vector<float> lb = model->forward(s1, B[p], p);
+    if (p == 2) gotB = lb;
+  }
+  model->closeSession(s0);
+  model->closeSession(s1);
+
+  float e = 0.0f;
+  for (int i = 0; i < vocab; ++i) {
+    e = std::max(e, std::fabs(gotA[i] - refA[i]));
+    e = std::max(e, std::fabs(gotB[i] - refB[i]));
+  }
+  if (e > 1e-3f)
+    return {true, false,
+            "multi-session isolation FAILED (interleaved != sequential, max err " +
+                std::to_string(e) + ")"};
+  return {true, true,
+          "2 sessions isolated: interleaved output matches sequential (max err " +
+              std::to_string(e) + ")"};
+}
+
 // ---- GPU-resident model runner (Milestone 4b) ----------------------------------------------
 namespace {
 
@@ -1359,7 +1461,8 @@ struct DevW {
 
 class VulkanModelImpl final : public VulkanModel {
  public:
-  explicit VulkanModelImpl(Context&& c, const VulkanModelConfig& cfg) : c_(std::move(c)), cfg_(cfg) {}
+  VulkanModelImpl(Context&& c, const VulkanModelConfig& cfg, int maxSessions)
+      : c_(std::move(c)), cfg_(cfg), maxSessions_(maxSessions < 1 ? 1 : maxSessions) {}
 
   ~VulkanModelImpl() override {
     if (descPool_) vkDestroyDescriptorPool(c_.device, descPool_, nullptr);
@@ -1369,8 +1472,8 @@ class VulkanModelImpl final : public VulkanModel {
                     &pSwiglu_, &pAdd_})
       destroyPipe(c_, *p);
     for (auto& b : owned_) b.destroy();
-    kc_.destroy();
-    vc_.destroy();
+    for (auto& b : kc_) b.destroy();
+    for (auto& b : vc_) b.destroy();
   }
 
   bool init(const float* tokEmbdF32, const float* outputNorm, const VulkanWeight& output,
@@ -1440,14 +1543,21 @@ class VulkanModelImpl final : public VulkanModel {
     bu_ = mkBytes(ffn * sizeof(float), nullptr, 0);
     bact_ = mkBytes(ffn * sizeof(float), nullptr, 0);
     blogits_ = mkBytes(vocab * sizeof(float), nullptr, 0);
-    // KV cache (its own Buffers so reset() can zero them)
+    // Per-session KV cache: each session owns an independent K and V buffer (isolation without any
+    // shader change — the kv_store/attention indexing stays (layer*maxSeq + pos)*kvDim within the
+    // session's own buffer). reset/openSession zero a single session's pair.
     const VkDeviceSize kvBytes =
         static_cast<VkDeviceSize>(L) * cfg_.maxSeq * kvDim * sizeof(float);
-    if (!makeBuffer(c_, kvBytes, kc_) || !makeBuffer(c_, kvBytes, vc_)) ok = false;
-    if (ok) {
-      kc_.zero();
-      vc_.zero();
-    }
+    kc_.resize(maxSessions_);
+    vc_.resize(maxSessions_);
+    sessionUsed_.assign(maxSessions_, 0);
+    for (int s = 0; s < maxSessions_ && ok; ++s)
+      if (!makeBuffer(c_, kvBytes, kc_[s]) || !makeBuffer(c_, kvBytes, vc_[s])) ok = false;
+    if (ok)
+      for (int s = 0; s < maxSessions_; ++s) {
+        kc_[s].zero();
+        vc_[s].zero();
+      }
     if (!ok) {
       err = "failed to allocate device buffers";
       return false;
@@ -1478,8 +1588,31 @@ class VulkanModelImpl final : public VulkanModel {
     return true;
   }
 
-  const std::vector<float>& forward(int token, int pos) override {
-    if (!ready_) return logits_;
+  int openSession() override {
+    for (int s = 0; s < maxSessions_; ++s)
+      if (!sessionUsed_[s]) {
+        sessionUsed_[s] = 1;
+        kc_[s].zero();
+        vc_[s].zero();
+        return s;
+      }
+    return kNoVkSession;
+  }
+  void closeSession(int session) override {
+    if (session >= 0 && session < maxSessions_) sessionUsed_[session] = 0;
+  }
+  void resetSession(int session) override {
+    if (session >= 0 && session < maxSessions_) {
+      kc_[session].zero();
+      vc_[session].zero();
+    }
+  }
+  const std::vector<float>& forward(int token, int pos) override { return forward(0, token, pos); }
+  void reset() override { resetSession(0); }
+
+  const std::vector<float>& forward(int session, int token, int pos) override {
+    if (!ready_ || session < 0 || session >= maxSessions_) return logits_;
+    VkBuffer kcBuf = kc_[session].buf, vcBuf = vc_[session].buf;
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn, vocab = cfg_.vocab,
               L = cfg_.nLayers, nHeads = cfg_.nHeads, headDim = cfg_.headDim, nKv = cfg_.nKv,
               maxSeq = cfg_.maxSeq;
@@ -1537,15 +1670,15 @@ class VulkanModelImpl final : public VulkanModel {
         std::uint32_t layer, pos, maxSeq, kvDim;
       } kv{static_cast<std::uint32_t>(l), static_cast<std::uint32_t>(pos),
            static_cast<std::uint32_t>(maxSeq), static_cast<std::uint32_t>(kvDim)};
-      rec.op(pKv_, {kc_.buf, bk_}, &kv, g256(kvDim));
-      rec.op(pKv_, {vc_.buf, bv_}, &kv, g256(kvDim));
+      rec.op(pKv_, {kcBuf, bk_}, &kv, g256(kvDim));
+      rec.op(pKv_, {vcBuf, bv_}, &kv, g256(kvDim));
       struct AttnPC {
         std::uint32_t nHeads, nKv, headDim, seqLen, kvDim, layer, maxSeq;
       } ap{static_cast<std::uint32_t>(nHeads), static_cast<std::uint32_t>(nKv),
            static_cast<std::uint32_t>(headDim), static_cast<std::uint32_t>(pos + 1),
            static_cast<std::uint32_t>(kvDim), static_cast<std::uint32_t>(l),
            static_cast<std::uint32_t>(maxSeq)};
-      rec.op(pAttn_, {battn_, bq_, kc_.buf, vc_.buf}, &ap, static_cast<std::uint32_t>(nHeads));
+      rec.op(pAttn_, {battn_, bq_, kcBuf, vcBuf}, &ap, static_cast<std::uint32_t>(nHeads));
       matmul(btmp_, lw.wo, battn_);
       struct NPC {
         std::uint32_t n;
@@ -1583,17 +1716,14 @@ class VulkanModelImpl final : public VulkanModel {
     return logits_;
   }
 
-  void reset() override {
-    kc_.zero();
-    vc_.zero();
-  }
-
  private:
   Context c_;
   VulkanModelConfig cfg_;
+  int maxSessions_ = 1;
   Pipe pEmbed_, pMatmulF32_, pQ8_, pQ4_, pQ6_, pRms_, pRope_, pKv_, pAttn_, pSwiglu_, pAdd_;
   std::vector<Buffer> owned_;
-  Buffer kc_{}, vc_{};
+  std::vector<Buffer> kc_, vc_;      // one K/V buffer per session
+  std::vector<char> sessionUsed_;    // slot occupancy (char, not vector<bool>)
   VkBuffer bTok_ = VK_NULL_HANDLE, bOutNorm_ = VK_NULL_HANDLE, bx_ = VK_NULL_HANDLE,
            bxn_ = VK_NULL_HANDLE, bq_ = VK_NULL_HANDLE, bk_ = VK_NULL_HANDLE, bv_ = VK_NULL_HANDLE,
            battn_ = VK_NULL_HANDLE, btmp_ = VK_NULL_HANDLE, bg_ = VK_NULL_HANDLE,
@@ -1616,13 +1746,13 @@ class VulkanModelImpl final : public VulkanModel {
 std::unique_ptr<VulkanModel> createVulkanModel(const VulkanModelConfig& cfg, const float* tokenEmbdF32,
                                                const float* outputNorm, const VulkanWeight& output,
                                                const std::vector<VulkanLayer>& layers,
-                                               std::string& error) {
+                                               std::string& error, int maxSessions) {
   Context c = makeContext();
   if (!c.ok) {
     error = "no Vulkan device present";
     return nullptr;
   }
-  auto m = std::make_unique<VulkanModelImpl>(std::move(c), cfg);
+  auto m = std::make_unique<VulkanModelImpl>(std::move(c), cfg, maxSessions);
   if (!m->init(tokenEmbdF32, outputNorm, output, layers, error)) return nullptr;
   return m;
 }

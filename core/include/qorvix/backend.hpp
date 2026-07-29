@@ -121,7 +121,7 @@ inline std::unique_ptr<cuda::GpuModel> buildGpuModel(const runtime::ModelConfig&
 // The Vulkan twin of buildGpuModel — same bridge, cross-vendor backend.
 inline std::unique_ptr<vulkan::VulkanModel> buildVulkanModel(const runtime::ModelConfig& cfg,
                                                              const runtime::Weights& w, int maxSeq,
-                                                             std::string& err) {
+                                                             std::string& err, int maxSessions = 1) {
   namespace rt = qorvix::runtime;
   const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
   std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
@@ -143,7 +143,8 @@ inline std::unique_ptr<vulkan::VulkanModel> buildVulkanModel(const runtime::Mode
              detail::toVkWeight(L.ffnGate), detail::toVkWeight(L.ffnUp),
              detail::toVkWeight(L.ffnDown)};
   }
-  return vulkan::createVulkanModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err);
+  return vulkan::createVulkanModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err,
+                                   maxSessions);
 }
 
 // THE unified construction point: builds an IInferenceEngine for `backend` from an opened GGUF file
@@ -181,7 +182,8 @@ inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, 
     if (!gm) return nullptr;
     return std::make_unique<GpuEngine>(std::move(gm), cfg, maxSeq);
   }
-  auto vm = buildVulkanModel(cfg, *weights, static_cast<int>(maxSeq), err);
+  auto vm = buildVulkanModel(cfg, *weights, static_cast<int>(maxSeq), err,
+                             static_cast<int>(maxSessions));
   if (!vm) return nullptr;
   return std::make_unique<VulkanEngine>(std::move(vm), cfg, maxSeq);
 }

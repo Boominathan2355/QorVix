@@ -12,12 +12,8 @@
 
 // Adapts a vulkan::VulkanModel to runtime::IInferenceEngine so the scheduler — and therefore the
 // unified createEngine() factory, `generate`, and `serve` — drive the cross-vendor Vulkan path
-// through the exact same seam as CPU and CUDA. The Vulkan twin of GpuEngine.
-//
-// VulkanModel is currently single-sequence (one KV cache), so this engine exposes a single session
-// slot: the first openSession() succeeds, further ones report "at capacity" (kInvalidSession) until
-// it is closed. That is enough for `generate` and single-stream `serve`; a multi-session VulkanModel
-// (per-session KV slices, like GpuModel) is the next step to raise --max-concurrent above 1.
+// through the exact same seam as CPU and CUDA. The Vulkan twin of GpuEngine, multi-session: each
+// session owns an independent KV slice, so `serve --vulkan --max-concurrent N` works like CUDA.
 namespace qorvix {
 
 class VulkanEngine final : public runtime::IInferenceEngine {
@@ -26,21 +22,22 @@ class VulkanEngine final : public runtime::IInferenceEngine {
                std::uint32_t maxSeq)
       : model_(std::move(model)), cfg_(std::move(cfg)), maxSeq_(maxSeq) {}
 
+  // SessionId 0 is memory::kInvalidSession (the "no session" sentinel), but Vulkan session 0 is a
+  // valid slot — so the two spaces are offset by one (identical to GpuEngine).
   memory::SessionId openSession() override {
-    if (inUse_) return memory::kInvalidSession;  // single slot
-    inUse_ = true;
-    model_->reset();
-    return kSlot;
+    const int s = model_->openSession();
+    if (s == vulkan::kNoVkSession) return memory::kInvalidSession;
+    return static_cast<memory::SessionId>(s + 1);
   }
   void closeSession(memory::SessionId s) override {
-    if (s == kSlot) inUse_ = false;
+    if (s != memory::kInvalidSession) model_->closeSession(toVk(s));
   }
   void resetSession(memory::SessionId s) override {
-    if (s == kSlot) model_->reset();
+    if (s != memory::kInvalidSession) model_->resetSession(toVk(s));
   }
 
-  const std::vector<float>& forward(memory::SessionId, int token, int pos) override {
-    return model_->forward(token, pos);
+  const std::vector<float>& forward(memory::SessionId session, int token, int pos) override {
+    return model_->forward(toVk(session), token, pos);
   }
 
   std::uint32_t maxSeqLen() const override { return maxSeq_; }
@@ -48,12 +45,11 @@ class VulkanEngine final : public runtime::IInferenceEngine {
   std::string backendName() const override { return "vulkan"; }
 
  private:
-  static constexpr memory::SessionId kSlot = 1;  // any non-kInvalidSession id
+  static int toVk(memory::SessionId s) { return static_cast<int>(s) - 1; }
 
   std::unique_ptr<vulkan::VulkanModel> model_;
   runtime::ModelConfig cfg_;
   std::uint32_t maxSeq_ = 0;
-  bool inUse_ = false;
 };
 
 }  // namespace qorvix

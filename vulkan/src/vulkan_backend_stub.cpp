@@ -28,9 +28,11 @@ SelfTestResult attentionSelfTest() { return {false, false, "Vulkan support not c
 
 SelfTestResult forwardSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
 
+SelfTestResult multiSessionSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
+
 std::unique_ptr<VulkanModel> createVulkanModel(const VulkanModelConfig&, const float*, const float*,
                                                const VulkanWeight&, const std::vector<VulkanLayer>&,
-                                               std::string& error) {
+                                               std::string& error, int) {
   error = "Vulkan support not compiled in";
   return nullptr;
 }

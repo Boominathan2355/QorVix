@@ -77,4 +77,9 @@ SelfTestResult attentionSelfTest();
 // assembled Vulkan forward pass is correct. The analogue of qorvix::cuda::gpuForwardSelfTest().
 SelfTestResult forwardSelfTest();
 
+// Multi-session isolation: builds a 2-session model and interleaves two independent sequences,
+// checking each session's output equals its stand-alone run. Proves per-session KV slices don't
+// cross-contaminate — i.e. `serve --vulkan --max-concurrent N` is safe.
+SelfTestResult multiSessionSelfTest();
+
 }  // namespace qorvix::vulkan
