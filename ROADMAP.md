@@ -392,9 +392,10 @@ above the seam, and `serve` now reaches Vulkan too. New `qorvix backends` comman
 namespace), and every backend is reachable over HTTP.
 
 **Still open from the old gap:** the GPU/Vulkan paths use flat device-resident KV, not the
-vLLM-style paged `GlobalKvCache` (that remains CPU-only); the Vulkan engine is single-session until
-`VulkanModel` gains per-session KV slices like `GpuModel`; and real batching across requests
-(`forwardBatch`) is still sequential.
+vLLM-style paged `GlobalKvCache` (that remains CPU-only); and real batching across requests
+(`forwardBatch`) is still sequential. *(The Vulkan engine is now multi-session — per-session KV
+slices like `GpuModel`, verified by `multiSessionSelfTest` — so `serve --vulkan --max-concurrent N`
+works.)*
 
 ### Cross-cutting backlog (status-annotated)
 

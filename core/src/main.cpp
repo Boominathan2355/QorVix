@@ -414,7 +414,7 @@ int cmdServe(const std::vector<std::string_view>& args) {
     // instruction-tuned models were not trained on — the biggest cause of poor chat output.
     chatTemplate = file.getString("tokenizer.chat_template").value_or("");
     // One KV slot per concurrent request (device engines size their cache to maxConcurrent). For
-    // CPU/CUDA maxConcurrent applies; the single-session Vulkan engine admits one at a time.
+    // maxConcurrent applies to every backend now (CPU, CUDA, and multi-session Vulkan).
     engine = qorvix::createEngine(backend, std::move(file), static_cast<std::uint32_t>(ctx),
                                   static_cast<std::uint32_t>(maxConcurrent), err);
     if (!engine) {
