@@ -22,6 +22,7 @@
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
 #include "qorvix/ports.hpp"
+#include "qorvix/runtime/benchmark.hpp"
 #include "qorvix/runtime/dequant.hpp"
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
@@ -845,6 +846,81 @@ int cmdBackends() {
   return 0;
 }
 
+// Reproducible throughput benchmark over the unified engine seam — the single source of truth for
+// every perf claim. Warmup + timed runs -> median, on whichever backend createEngine() picks.
+int cmdBench(const std::vector<std::string_view>& args) {
+  namespace rt = qorvix::runtime;
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (path.empty()) {
+    std::cerr << "usage: qorvix bench <file.gguf> [--gpu|--vulkan|--auto] [--prompt N] [--gen N] "
+                 "[--warmup N] [--runs N] [--json]\n";
+    return 1;
+  }
+  const qorvix::Backend backend = backendFromArgs(args);
+  const bool json = hasFlag(args, "--json");
+  rt::BenchConfig bc;
+  if (auto v = flagValue(args, "--prompt"); !v.empty()) bc.promptTokens = std::stoi(v);
+  if (auto v = flagValue(args, "--gen"); !v.empty()) bc.genTokens = std::stoi(v);
+  if (auto v = flagValue(args, "--warmup"); !v.empty()) bc.warmupRuns = std::stoi(v);
+  if (auto v = flagValue(args, "--runs"); !v.empty()) bc.timedRuns = std::stoi(v);
+
+  if (!qorvix::backendAvailable(backend)) {
+    std::cerr << "error: " << qorvix::backendName(backend)
+              << " backend requested but unavailable (not built in, or no device)\n";
+    return 1;
+  }
+
+  try {
+    using clock = std::chrono::steady_clock;
+    const auto tLoad0 = clock::now();
+    auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    const std::uint32_t maxSeq = static_cast<std::uint32_t>(bc.promptTokens + bc.genTokens + 4);
+    auto engine = qorvix::createEngine(backend, std::move(file), maxSeq, 1, err);
+    if (!engine) {
+      std::cerr << "error: " << qorvix::backendName(backend) << " engine: " << err << "\n";
+      return 1;
+    }
+    const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+    if (!json)
+      std::cerr << "benchmarking " << qorvix::backendName(backend) << " | prompt " << bc.promptTokens
+                << " gen " << bc.genTokens << " | warmup " << bc.warmupRuns << " runs " << bc.timedRuns
+                << " ...\n";
+    auto r = rt::runBenchmark(*engine, bc);
+    r.loadSec = loadSec;
+    if (!r.ran) {
+      std::cerr << "error: benchmark did not run (engine capacity or empty config)\n";
+      return 1;
+    }
+
+    if (json) {
+      std::cout << "{\"backend\":\"" << r.backend << "\",\"prompt_tokens\":" << r.promptTokens
+                << ",\"gen_tokens\":" << r.genTokens << ",\"timed_runs\":" << r.timedRuns
+                << ",\"load_sec\":" << r.loadSec << ",\"prefill_tok_per_sec\":" << r.prefillTokPerSec
+                << ",\"decode_tok_per_sec\":" << r.decodeTokPerSec
+                << ",\"decode_ms_per_tok_median\":" << r.decodeMsPerTokMedian
+                << ",\"decode_ms_per_tok_min\":" << r.decodeMsPerTokMin
+                << ",\"decode_ms_per_tok_max\":" << r.decodeMsPerTokMax << "}\n";
+    } else {
+      std::cout << std::fixed;
+      std::cout << "\n==== qorvix bench: " << r.backend << " ====\n"
+                << "  model          : " << path << "\n"
+                << "  load           : " << std::setprecision(2) << r.loadSec << " s\n"
+                << "  prompt / gen   : " << r.promptTokens << " / " << r.genTokens << " tokens\n"
+                << "  prefill        : " << std::setprecision(1) << r.prefillTokPerSec << " tok/s\n"
+                << "  decode         : " << std::setprecision(1) << r.decodeTokPerSec << " tok/s ("
+                << std::setprecision(2) << r.decodeMsPerTokMedian << " ms/tok, min "
+                << r.decodeMsPerTokMin << " max " << r.decodeMsPerTokMax << ")\n"
+                << "  timed runs     : " << r.timedRuns << " (median reported)\n";
+    }
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int printUsage() {
   std::cout << qorvix::startupBanner() << "\n\n"
             << "Usage: qorvix <command> [args]\n\n"
@@ -859,6 +935,7 @@ int printUsage() {
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
             << qorvix::ports::kRangeLast << ")\n"
             << "  backends            List compute backends (cpu/cuda/vulkan) and the auto default\n"
+            << "  bench <file> [--gpu|--vulkan|--auto] [--json]   Benchmark decode throughput\n"
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  vulkan              Show Vulkan devices and run compute-backend self-tests\n"
             << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
@@ -892,6 +969,7 @@ int main(int argc, char** argv) {
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();
   if (command == "backends") return cmdBackends();
+  if (command == "bench") return cmdBench(args);
   if (command == "gpu-check") return cmdGpuCheck(arg1);
   if (command == "vulkan-check") return cmdVulkanCheck(arg1);
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
