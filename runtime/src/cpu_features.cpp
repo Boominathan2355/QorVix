@@ -57,6 +57,18 @@ __attribute__((target("avx2,fma"))) float dot_avx2(const float* a, const float* 
   for (; i < n; ++i) r += a[i] * b[i];
   return r;
 }
+
+// 512-bit variant for CPUs with AVX-512F. Compiled here but can only ACTIVATE (and thus be
+// verified) on AVX-512 hardware; the x86 reference environment is AVX2-only, so this stays
+// code-complete but hardware-unverified.
+__attribute__((target("avx512f"))) float dot_avx512(const float* a, const float* b, int n) {
+  __m512 s = _mm512_setzero_ps();
+  int i = 0;
+  for (; i + 15 < n; i += 16) s = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), s);
+  float r = _mm512_reduce_add_ps(s);
+  for (; i < n; ++i) r += a[i] * b[i];
+  return r;
+}
 #endif
 
 #if defined(QORVIX_ARCH_ARM64)
@@ -117,6 +129,7 @@ using DotFn = float (*)(const float*, const float*, int);
 DotFn pickDot() {
   const Features& f = features();
 #if defined(QORVIX_X86_SIMD)
+  if (f.avx512f) return &dot_avx512;
   if (f.avx2 && f.fma) return &dot_avx2;
 #endif
 #if defined(QORVIX_ARCH_ARM64)
@@ -139,6 +152,7 @@ float dotProductF32(const float* a, const float* b, int n) { return g_dot(a, b, 
 
 const char* activeDotKernel() {
 #if defined(QORVIX_X86_SIMD)
+  if (g_dot == &dot_avx512) return "avx512";
   if (g_dot == &dot_avx2) return "avx2";
 #endif
 #if defined(QORVIX_ARCH_ARM64)
