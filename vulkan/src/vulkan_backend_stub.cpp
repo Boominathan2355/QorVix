@@ -2,6 +2,7 @@
 // headers were not found. Every facade entry point stays callable and simply reports "no Vulkan",
 // so callers (CLI, tests) need no #ifdefs. Mirrors cuda/src/cuda_backend_stub.cpp.
 #include "qorvix/vulkan/backend.hpp"
+#include "qorvix/vulkan/vulkan_model.hpp"
 
 namespace qorvix::vulkan {
 
@@ -26,5 +27,12 @@ SelfTestResult opsSelfTest() { return {false, false, "Vulkan support not compile
 SelfTestResult attentionSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
 
 SelfTestResult forwardSelfTest() { return {false, false, "Vulkan support not compiled in"}; }
+
+std::unique_ptr<VulkanModel> createVulkanModel(const VulkanModelConfig&, const float*, const float*,
+                                               const VulkanWeight&, const std::vector<VulkanLayer>&,
+                                               std::string& error) {
+  error = "Vulkan support not compiled in";
+  return nullptr;
+}
 
 }  // namespace qorvix::vulkan

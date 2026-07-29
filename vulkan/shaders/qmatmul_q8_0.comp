@@ -4,15 +4,15 @@
 //
 // Q8_0 packs 32 int8 weights per block behind one fp16 scale d, block = 34 bytes:
 //   [ d.lo, d.hi, q0, q1, ..., q31 ].
-// The weight buffer is bound as a uint[] (32-bit) SSBO — Vulkan storage buffers are typed and
-// 8-bit storage is an optional feature, so bytes are extracted from the uint words by shifting.
-// This mirrors the CPU/CUDA reference (dequantize in registers, never materialize F32 weights).
+// The weight buffer is bound as a uint[] (32-bit) SSBO — 8-bit storage is an optional Vulkan
+// feature, so bytes are extracted by shifting. Dequant matches the CPU/CUDA reference.
 //
-// Correctness-first: one invocation computes one full output row (no cross-thread reduction). This
-// is the shape the argmax-parity gate is proven against; throughput tuning (cooperative loads,
-// subgroup reductions) comes in later milestones without changing the math.
+// One WORKGROUP computes one output row; the 256 lanes split the row's elements and tree-reduce the
+// partial sums in shared memory. The tree reduction (vs a single-thread sequential sum over ~2048
+// terms) keeps fp32 accumulation error low enough that the logits match the CPU runtime, not just
+// the argmax.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer WBuf { uint W[]; };
 layout(std430, binding = 1) readonly buffer XBuf { float X[]; };
@@ -23,29 +23,33 @@ layout(push_constant) uniform PC {
   uint cols;
 } pc;
 
-// Byte at absolute address `a` in the weight buffer (little-endian word packing).
-uint getByte(uint a) {
-  return (W[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu;
-}
+uint getByte(uint a) { return (W[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu; }
+
+shared float red[256];
 
 void main() {
-  uint row = gl_GlobalInvocationID.x;
+  uint row = gl_WorkGroupID.x;
   if (row >= pc.rows) return;
+  uint tid = gl_LocalInvocationID.x;
 
   uint nBlocks = pc.cols / 32u;
   uint rowBytes = nBlocks * 34u;
   uint base = row * rowBytes;
 
   float sum = 0.0;
-  for (uint b = 0u; b < nBlocks; ++b) {
+  for (uint e = tid; e < pc.cols; e += 256u) {
+    uint b = e / 32u, i = e % 32u;
     uint blk = base + b * 34u;
-    // fp16 scale sits in the low 16 bits; unpackHalf2x16 decodes it exactly like __half2float.
     float d = unpackHalf2x16(getByte(blk) | (getByte(blk + 1u) << 8u)).x;
-    for (uint i = 0u; i < 32u; ++i) {
-      int q = int(getByte(blk + 2u + i));
-      if (q > 127) q -= 256;  // sign-extend the int8
-      sum += d * float(q) * X[b * 32u + i];
-    }
+    int q = int(getByte(blk + 2u + i));
+    if (q > 127) q -= 256;  // sign-extend the int8
+    sum += d * float(q) * X[e];
   }
-  O[row] = sum;
+  red[tid] = sum;
+  barrier();
+  for (uint s = 128u; s > 0u; s >>= 1u) {
+    if (tid < s) red[tid] += red[tid + s];
+    barrier();
+  }
+  if (tid == 0u) O[row] = red[0];
 }

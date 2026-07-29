@@ -8,6 +8,7 @@
 // — and on real NVIDIA/AMD/Apple/Intel hardware (device-local + staging is a later throughput
 // milestone, not a correctness one). The compute shaders are SPIR-V embedded at build time.
 #include "qorvix/vulkan/backend.hpp"
+#include "qorvix/vulkan/vulkan_model.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -99,6 +100,27 @@ struct Context {
   VkCommandPool pool = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memProps{};
   bool ok = false;
+
+  Context() = default;
+  Context(const Context&) = delete;
+  Context& operator=(const Context&) = delete;
+  // Move by swap: the moved-from object is left holding our (null) handles, so its destructor frees
+  // nothing. Lets a VulkanModel own its Context by value.
+  Context(Context&& o) noexcept { swap(o); }
+  Context& operator=(Context&& o) noexcept {
+    if (this != &o) swap(o);
+    return *this;
+  }
+  void swap(Context& o) noexcept {
+    std::swap(instance, o.instance);
+    std::swap(phys, o.phys);
+    std::swap(device, o.device);
+    std::swap(queue, o.queue);
+    std::swap(queueFamily, o.queueFamily);
+    std::swap(pool, o.pool);
+    std::swap(memProps, o.memProps);
+    std::swap(ok, o.ok);
+  }
 
   ~Context() {
     if (device) {
@@ -212,6 +234,14 @@ struct Buffer {
     if (mem) vkFreeMemory(device, mem, nullptr);
     buf = VK_NULL_HANDLE;
     mem = VK_NULL_HANDLE;
+  }
+
+  void zero() {
+    void* p = nullptr;
+    if (vkMapMemory(device, mem, 0, size, 0, &p) == VK_SUCCESS) {
+      std::memset(p, 0, size);
+      vkUnmapMemory(device, mem);
+    }
   }
 };
 
@@ -585,7 +615,7 @@ SelfTestResult selfTest() {
   struct {
     std::uint32_t rows, cols;
   } pc{static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(cols)};
-  const std::uint32_t groups = (rows + 63) / 64;
+  const std::uint32_t groups = static_cast<std::uint32_t>(rows);  // one workgroup per output row
   const bool ran = dispatch(c, qmatmul_q8_0_spv, sizeof(qmatmul_q8_0_spv), {bw.buf, bx.buf, bo.buf},
                             &pc, sizeof(pc), groups);
   std::vector<float> got(rows, 0.0f);
@@ -646,7 +676,7 @@ SelfTestResult qmatmulQ8_0SelfTest() {
     std::uint32_t rows, cols;
   } pc{static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(cols)};
   const bool ran = dispatch(c, qmatmul_q8_0_spv, sizeof(qmatmul_q8_0_spv), {bw.buf, bx.buf, bo.buf},
-                            &pc, sizeof(pc), (rows + 63) / 64);
+                            &pc, sizeof(pc), static_cast<std::uint32_t>(rows));
   if (ran) download(bo, got.data(), rows * sizeof(float));
   bw.destroy();
   bx.destroy();
@@ -706,7 +736,7 @@ SelfTestResult kQuantSelfTest(const char* label, const std::uint32_t* spirv, std
     std::uint32_t rows, cols;
   } pc{static_cast<std::uint32_t>(rows), static_cast<std::uint32_t>(cols)};
   const bool ran =
-      dispatch(c, spirv, spirvBytes, {bw.buf, bx.buf, bo.buf}, &pc, sizeof(pc), (rows + 63) / 64);
+      dispatch(c, spirv, spirvBytes, {bw.buf, bx.buf, bo.buf}, &pc, sizeof(pc), static_cast<std::uint32_t>(rows));
   if (ran) download(bo, got.data(), rows * sizeof(float));
   bw.destroy();
   bx.destroy();
@@ -1238,8 +1268,8 @@ SelfTestResult forwardSelfTest() {
       rec.op(pMatmul, {bv, bWv[l], bxn}, &mkv, (std::uint32_t)kvDim);
       RopePC rq{(std::uint32_t)nHeads, (std::uint32_t)headDim, pos, freqBase},
           rk{(std::uint32_t)nKv, (std::uint32_t)headDim, pos, freqBase};
-      rec.op(pRope, {bq}, &rq, g256(nHeads * headDim / 2));
-      rec.op(pRope, {bk}, &rk, g256(nKv * headDim / 2));
+      rec.op(pRope, {bq}, &rq, static_cast<std::uint32_t>((nHeads * headDim / 2 + 63) / 64));
+      rec.op(pRope, {bk}, &rk, static_cast<std::uint32_t>((nKv * headDim / 2 + 63) / 64));
       KvPC kv{(std::uint32_t)l, (std::uint32_t)pos, (std::uint32_t)maxSeq, (std::uint32_t)kvDim};
       rec.op(pKv, {bKc, bk}, &kv, g256(kvDim));
       rec.op(pKv, {bVc, bv}, &kv, g256(kvDim));
@@ -1303,6 +1333,298 @@ SelfTestResult forwardSelfTest() {
           (ok ? "Vulkan forward pass (2-layer, 3 positions) matches CPU reference (max err "
               : "Vulkan forward disagrees with CPU (max err ") +
               std::to_string(maxErr) + ") on " + dp.deviceName};
+}
+
+// ---- GPU-resident model runner (Milestone 4b) ----------------------------------------------
+namespace {
+
+// Byte size of a [rows,cols] weight in its GGUF quant type (F32=0, Q8_0=8, Q4_K=12, Q6_K=14).
+VkDeviceSize weightBytes(std::uint32_t type, int rows, int cols) {
+  const std::size_t n = static_cast<std::size_t>(rows) * cols;
+  switch (type) {
+    case 0: return n * sizeof(float);       // F32
+    case 8: return n / 32 * 34;             // Q8_0
+    case 12: return n / 256 * 144;          // Q4_K
+    case 14: return n / 256 * 210;          // Q6_K
+    default: return 0;
+  }
+}
+
+struct DevW {
+  VkBuffer buf = VK_NULL_HANDLE;
+  std::uint32_t type = 0;
+  int rows = 0;
+  int cols = 0;
+};
+
+class VulkanModelImpl final : public VulkanModel {
+ public:
+  explicit VulkanModelImpl(Context&& c, const VulkanModelConfig& cfg) : c_(std::move(c)), cfg_(cfg) {}
+
+  ~VulkanModelImpl() override {
+    if (descPool_) vkDestroyDescriptorPool(c_.device, descPool_, nullptr);
+    if (fence_) vkDestroyFence(c_.device, fence_, nullptr);
+    if (cmd_) vkFreeCommandBuffers(c_.device, c_.pool, 1, &cmd_);
+    for (Pipe* p : {&pEmbed_, &pMatmulF32_, &pQ8_, &pQ4_, &pQ6_, &pRms_, &pRope_, &pKv_, &pAttn_,
+                    &pSwiglu_, &pAdd_})
+      destroyPipe(c_, *p);
+    for (auto& b : owned_) b.destroy();
+    kc_.destroy();
+    vc_.destroy();
+  }
+
+  bool init(const float* tokEmbdF32, const float* outputNorm, const VulkanWeight& output,
+            const std::vector<VulkanLayer>& layers, std::string& err) {
+    const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn, vocab = cfg_.vocab,
+              L = cfg_.nLayers, qDim = cfg_.nHeads * cfg_.headDim;
+
+    if (!makePipe(c_, embed_row_spv, sizeof(embed_row_spv), 2, 8, pEmbed_) ||
+        !makePipe(c_, matmul_f32_spv, sizeof(matmul_f32_spv), 3, 8, pMatmulF32_) ||
+        !makePipe(c_, qmatmul_q8_0_spv, sizeof(qmatmul_q8_0_spv), 3, 8, pQ8_) ||
+        !makePipe(c_, qmatmul_q4_k_spv, sizeof(qmatmul_q4_k_spv), 3, 8, pQ4_) ||
+        !makePipe(c_, qmatmul_q6_k_spv, sizeof(qmatmul_q6_k_spv), 3, 8, pQ6_) ||
+        !makePipe(c_, rmsnorm_spv, sizeof(rmsnorm_spv), 3, 8, pRms_) ||
+        !makePipe(c_, rope_spv, sizeof(rope_spv), 1, 16, pRope_) ||
+        !makePipe(c_, kv_store_spv, sizeof(kv_store_spv), 2, 16, pKv_) ||
+        !makePipe(c_, attention_spv, sizeof(attention_spv), 4, 28, pAttn_) ||
+        !makePipe(c_, swiglu_spv, sizeof(swiglu_spv), 3, 4, pSwiglu_) ||
+        !makePipe(c_, add_spv, sizeof(add_spv), 2, 4, pAdd_)) {
+      err = "failed to build compute pipelines";
+      return false;
+    }
+
+    bool ok = true;
+    auto mkBytes = [&](VkDeviceSize bytes, const void* src, VkDeviceSize srcBytes) -> VkBuffer {
+      Buffer b{};
+      if (bytes == 0 || !makeBuffer(c_, (bytes + 3) & ~VkDeviceSize(3), b)) {
+        ok = false;
+        return VK_NULL_HANDLE;
+      }
+      if (src) upload(b, src, srcBytes);
+      owned_.push_back(b);
+      return owned_.back().buf;
+    };
+    auto mkF = [&](const float* p, std::size_t n) {
+      return mkBytes(n * sizeof(float), p, n * sizeof(float));
+    };
+    auto mkW = [&](const VulkanWeight& w) -> DevW {
+      const VkDeviceSize bytes = weightBytes(w.ggmlType, w.rows, w.cols);
+      VkBuffer b = mkBytes(bytes, w.host, bytes);
+      return {b, w.ggmlType, w.rows, w.cols};
+    };
+
+    bTok_ = mkF(tokEmbdF32, static_cast<std::size_t>(vocab) * d);
+    bOutNorm_ = mkF(outputNorm, d);
+    output_ = mkW(output);
+    layers_.resize(L);
+    for (int l = 0; l < L; ++l) {
+      layers_[l].attnNorm = mkF(layers[l].attnNorm, d);
+      layers_[l].ffnNorm = mkF(layers[l].ffnNorm, d);
+      layers_[l].wq = mkW(layers[l].wq);
+      layers_[l].wk = mkW(layers[l].wk);
+      layers_[l].wv = mkW(layers[l].wv);
+      layers_[l].wo = mkW(layers[l].wo);
+      layers_[l].gate = mkW(layers[l].ffnGate);
+      layers_[l].up = mkW(layers[l].ffnUp);
+      layers_[l].down = mkW(layers[l].ffnDown);
+    }
+    // scratch
+    bx_ = mkBytes(d * sizeof(float), nullptr, 0);
+    bxn_ = mkBytes(d * sizeof(float), nullptr, 0);
+    bq_ = mkBytes(qDim * sizeof(float), nullptr, 0);
+    bk_ = mkBytes(kvDim * sizeof(float), nullptr, 0);
+    bv_ = mkBytes(kvDim * sizeof(float), nullptr, 0);
+    battn_ = mkBytes(qDim * sizeof(float), nullptr, 0);
+    btmp_ = mkBytes(d * sizeof(float), nullptr, 0);
+    bg_ = mkBytes(ffn * sizeof(float), nullptr, 0);
+    bu_ = mkBytes(ffn * sizeof(float), nullptr, 0);
+    bact_ = mkBytes(ffn * sizeof(float), nullptr, 0);
+    blogits_ = mkBytes(vocab * sizeof(float), nullptr, 0);
+    // KV cache (its own Buffers so reset() can zero them)
+    const VkDeviceSize kvBytes =
+        static_cast<VkDeviceSize>(L) * cfg_.maxSeq * kvDim * sizeof(float);
+    if (!makeBuffer(c_, kvBytes, kc_) || !makeBuffer(c_, kvBytes, vc_)) ok = false;
+    if (ok) {
+      kc_.zero();
+      vc_.zero();
+    }
+    if (!ok) {
+      err = "failed to allocate device buffers";
+      return false;
+    }
+
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = c_.pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    const std::uint32_t sets = static_cast<std::uint32_t>((L + 1) * 18 + 8);
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * 4};
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = sets;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &dps;
+    if (vkAllocateCommandBuffers(c_.device, &cbai, &cmd_) != VK_SUCCESS ||
+        vkCreateFence(c_.device, &fci, nullptr, &fence_) != VK_SUCCESS ||
+        vkCreateDescriptorPool(c_.device, &dpci, nullptr, &descPool_) != VK_SUCCESS) {
+      err = "failed to allocate command/descriptor infrastructure";
+      return false;
+    }
+    logits_.resize(vocab);
+    ready_ = true;
+    return true;
+  }
+
+  const std::vector<float>& forward(int token, int pos) override {
+    if (!ready_) return logits_;
+    const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn, vocab = cfg_.vocab,
+              L = cfg_.nLayers, nHeads = cfg_.nHeads, headDim = cfg_.headDim, nKv = cfg_.nKv,
+              maxSeq = cfg_.maxSeq;
+    const float eps = cfg_.normEps, freqBase = cfg_.ropeFreqBase;
+    auto g256 = [](int n) { return static_cast<std::uint32_t>((n + 255) / 256); };
+
+    vkResetDescriptorPool(c_.device, descPool_, 0);
+    vkResetCommandBuffer(cmd_, 0);
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd_, &bi);
+    Recorder rec{c_, cmd_, descPool_};
+
+    // matmul dispatched by quant type: F32 uses matmul_f32 (bindings out,W,x; one workgroup/row);
+    // quant uses qmatmul_* (bindings W,x,out; one invocation/row).
+    auto matmul = [&](VkBuffer out, const DevW& w, VkBuffer in) {
+      struct {
+        std::uint32_t rows, cols;
+      } pc{static_cast<std::uint32_t>(w.rows), static_cast<std::uint32_t>(w.cols)};
+      if (w.type == 0) {
+        rec.op(pMatmulF32_, {out, w.buf, in}, &pc, static_cast<std::uint32_t>(w.rows));
+      } else {
+        const Pipe& p = (w.type == 8) ? pQ8_ : (w.type == 12) ? pQ4_ : pQ6_;
+        rec.op(p, {w.buf, in, out}, &pc, static_cast<std::uint32_t>(w.rows));  // one workgroup/row
+      }
+    };
+
+    struct {
+      std::uint32_t token, d;
+    } ePC{static_cast<std::uint32_t>(token), static_cast<std::uint32_t>(d)};
+    rec.op(pEmbed_, {bx_, bTok_}, &ePC, g256(d));
+
+    for (int l = 0; l < L; ++l) {
+      auto& lw = layers_[l];
+      struct RmsPC {
+        std::uint32_t n;
+        float eps;
+      } rmsAttn{static_cast<std::uint32_t>(d), eps};
+      rec.op(pRms_, {bxn_, bx_, lw.attnNorm}, &rmsAttn, 1);
+      matmul(bq_, lw.wq, bxn_);
+      matmul(bk_, lw.wk, bxn_);
+      matmul(bv_, lw.wv, bxn_);
+      struct RopePC {
+        std::uint32_t nh, hd;
+        std::int32_t pos;
+        float base;
+      } rq{static_cast<std::uint32_t>(nHeads), static_cast<std::uint32_t>(headDim), pos, freqBase},
+          rk{static_cast<std::uint32_t>(nKv), static_cast<std::uint32_t>(headDim), pos, freqBase};
+      // rope.comp has local_size_x=64, so it needs ceil(pairs/64) workgroups (NOT g256 — that would
+      // under-launch and leave most q/k pairs un-rotated once nHeads*headDim/2 > 64).
+      rec.op(pRope_, {bq_}, &rq, static_cast<std::uint32_t>((nHeads * headDim / 2 + 63) / 64));
+      rec.op(pRope_, {bk_}, &rk, static_cast<std::uint32_t>((nKv * headDim / 2 + 63) / 64));
+      struct KvPC {
+        std::uint32_t layer, pos, maxSeq, kvDim;
+      } kv{static_cast<std::uint32_t>(l), static_cast<std::uint32_t>(pos),
+           static_cast<std::uint32_t>(maxSeq), static_cast<std::uint32_t>(kvDim)};
+      rec.op(pKv_, {kc_.buf, bk_}, &kv, g256(kvDim));
+      rec.op(pKv_, {vc_.buf, bv_}, &kv, g256(kvDim));
+      struct AttnPC {
+        std::uint32_t nHeads, nKv, headDim, seqLen, kvDim, layer, maxSeq;
+      } ap{static_cast<std::uint32_t>(nHeads), static_cast<std::uint32_t>(nKv),
+           static_cast<std::uint32_t>(headDim), static_cast<std::uint32_t>(pos + 1),
+           static_cast<std::uint32_t>(kvDim), static_cast<std::uint32_t>(l),
+           static_cast<std::uint32_t>(maxSeq)};
+      rec.op(pAttn_, {battn_, bq_, kc_.buf, vc_.buf}, &ap, static_cast<std::uint32_t>(nHeads));
+      matmul(btmp_, lw.wo, battn_);
+      struct NPC {
+        std::uint32_t n;
+      } nd{static_cast<std::uint32_t>(d)};
+      rec.op(pAdd_, {bx_, btmp_}, &nd, g256(d));
+      struct RmsPC rmsFfn{static_cast<std::uint32_t>(d), eps};
+      rec.op(pRms_, {bxn_, bx_, lw.ffnNorm}, &rmsFfn, 1);
+      matmul(bg_, lw.gate, bxn_);
+      matmul(bu_, lw.up, bxn_);
+      struct NPC nf{static_cast<std::uint32_t>(ffn)};
+      rec.op(pSwiglu_, {bact_, bg_, bu_}, &nf, g256(ffn));
+      matmul(btmp_, lw.down, bact_);
+      rec.op(pAdd_, {bx_, btmp_}, &nd, g256(d));
+    }
+    struct {
+      std::uint32_t n;
+      float eps;
+    } rmsOut{static_cast<std::uint32_t>(d), eps};
+    rec.op(pRms_, {bxn_, bx_, bOutNorm_}, &rmsOut, 1);
+    matmul(blogits_, output_, bxn_);
+    vkEndCommandBuffer(cmd_);
+
+    if (rec.ok) {
+      VkSubmitInfo si{};
+      si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+      si.commandBufferCount = 1;
+      si.pCommandBuffers = &cmd_;
+      if (vkQueueSubmit(c_.queue, 1, &si, fence_) == VK_SUCCESS) {
+        vkWaitForFences(c_.device, 1, &fence_, VK_TRUE, UINT64_MAX);
+        vkResetFences(c_.device, 1, &fence_);
+        for (auto& b : owned_)
+          if (b.buf == blogits_) download(b, logits_.data(), vocab * sizeof(float));
+      }
+    }
+    return logits_;
+  }
+
+  void reset() override {
+    kc_.zero();
+    vc_.zero();
+  }
+
+ private:
+  Context c_;
+  VulkanModelConfig cfg_;
+  Pipe pEmbed_, pMatmulF32_, pQ8_, pQ4_, pQ6_, pRms_, pRope_, pKv_, pAttn_, pSwiglu_, pAdd_;
+  std::vector<Buffer> owned_;
+  Buffer kc_{}, vc_{};
+  VkBuffer bTok_ = VK_NULL_HANDLE, bOutNorm_ = VK_NULL_HANDLE, bx_ = VK_NULL_HANDLE,
+           bxn_ = VK_NULL_HANDLE, bq_ = VK_NULL_HANDLE, bk_ = VK_NULL_HANDLE, bv_ = VK_NULL_HANDLE,
+           battn_ = VK_NULL_HANDLE, btmp_ = VK_NULL_HANDLE, bg_ = VK_NULL_HANDLE,
+           bu_ = VK_NULL_HANDLE, bact_ = VK_NULL_HANDLE, blogits_ = VK_NULL_HANDLE;
+  DevW output_;
+  struct LayerW {
+    VkBuffer attnNorm, ffnNorm;
+    DevW wq, wk, wv, wo, gate, up, down;
+  };
+  std::vector<LayerW> layers_;
+  VkCommandBuffer cmd_ = VK_NULL_HANDLE;
+  VkFence fence_ = VK_NULL_HANDLE;
+  VkDescriptorPool descPool_ = VK_NULL_HANDLE;
+  std::vector<float> logits_;
+  bool ready_ = false;
+};
+
+}  // namespace
+
+std::unique_ptr<VulkanModel> createVulkanModel(const VulkanModelConfig& cfg, const float* tokenEmbdF32,
+                                               const float* outputNorm, const VulkanWeight& output,
+                                               const std::vector<VulkanLayer>& layers,
+                                               std::string& error) {
+  Context c = makeContext();
+  if (!c.ok) {
+    error = "no Vulkan device present";
+    return nullptr;
+  }
+  auto m = std::make_unique<VulkanModelImpl>(std::move(c), cfg);
+  if (!m->init(tokenEmbdF32, outputNorm, output, layers, error)) return nullptr;
+  return m;
 }
 
 }  // namespace qorvix::vulkan

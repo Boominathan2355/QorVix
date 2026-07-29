@@ -15,6 +15,7 @@
 #include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/cuda/multi_gpu.hpp"
 #include "qorvix/vulkan/backend.hpp"
+#include "qorvix/vulkan/vulkan_model.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/gpu_engine.hpp"
 #include "qorvix/model_registry.hpp"
@@ -276,6 +277,46 @@ std::unique_ptr<qorvix::cuda::GpuModel> buildGpuModel(const qorvix::runtime::Mod
   return cu::createGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err, maxSessions);
 }
 
+// Vulkan twin of buildGpuModel: same bridge, cross-vendor backend. Uploads the GGUF weights to
+// Vulkan device buffers and returns a VulkanModel runner (null in a CPU/no-device build).
+qorvix::vulkan::VulkanWeight toVkWeight(const qorvix::runtime::WeightMat& m) {
+  return qorvix::vulkan::VulkanWeight{m.quant, m.type, m.rows, m.cols};
+}
+std::unique_ptr<qorvix::vulkan::VulkanModel> buildVulkanModel(const qorvix::runtime::ModelConfig& cfg,
+                                                              const qorvix::runtime::Weights& w,
+                                                              int maxSeq, std::string& err) {
+  namespace rt = qorvix::runtime;
+  namespace vk = qorvix::vulkan;
+  const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+  std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
+  if (!rt::dequantize(w.tokenEmbd.type, w.tokenEmbd.quant, embF32.data(),
+                      static_cast<std::size_t>(vocab) * d)) {
+    err = "failed to dequantize token_embd";
+    return nullptr;
+  }
+  vk::VulkanModelConfig gc;
+  gc.nLayers = static_cast<int>(cfg.blockCount);
+  gc.dModel = d;
+  gc.nHeads = static_cast<int>(cfg.headCount);
+  gc.headDim = static_cast<int>(cfg.headDim());
+  gc.nKv = static_cast<int>(cfg.headCountKv);
+  gc.ffn = static_cast<int>(cfg.feedForwardLength);
+  gc.vocab = vocab;
+  gc.maxSeq = maxSeq;
+  gc.normEps = cfg.normEpsilon;
+  gc.ropeFreqBase = cfg.ropeFreqBase;
+
+  vk::VulkanWeight output = w.output.valid() ? toVkWeight(w.output) : toVkWeight(w.tokenEmbd);
+  std::vector<vk::VulkanLayer> gl(cfg.blockCount);
+  for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+    const auto& L = w.layers[l];
+    gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), toVkWeight(L.wq), toVkWeight(L.wk),
+             toVkWeight(L.wv), toVkWeight(L.wo), toVkWeight(L.ffnGate), toVkWeight(L.ffnUp),
+             toVkWeight(L.ffnDown)};
+  }
+  return vk::createVulkanModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err);
+}
+
 // GPU generation loop: drives the on-device GpuModel with the tokenizer + sampler.
 int generateGpu(const std::string& path, const std::string& prompt,
                 const qorvix::runtime::GenerationConfig& cfg) {
@@ -357,12 +398,77 @@ int generateGpu(const std::string& path, const std::string& prompt,
   }
 }
 
+// Cross-vendor generation loop: drives the on-device VulkanModel with the tokenizer + sampler. The
+// Vulkan twin of generateGpu — runs on any GPU (NVIDIA/AMD/Apple/Intel), or Mesa's software device.
+int generateVulkan(const std::string& path, const std::string& prompt,
+                   const qorvix::runtime::GenerationConfig& cfg) {
+  namespace rt = qorvix::runtime;
+  namespace vk = qorvix::vulkan;
+  if (!vk::builtWithVulkan() || vk::deviceCount() == 0) {
+    std::cerr << "error: --vulkan requested but no Vulkan device is available "
+                 "(build with -DQORVIX_ENABLE_VULKAN=ON)\n";
+    return 1;
+  }
+  try {
+    using clock = std::chrono::steady_clock;
+    const auto tLoad0 = clock::now();
+    auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) { std::cerr << "error: tokenizer: " << err << "\n"; return 1; }
+    const auto mc = rt::configFromGguf(file, err);
+    if (!mc.valid()) { std::cerr << "error: config: " << err << "\n"; return 1; }
+    auto weights = rt::loadWeights(file, mc, err);
+    if (!weights) { std::cerr << "error: weights: " << err << "\n"; return 1; }
+
+    const auto promptIds = tok->encode(prompt, cfg.addBos);
+    const int maxSeq = static_cast<int>(promptIds.size()) + cfg.maxNewTokens + 4;
+    auto gpu = buildVulkanModel(mc, *weights, maxSeq, err);
+    if (!gpu) { std::cerr << "error: Vulkan model: " << err << "\n"; return 1; }
+    const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+    rt::Sampler sampler(cfg.sampling, cfg.seed);
+    std::vector<int> history = promptIds;
+    const int eos = tok->special().eos;
+
+    std::cout << prompt << std::flush;
+    const auto tGen0 = clock::now();
+    int pos = 0;
+    std::vector<float> logits;
+    for (std::size_t i = 0; i < promptIds.size() && pos < maxSeq; ++i, ++pos)
+      logits = gpu->forward(promptIds[i], pos);
+    int next = sampler.sample(logits, history);
+
+    int generated = 0;
+    bool hitEos = false;
+    for (int n = 0; n < cfg.maxNewTokens && pos < maxSeq; ++n) {
+      if (next == eos) { hitEos = true; break; }
+      std::cout << tok->decodeToken(next) << std::flush;
+      history.push_back(next);
+      ++generated;
+      logits = gpu->forward(next, pos++);
+      next = sampler.sample(logits, history);
+    }
+    const double genSec = std::chrono::duration<double>(clock::now() - tGen0).count();
+    const int forwards = static_cast<int>(promptIds.size()) + generated;
+    std::cout << "\n\n[Vulkan | " << promptIds.size() << " prompt tokens, " << generated
+              << " generated" << (hitEos ? ", eos" : "") << "]\n"
+              << "[load " << std::fixed << std::setprecision(1) << loadSec << "s | " << forwards
+              << " forwards in " << std::setprecision(2) << genSec << "s = "
+              << (genSec > 0 ? forwards / genSec : 0.0) << " tok/s]\n";
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int cmdGenerate(const std::vector<std::string_view>& args) {
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   const std::string prompt = flagValue(args, "--prompt");
   if (path.empty() || prompt.empty()) {
     std::cerr << "usage: qorvix generate <file.gguf> --prompt \"...\" "
-                 "[--gpu] [--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n";
+                 "[--gpu|--vulkan] [--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n";
     return 1;
   }
 
@@ -374,6 +480,7 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   if (auto v = flagValue(args, "--seed"); !v.empty()) cfg.seed = std::stoull(v);
 
   if (hasFlag(args, "--gpu")) return generateGpu(path, prompt, cfg);
+  if (hasFlag(args, "--vulkan")) return generateVulkan(path, prompt, cfg);
 
   try {
     using clock = std::chrono::steady_clock;
@@ -688,6 +795,66 @@ int cmdGpuCheck(const std::string& path) {
   }
 }
 
+// Vulkan twin of gpu-check: builds the CPU model and the Vulkan model from the same GGUF, runs both
+// over a short prompt, and checks argmax parity. Works on any Vulkan device — including Mesa's
+// software device (lavapipe) — so it is meaningful without a discrete GPU.
+int cmdVulkanCheck(const std::string& path) {
+  namespace rt = qorvix::runtime;
+  namespace vk = qorvix::vulkan;
+  if (!vk::builtWithVulkan()) {
+    std::cout << "Vulkan not built in — rebuild with -DQORVIX_ENABLE_VULKAN=ON.\n";
+    return 0;
+  }
+  if (path.empty()) {
+    std::cerr << "usage: qorvix vulkan-check <file.gguf>\n";
+    return 1;
+  }
+  try {
+    auto file = qorvix::gguf::GgufFile::open(path);  // kept alive: CPU weights borrow its mmap
+    std::string err;
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) { std::cerr << "tokenizer: " << err << "\n"; return 1; }
+    const auto cfg = rt::configFromGguf(file, err);
+    if (!cfg.valid()) { std::cerr << "config: " << err << "\n"; return 1; }
+    auto weights = rt::loadWeights(file, cfg, err);
+    if (!weights) { std::cerr << "weights: " << err << "\n"; return 1; }
+
+    const int vocab = static_cast<int>(cfg.vocabSize);
+    const int maxSeq = 64;
+
+    std::string gerr;
+    std::cout << "Uploading weights to device buffers and building Vulkan model...\n";
+    auto gpu = buildVulkanModel(cfg, *weights, maxSeq, gerr);
+    if (!gpu) { std::cerr << "Vulkan model: " << gerr << "\n"; return 1; }
+
+    rt::TextModel cpu(cfg, std::move(*weights), maxSeq);  // in-memory ctor; borrows the live file
+
+    const auto ids = tok->encode("The capital of France is", true);
+    std::cout << "Comparing Vulkan vs CPU logits over " << ids.size() << " prompt tokens...\n";
+    float maxErr = 0.0f, maxRef = 1e-6f;
+    bool argmaxMatch = true;
+    for (int pos = 0; pos < static_cast<int>(ids.size()) && pos < maxSeq; ++pos) {
+      const auto& cl = cpu.forward(ids[pos], pos);
+      const auto& glog = gpu->forward(ids[pos], pos);
+      for (int i = 0; i < vocab; ++i) {
+        maxErr = std::max(maxErr, std::fabs(cl[i] - glog[i]));
+        maxRef = std::max(maxRef, std::fabs(cl[i]));
+      }
+      if (argmaxOf(cl) != argmaxOf(glog)) argmaxMatch = false;
+    }
+    const float relErr = maxErr / maxRef;
+    std::cout << "\nVulkan vs CPU logits:  max abs err " << maxErr << ", rel err " << relErr << "\n"
+              << "Argmax agrees at every position: " << (argmaxMatch ? "yes" : "NO") << "\n"
+              << (argmaxMatch && relErr < 5e-2f
+                      ? "RESULT: PASS - Vulkan forward matches the CPU runtime.\n"
+                      : "RESULT: MISMATCH - see errors above.\n");
+    return (argmaxMatch && relErr < 5e-2f) ? 0 : 1;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 int cmdGpu() {
   if (!qorvix::cuda::builtWithCuda()) {
     std::cout << "CUDA support: not built in.\n"
@@ -849,6 +1016,7 @@ int printUsage() {
             << "  gpu                 Show CUDA devices and run backend self-tests\n"
             << "  vulkan              Show Vulkan devices and run compute-backend self-tests\n"
             << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
+            << "  vulkan-check <file> Compare Vulkan vs CPU forward-pass logits for a GGUF model\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
             << "  help                Show this help\n";
@@ -878,6 +1046,7 @@ int main(int argc, char** argv) {
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();
   if (command == "gpu-check") return cmdGpuCheck(arg1);
+  if (command == "vulkan-check") return cmdVulkanCheck(arg1);
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 
   std::cerr << "Unknown command: " << command << "\n\n";
