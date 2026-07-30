@@ -93,3 +93,21 @@ The two reverted predecessors only ever touched the weight loads. The `8× LDG.E
 times per super-block — together 24 of the 30 memory instructions, and neither was addressed before.
 That is the argument for why this attempt should behave differently from those two; only the T4 can
 settle it.
+
+### Decision rule for the pending row — agreed 2026-07-30, do not skip
+
+**No further GPU kernel changes until this row has a measured number.** Static evidence (30 → 7
+memory instructions) is a hypothesis about the bottleneck, not a result. Run `scripts/colab_bench.sh`
+on the T4 first, then branch on what it says:
+
+- **Decode improves over 86.65** → the memory-instruction-issue theory is confirmed. Extend the same
+  re-blocking to the Q6_K GEMV (it is the same shape: 75% L1TEX, still on a `__shfl` broadcast for
+  `d`, still decoding scales per element).
+- **Decode does not move** → **stop this line.** Three attempts will have failed to move a kernel
+  whose instruction count provably fell 4×, which would mean MIO issue pressure is not the binding
+  constraint and the model of this kernel is wrong. Do not try a fourth variant of the same idea.
+  Re-profile from scratch (`scripts/colab_ncu_profile.sh`) and find the next dominant bottleneck
+  before writing any kernel code.
+
+This rule exists because the same mistake has already been made twice (4637be5, a341822): a plausible
+mechanism was iterated on instead of re-measured.
