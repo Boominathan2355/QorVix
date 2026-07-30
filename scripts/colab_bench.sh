@@ -65,16 +65,33 @@ echo "############## bench: GPU backends, same workload (JSON) ##############"
 echo "workload: prompt=${PROMPT} gen=${GEN} warmup=${WARMUP} runs=${RUNS}"
 # GPU backends FIRST at the full workload (fast on real hardware). cuda is the NVIDIA fast path;
 # vulkan is the one cross-vendor backend that also runs here.
+# Each backend is wrapped in a timeout and never allowed to kill the run: an unoptimized backend
+# that hangs or crawls used to truncate everything after it (the T4 vulkan row came back empty with
+# no error at all). Failures print their exit status and the tail of stderr instead of vanishing.
+BENCH_TIMEOUT="${QORVIX_BENCH_TIMEOUT:-900}"
+run_bench() {  # run_bench <label> <args...>
+  local label="$1"; shift
+  local errf rc=0
+  errf="$(mktemp)"
+  echo -n "  ${label}: "
+  timeout "${BENCH_TIMEOUT}" "${BIN}" bench "${MODEL}" "$@" --json 2>"${errf}" || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    if [ "${rc}" -eq 124 ]; then
+      echo "(TIMEOUT after ${BENCH_TIMEOUT}s — backend too slow for this workload)"
+    else
+      echo "(FAILED, exit ${rc})"
+    fi
+    tail -n 8 "${errf}" | sed 's/^/      | /'
+  fi
+  rm -f "${errf}"
+}
+
 for be in cuda vulkan; do
-  echo -n "  ${be}: "
-  "${BIN}" bench "${MODEL}" --${be} --prompt "${PROMPT}" --gen "${GEN}" \
-    --warmup "${WARMUP}" --runs "${RUNS}" --json 2>/dev/null || echo "(unavailable)"
+  run_bench "${be}" "--${be}" --prompt "${PROMPT}" --gen "${GEN}" --warmup "${WARMUP}" --runs "${RUNS}"
 done
 # CPU is the generalized reference, ~100x slower — a LIGHT workload only, so it never blocks the GPU
 # numbers (the full workload would take ~15+ min on CPU). Not a target; sanity/context only.
-echo -n "  cpu (light ref): "
-"${BIN}" bench "${MODEL}" --cpu --prompt 8 --gen 16 --warmup 0 --runs 1 --json 2>/dev/null \
-  || echo "(unavailable)"
+run_bench "cpu (light ref)" --cpu --prompt 8 --gen 16 --warmup 0 --runs 1
 
 echo ""
 echo "==================== done — paste the JSON lines into BENCHMARKS.md ===================="

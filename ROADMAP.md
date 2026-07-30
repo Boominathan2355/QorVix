@@ -336,19 +336,21 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status (2026-07-29):** Phases 0–9 complete, Phase 8.5 (cross-vendor + unified engine) complete,
+**Status (2026-07-30):** Phases 0–9 complete, Phase 8.5 (cross-vendor + unified engine) complete,
 Phase 10 started. **Qorvix runs correct inference on real models across three backends behind one
-seam** — CPU, CUDA (~87–89 tok/s on a T4, rel err 3.7e-06), and Vulkan (cross-vendor, argmax parity
-verified GPU-free on lavapipe, rel err 2.6e-06). Test suite: **128 cases / 4413 assertions green**;
-the CPU-only, CUDA, and Vulkan builds all compile and link.
+seam** — CPU, CUDA (**86.65 decode tok/s measured on a Tesla T4**, argmax parity, see BENCHMARKS.md),
+and Vulkan (cross-vendor, argmax parity verified GPU-free on lavapipe, rel err 2.6e-06). Test suite:
+**131 cases / 4429 assertions green**; the CPU-only, CUDA, and Vulkan builds all compile and link.
 
 - **Unified backend ✅** — one `IInferenceEngine` seam, three implementations (CPU/CUDA/Vulkan), one
   `createEngine` factory, one generation loop. `generate` and `serve` reach any backend via
   `--gpu` / `--vulkan` / `--auto`; `qorvix backends` lists them.
 - **CPU path ✅** — correct generation from real GGUF with native quantized weights (~0.8 GB RAM),
   paged multi-session KV cache, continuous-batching scheduler, OpenAI-compatible HTTP server.
-- **CUDA path ✅ correct, 🚧 fast** — every kernel verified on a T4; CUDA Graphs shipped; decode
-  bandwidth-bound (Phase 8c).
+- **CUDA path ✅ correct, 🚧 fast** — every kernel verified on a T4; CUDA Graphs shipped; decode is
+  **memory-instruction-issue bound, not bandwidth bound** (T4: 28% DRAM but 84% L1TEX and 46% of
+  warp stalls on a full MIO queue — earlier notes here called it bandwidth-bound, which the `ncu`
+  data contradicts). Phase 8c works the instruction count, not the byte count.
 - **Vulkan path ✅ correct, 🚧 fast** — full forward verified on lavapipe; single-session and
   correctness-first (throughput pass — device-local buffers, command-buffer reuse, subgroups — is
   future work).
@@ -444,8 +446,8 @@ Measurement before features — everything below is validated against `qorvix be
 
 1. **CUDA optimization** 🟡 — *highest priority.* Phase 8c: the L1TEX-bound Q4_K GEMV on the T4.
 2. **Vulkan optimization** 🟡 — after CUDA (device-local buffers, command-buffer reuse, subgroups).
-3. **Real-hardware benchmarks** ⬜🖥️ — run `scripts/colab_bench.sh` on T4 / RTX / AMD / Intel; fill
-   the BENCHMARKS.md baselines.
+3. **Real-hardware benchmarks** 🟡🖥️ — T4 CUDA row is filled. Still open: T4 Vulkan, and
+   RTX / AMD / Intel via `scripts/colab_bench.sh`.
 4. **Documentation & release** ⬜ — publish results once numbers stabilize.
 5. **Native HIP / Metal** ⬜🖥️ — only after cross-vendor Vulkan performance stabilizes (Vulkan
    already covers those vendors functionally).
