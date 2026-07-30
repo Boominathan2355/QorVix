@@ -111,3 +111,43 @@ on the T4 first, then branch on what it says:
 
 This rule exists because the same mistake has already been made twice (4637be5, a341822): a plausible
 mechanism was iterated on instead of re-measured.
+
+## External reference: llama.cpp
+
+Every number above is self-relative — it says whether Qorvix got faster than Qorvix, never whether
+86.65 tok/s is respectable. `scripts/colab_llamacpp_compare.sh` builds llama.cpp with CUDA next to
+Qorvix and runs both on one GPU, one TinyLlama 1.1B Q4_K_M, one workload. It is deliberately separate
+from `colab_bench.sh` so it cannot perturb the Phase 8c decision run.
+
+| Date | Device | Qorvix decode | llama.cpp tg128 | Qorvix prefill | llama.cpp pp64 |
+|------|--------|--------------:|----------------:|---------------:|---------------:|
+| _pending_ | Tesla T4 | 86.65 | — | 99.38 | — |
+
+### Design gap, read from llama.cpp's source (not from memory)
+
+`ggml/src/ggml-cuda/{mmvq.cu,vecdotq.cuh,quantize.cu}`, the MMVQ path that serves batch-1 decode:
+
+| | Qorvix `qmatmulQ4_KKernel` (5404523) | llama.cpp `vec_dot_q4_K_q8_1` |
+|---|---|---|
+| activation format | **f32, 4 B/element** | **q8_1: int8 + fp16 (d, s) per 32 → 1.125 B/element** |
+| activation load | 2× `LDG.E.128` (`float4`) | 32-bit loads of packed int8 |
+| weight nibble load | 2× `LDG.E` (`uint32`) | 32-bit `const int* q4` — **same** |
+| scale/min unpack | folded register ALU off one shared `uint4` | 16-bit masked `scales[j] & 0x3f3f` — **equivalent** |
+| arithmetic | FP32 FFMA, **1 MAC/instruction** | `__dp4a`, **4 int8 MACs/instruction** |
+
+The commit we just landed closed the two right-hand rows — weight loading and scale unpacking are now
+essentially what llama.cpp does. The two rows that remain open are the structural ones, and they are
+exactly the two that a memory-instruction-issue-bound kernel cares about:
+
+- **~3.6× more activation bytes** (4 B vs 1.125 B per element).
+- **~4× more arithmetic instructions** for identical MACs (`FFMA` vs `__dp4a`).
+
+The activation quantization cost is amortized to nothing: `quantize_row_q8_1_cuda` runs once per token
+over `cols` elements, and the result is reused across all `rows` of the GEMV.
+
+**This is not a free win, and it is not just an optimization.** q8_1 activations are an approximation;
+part of llama.cpp's speed is bought with activation precision. Qorvix's ship gate is argmax parity
+against its own f32 CPU reference, and quantizing activations on the GPU only would widen the GPU↔CPU
+gap by construction (llama.cpp does not have this problem because its CPU backend quantizes too).
+Adopting it means deciding whether the CPU reference quantizes as well, or whether the parity gate
+loosens. That decision needs the measured comparison above first — see the decision rule.
