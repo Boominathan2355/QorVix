@@ -222,12 +222,14 @@ std::uint32_t findMemType(const Context& c, std::uint32_t typeBits, VkMemoryProp
   return UINT32_MAX;
 }
 
-// A host-visible, coherent storage buffer. Correctness-first: no staging, map/unmap directly.
+// A storage buffer. `hostVisible` ones are mapped directly; device-local ones are filled through a
+// staging copy, which is the entire point of the distinction — see makeDeviceBuffer.
 struct Buffer {
   VkDevice device = VK_NULL_HANDLE;
   VkBuffer buf = VK_NULL_HANDLE;
   VkDeviceMemory mem = VK_NULL_HANDLE;
   VkDeviceSize size = 0;
+  bool hostVisible = true;
 
   void destroy() {
     if (buf) vkDestroyBuffer(device, buf, nullptr);
@@ -237,6 +239,7 @@ struct Buffer {
   }
 
   void zero() {
+    if (!hostVisible) return;  // device-local buffers are zeroed with fillZero()
     void* p = nullptr;
     if (vkMapMemory(device, mem, 0, size, 0, &p) == VK_SUCCESS) {
       std::memset(p, 0, size);
@@ -245,21 +248,24 @@ struct Buffer {
   }
 };
 
-bool makeBuffer(const Context& c, VkDeviceSize size, Buffer& out) {
+// Allocate + bind, given an exact memory-property requirement. Transfer bits are always on so any
+// buffer can act as a staging source or a copy destination.
+bool allocBuffer(const Context& c, VkDeviceSize size, VkMemoryPropertyFlags want, Buffer& out) {
   out.device = c.device;
   out.size = size;
   VkBufferCreateInfo bci{};
   bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
   bci.size = size;
-  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+              VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   if (vkCreateBuffer(c.device, &bci, nullptr, &out.buf) != VK_SUCCESS) return false;
 
   VkMemoryRequirements req{};
   vkGetBufferMemoryRequirements(c.device, out.buf, &req);
-  const std::uint32_t mt = findMemType(
-      c, req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  const std::uint32_t mt = findMemType(c, req.memoryTypeBits, want);
   if (mt == UINT32_MAX) return false;
+  out.hostVisible = (c.memProps.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
 
   VkMemoryAllocateInfo mai{};
   mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -269,12 +275,93 @@ bool makeBuffer(const Context& c, VkDeviceSize size, Buffer& out) {
   return vkBindBufferMemory(c.device, out.buf, out.mem, 0) == VK_SUCCESS;
 }
 
+// Host-visible + coherent: mappable from the CPU. Correct for anything the host touches per token
+// (the logits readback) and for staging buffers.
+bool makeBuffer(const Context& c, VkDeviceSize size, Buffer& out) {
+  return allocBuffer(
+      c, size, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, out);
+}
+
+// DEVICE_LOCAL: real VRAM on a discrete GPU. Use for anything the GPU reads every token — above
+// all the model weights.
+//
+// Why this exists: every buffer used to be allocated HOST_VISIBLE|HOST_COHERENT, which on a
+// discrete GPU is SYSTEM RAM reached across PCIe, so each GEMV streamed the whole weight set over
+// the bus once per token. That bug is INVISIBLE on the dev box's verification path: Mesa lavapipe
+// reports exactly one memory type carrying DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED at
+// once, so asking for host-visible there also happens to give you device-local. A discrete NVIDIA
+// device exposes ~11 types and findMemType returns the FIRST host-visible one, which is host RAM.
+// Hence: ask for what is actually wanted, and fall back only if the device has no device-local heap.
+bool makeDeviceBuffer(const Context& c, VkDeviceSize size, Buffer& out) {
+  if (allocBuffer(c, size, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, out)) return true;
+  out.destroy();
+  return makeBuffer(c, size, out);
+}
+
 bool upload(const Buffer& b, const void* src, VkDeviceSize n) {
   void* p = nullptr;
   if (vkMapMemory(b.device, b.mem, 0, n, 0, &p) != VK_SUCCESS) return false;
   std::memcpy(p, src, n);
   vkUnmapMemory(b.device, b.mem);
   return true;
+}
+
+// Fill a device-local buffer through a temporary host-visible staging buffer. One-shot copy,
+// synchronous, staging freed immediately — this runs at model load, never per token, so the cost is
+// paid once and the peak extra host memory is one buffer's worth.
+//
+// Always staged, even when the destination happens to also be host-visible (integrated GPUs, and
+// lavapipe). That is deliberate: it means the dev box's lavapipe run exercises exactly the code path
+// a discrete GPU will take, instead of silently skipping it.
+bool uploadDevice(const Context& c, const Buffer& dst, const void* src, VkDeviceSize n) {
+  if (n == 0) return true;
+  if (dst.hostVisible && !src) return true;
+
+  Buffer stage{};
+  if (!makeBuffer(c, n, stage)) {
+    stage.destroy();
+    return false;
+  }
+  if (!upload(stage, src, n)) {
+    stage.destroy();
+    return false;
+  }
+
+  VkCommandBufferAllocateInfo cbai{};
+  cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cbai.commandPool = c.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(c.device, &cbai, &cmd) != VK_SUCCESS) {
+    stage.destroy();
+    return false;
+  }
+
+  VkCommandBufferBeginInfo bi{};
+  bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &bi);
+  VkBufferCopy region{0, 0, n};
+  vkCmdCopyBuffer(cmd, stage.buf, dst.buf, 1, &region);
+  vkEndCommandBuffer(cmd);
+
+  VkFenceCreateInfo fci{};
+  fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+  VkFence fence = VK_NULL_HANDLE;
+  bool ok = vkCreateFence(c.device, &fci, nullptr, &fence) == VK_SUCCESS;
+  if (ok) {
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    ok = vkQueueSubmit(c.queue, 1, &si, fence) == VK_SUCCESS &&
+         vkWaitForFences(c.device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    vkDestroyFence(c.device, fence, nullptr);
+  }
+  vkFreeCommandBuffers(c.device, c.pool, 1, &cmd);
+  stage.destroy();
+  return ok;
 }
 
 bool download(const Buffer& b, void* dst, VkDeviceSize n) {
@@ -1497,13 +1584,20 @@ class VulkanModelImpl final : public VulkanModel {
     }
 
     bool ok = true;
+    // Everything here lives in DEVICE_LOCAL memory (real VRAM on a discrete GPU) and is filled once
+    // through a staging copy. The weights dominate: on a discrete card the previous host-visible
+    // allocation meant every GEMV pulled the whole weight set across PCIe once per token.
     auto mkBytes = [&](VkDeviceSize bytes, const void* src, VkDeviceSize srcBytes) -> VkBuffer {
       Buffer b{};
-      if (bytes == 0 || !makeBuffer(c_, (bytes + 3) & ~VkDeviceSize(3), b)) {
+      if (bytes == 0 || !makeDeviceBuffer(c_, (bytes + 3) & ~VkDeviceSize(3), b)) {
         ok = false;
         return VK_NULL_HANDLE;
       }
-      if (src) upload(b, src, srcBytes);
+      if (src && !uploadDevice(c_, b, src, srcBytes)) {
+        b.destroy();
+        ok = false;
+        return VK_NULL_HANDLE;
+      }
       owned_.push_back(b);
       return owned_.back().buf;
     };
@@ -1542,7 +1636,17 @@ class VulkanModelImpl final : public VulkanModel {
     bg_ = mkBytes(ffn * sizeof(float), nullptr, 0);
     bu_ = mkBytes(ffn * sizeof(float), nullptr, 0);
     bact_ = mkBytes(ffn * sizeof(float), nullptr, 0);
-    blogits_ = mkBytes(vocab * sizeof(float), nullptr, 0);
+    // The one exception to device-local: the host maps and reads this every token, so it has to stay
+    // host-visible. It is ~128 KB per token against ~500 MB of weight traffic — irrelevant either way.
+    {
+      Buffer b{};
+      if (!makeBuffer(c_, vocab * sizeof(float), b)) {
+        ok = false;
+      } else {
+        owned_.push_back(b);
+        blogits_ = owned_.back().buf;
+      }
+    }
     // Per-session KV cache: each session owns an independent K and V buffer (isolation without any
     // shader change — the kv_store/attention indexing stays (layer*maxSeq + pos)*kvDim within the
     // session's own buffer). reset/openSession zero a single session's pair.

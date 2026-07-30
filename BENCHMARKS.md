@@ -67,6 +67,44 @@ The `vulkan` row on the T4 came back empty — the run was cut off after the CUD
 `scripts/colab_bench.sh` now wraps each backend in a `timeout` and surfaces stderr so a slow or
 hanging backend reports itself instead of silently truncating the run.
 
+### Why the T4 Vulkan row never finished — root cause
+
+Not a hang. Every Vulkan buffer was allocated `HOST_VISIBLE | HOST_COHERENT` with no
+`DEVICE_LOCAL` (`makeBuffer`, documented at the time as "correctness-first: no staging, map/unmap
+directly"). On a **discrete** GPU that memory is system RAM reached across PCIe, so the ~500 MB
+weight set was streamed over the bus *once per token*. At a realistic 4–8 GB/s for GPU reads of
+host-coherent memory that is ~60–120 ms/token before any compute — roughly 10× slower than the CUDA
+path's 11.5 ms/tok, over 768 forwards (192 tokens × 4 runs). It was crawling, not stuck.
+
+**The dev box structurally cannot catch this class of bug.** Mesa lavapipe reports exactly one
+memory type:
+
+```
+memoryTypes: count = 1
+  memoryTypes[0]: MEMORY_PROPERTY_DEVICE_LOCAL_BIT | HOST_VISIBLE_BIT | HOST_COHERENT_BIT | HOST_CACHED_BIT
+```
+
+so on lavapipe asking for host-visible *also* returns device-local — there is nothing else to
+return. A discrete NVIDIA device exposes ~11 memory types and `findMemType` returns the **first**
+match, which is host RAM. The lavapipe loop validates numerics perfectly and is blind to memory
+placement; treat every future "verified on lavapipe" claim as scoped to correctness only.
+
+Fixed by `makeDeviceBuffer` (requests `DEVICE_LOCAL`, falls back to host-visible only if the device
+has no device-local heap) plus `uploadDevice`, a one-shot staging copy used at load time. Weights,
+the embedding table, norms and scratch are now device-local; `blogits_` stays host-visible because
+the host maps it every token (~128 KB against ~500 MB — irrelevant). The staging path runs
+*unconditionally*, even where the destination is also host-visible, so lavapipe exercises the same
+code a discrete GPU will take rather than skipping it.
+
+Verified on lavapipe: 8/8 Vulkan self-tests PASS, and `vulkan-check` on the real TinyLlama gives
+**max abs err 6.35e-06, rel err 4.09e-07, argmax agrees at every position**. The speedup itself is
+**unmeasured** — it needs a discrete GPU, which is the whole point of the bug.
+
+Still open (measured next, not now): the forward re-records its command buffer and re-allocates a
+descriptor set for every one of ~377 dispatches per token (22 layers × 17 ops + 3), with a full
+compute→compute barrier after each. That is CPU-side submission overhead the T4 run will expose once
+the PCIe streaming is gone.
+
 ## Optimization log
 
 Append one row per attempt: what changed, the before→after `decode_tok_per_sec` on the fixed
