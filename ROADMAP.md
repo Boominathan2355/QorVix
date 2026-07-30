@@ -444,12 +444,19 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
 
 Measurement before features — everything below is validated against `qorvix bench` / BENCHMARKS.md.
 
-1. **CUDA optimization** 🟡 — *highest priority.* Phase 8c: the L1TEX-bound Q4_K GEMV on the T4.
+1. **CUDA optimization** 🟡 — *highest priority.* Phase 8c: the Q4_K GEMV on the T4. Baseline is
+   set (86.65 tok/s @ 4ad49c8) and the re-blocked kernel is in — it needs a T4 re-run to confirm.
+   Next candidates once that number lands: the same re-blocking for Q6_K (128 GB/s, 75% L1TEX, and
+   it still uses a `__shfl` broadcast), then staging `x` in shared per block.
 2. **Vulkan optimization** 🟡 — after CUDA (device-local buffers, command-buffer reuse, subgroups).
+   The T4 Vulkan bench has never completed; get a number before tuning anything.
 3. **Real-hardware benchmarks** 🟡🖥️ — T4 CUDA row is filled. Still open: T4 Vulkan, and
    RTX / AMD / Intel via `scripts/colab_bench.sh`.
-4. **Documentation & release** ⬜ — publish results once numbers stabilize.
-5. **Native HIP / Metal** ⬜🖥️ — only after cross-vendor Vulkan performance stabilizes (Vulkan
+4. **Batched prefill** ⬜ — measured T4 prefill (99 tok/s) is barely above decode (87), the
+   signature of a token-at-a-time prefill. GEMV → GEMM for the prompt phase is a large, separate
+   win that does not touch `decode_tok_per_sec`.
+5. **Documentation & release** ⬜ — publish results once numbers stabilize.
+6. **Native HIP / Metal** ⬜🖥️ — only after cross-vendor Vulkan performance stabilizes (Vulkan
    already covers those vendors functionally).
 
 ### Former architectural gap (now resolved by Phase 8.5)

@@ -86,17 +86,9 @@ constexpr int kQKK = 256;      // K-quant super-block
 constexpr int kQ4KBytes = 144;  // Q4_K: d(2) + dmin(2) + scales[12] + qs[128]
 constexpr int kQ6KBytes = 210;  // Q6_K: ql[128] + qh[64] + scales[16] + d(2)
 
-// 6-bit (scale, min) unpack for sub-block j of a Q4_K/Q5_K scales array. Verbatim from ggml.
-__device__ inline void getScaleMinK4(int j, const unsigned char* q, unsigned char& d,
-                                     unsigned char& m) {
-  if (j < 4) {
-    d = q[j] & 63;
-    m = q[j + 4] & 63;
-  } else {
-    d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-    m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-  }
-}
+// The 6-bit (scale, min) unpack for sub-block j of a Q4_K scales array — ggml's get_scale_min_k4 —
+// is folded directly into qmatmulQ4_KKernel below so the 12 scale bytes can stay in registers.
+// The canonical unfolded form lives in runtime/src/dequant.cpp and vulkan/shaders/qmatmul_q4_k.comp.
 
 __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* __restrict__ W,
                                   const float* __restrict__ x, int rows, int cols) {
@@ -108,40 +100,73 @@ __global__ void qmatmulQ4_KKernel(float* __restrict__ out, const std::uint8_t* _
   const std::size_t rowBytes = static_cast<std::size_t>(nSB) * kQ4KBytes;
   const std::uint8_t* rowPtr = W + static_cast<std::size_t>(row) * rowBytes;
 
-  // Per-warp scratch for the 16 header bytes: d(2) + dmin(2) + 12 packed sub-block scales.
-  // ncu on the real decode workload showed this kernel is L1TEX-throughput bound (L1TEX ~88%,
-  // DRAM only ~26%), NOT DRAM- or occupancy-bound. The prior version removed the MIO warp shuffles
-  // by having every one of the 32 lanes decode these 16 header bytes locally — but they are
-  // IDENTICAL across the warp, so that turned into 32x-redundant broadcast loads through the L1TEX
-  // data pipe every super-block, which is the current bound. Load them cooperatively ONCE per warp
-  // into shared, then read from shared: no global broadcast, and no warp shuffle either (MIO stays
-  // clean). The per-lane arithmetic below reads exactly the same byte values as before, so the
-  // result is bit-identical to the previous version and the gpu-check argmax gate still holds.
-  __shared__ std::uint8_t hdrS[kWarpsPerBlock][16];
-  std::uint8_t* hdr = hdrS[warp];
+  // This kernel is memory-INSTRUCTION bound, not bandwidth bound. Measured on a T4 (4ad49c8):
+  // DRAM throughput 28%, L1TEX throughput 84%, and 46% of warp stalls waiting on a full MIO
+  // instruction queue. Cutting bytes moved is therefore worthless; cutting the NUMBER of memory
+  // instructions is the whole game. Two earlier attempts (4637be5, a341822) vectorized only the
+  // weight loads and were reverted for no measurable gain — because the eight scalar `x` loads per
+  // super-block were left untouched and kept the MIO queue just as full.
+  //
+  // So re-block the warp. Each lane owns four CONTIGUOUS elements per half super-block instead of
+  // eight elements strided by 32:
+  //     old: lane L, k in [0,8)          -> element L + 32k
+  //     new: lane L, g in [0,2), j in [0,4) -> element 128g + 4L + j
+  // Contiguity is what makes the loads wide: the four activations become one 128-bit `float4` and
+  // the four weight nibbles become one 32-bit load (they share a byte pair-wise, and all four sit
+  // in one 32-bit word). Per super-block per lane that is 2 float4 + 2 uint32 = 4 global memory
+  // instructions, down from 16 scalar ones, with the same bytes touched and the same coalescing.
+  //
+  // The 16 header bytes are still staged once per warp in shared, but are now read back as a single
+  // uint4 broadcast and taken apart with register ALU. With t = lane>>3, the three bytes a/b/c
+  // below are exactly the ones getScaleMinK4 wants for sub-blocks t and 4+t, so the per-lane pair of
+  // sub-blocks needs no runtime indexing into the header (which would spill it to local memory).
+  //
+  // Every index and bit-extraction identity above is machine-checked against the previous version's
+  // arithmetic on the host (there is no GPU on the dev box). The re-blocking changes only the ORDER
+  // of the float accumulation, so results are no longer bit-identical; `gpu-check` argmax parity is
+  // the ship gate and the reassociation error is the same magnitude as before.
+  __shared__ __align__(16) std::uint8_t hdrS[kWarpsPerBlock][16];
+  uint4* hdrSlot = reinterpret_cast<uint4*>(hdrS[warp]);
+
+  // Lane-invariant addressing, hoisted out of the super-block loop.
+  const int qByte = (lane >> 4) * 32 + (lane & 7) * 4;      // weight byte offset (+ g*64)
+  const int xElem = lane * 4;                                // activation element offset (+ g*128)
+  const unsigned nibShift = ((lane & 15) >= 8) ? 4u : 0u;    // low or high nibble of each byte
+  const int hdrShift = 8 * (lane >> 3);                      // byte select inside a header word
 
   float sum = 0.0f;
   for (int sb = 0; sb < nSB; ++sb) {
     const std::uint8_t* blk = rowPtr + static_cast<std::size_t>(sb) * kQ4KBytes;
-    if (lane < 16) hdr[lane] = blk[lane];  // one coalesced 16-byte load per warp, not per lane
+    if (lane == 0) *hdrSlot = *reinterpret_cast<const uint4*>(blk);  // one 16-byte load per warp
     __syncwarp();
+    const uint4 h = *hdrSlot;  // broadcast read; everything below is register arithmetic
+    __syncwarp();              // hdr slot is free to be overwritten by the next super-block
 
-    const float d = __half2float(__ushort_as_half(hdr[0] | (static_cast<unsigned short>(hdr[1]) << 8)));
-    const float dmin = __half2float(__ushort_as_half(hdr[2] | (static_cast<unsigned short>(hdr[3]) << 8)));
+    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(h.x & 0xFFFFu)));
+    const float dmin = __half2float(__ushort_as_half(static_cast<unsigned short>(h.x >> 16)));
+
+    const unsigned a = (h.y >> hdrShift) & 0xFFu;  // scales byte t
+    const unsigned b = (h.z >> hdrShift) & 0xFFu;  // scales byte t+4
+    const unsigned c = (h.w >> hdrShift) & 0xFFu;  // scales byte t+8
 
     const std::uint8_t* qs = blk + 16;
     const float* xb = x + static_cast<std::size_t>(sb) * kQKK;
 #pragma unroll
-    for (int k = 0; k < 8; ++k) {  // element i = lane + k*32 lives in sub-block k
-      const int i = lane + k * 32;
-      const int chunk = i / 64, local = i % 64;
-      const std::uint8_t qbyte = qs[chunk * 32 + (local & 31)];
-      const int nib = (local < 32) ? (qbyte & 0xF) : (qbyte >> 4);
-      unsigned char sc, m;
-      getScaleMinK4(k, hdr + 4, sc, m);
-      sum += (d * sc * nib - dmin * m) * xb[i];
+    for (int g = 0; g < 2; ++g) {
+      // getScaleMinK4 for sub-block (4g + lane>>3), expanded so the header stays in registers.
+      const unsigned sc = (g == 0) ? (a & 63u) : ((c & 0xFu) | ((a >> 6) << 4));
+      const unsigned mn = (g == 0) ? (b & 63u) : ((c >> 4) | ((b >> 6) << 4));
+      const float dsc = d * static_cast<float>(sc);
+      const float dm = dmin * static_cast<float>(mn);
+
+      const unsigned q4 = *reinterpret_cast<const unsigned*>(qs + g * 64 + qByte);       // 4 nibble pairs
+      const float4 xv = *reinterpret_cast<const float4*>(xb + g * (kQKK / 2) + xElem);  // 4 activations
+
+      sum += (dsc * static_cast<float>((q4 >> nibShift) & 0xFu) - dm) * xv.x;
+      sum += (dsc * static_cast<float>((q4 >> (nibShift + 8)) & 0xFu) - dm) * xv.y;
+      sum += (dsc * static_cast<float>((q4 >> (nibShift + 16)) & 0xFu) - dm) * xv.z;
+      sum += (dsc * static_cast<float>((q4 >> (nibShift + 24)) & 0xFu) - dm) * xv.w;
     }
-    __syncwarp();  // all lanes done reading hdr before the next super-block overwrites it
   }
   for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, off);
   if (lane == 0) out[row] = sum;

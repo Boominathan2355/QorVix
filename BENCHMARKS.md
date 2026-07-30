@@ -75,4 +75,21 @@ outcome — it stops us from repeating it (as the reverted Q4_K vectorized-load 
 
 | Date | Commit | Backend | Change | decode tok/s before→after | parity | verdict |
 |------|--------|---------|--------|---------------------------|--------|---------|
-| _(first entry lands with the first hardware-measured optimization)_ | | | | | | |
+| 2026-07-30 | _this commit_ | cuda | Q4_K GEMV re-blocked: 4 contiguous elements/lane so activations load as `float4` and weights as one `uint32`; header decoded from one shared `uint4` instead of 8 `getScaleMinK4` calls | 86.65 → _pending T4_ | _pending_ | _awaiting measurement_ |
+
+**Static evidence for the pending row** (what the dev box can prove without a GPU). SASS for `sm_75`,
+per super-block iteration of `qmatmulQ4_KKernel`:
+
+| | old (4ad49c8) | new |
+|---|---:|---:|
+| global load instructions | 13 (`8× LDG.E` 32-bit + `5× LDG.E.U8`) | 5 (`3× LDG.E.128` + `2× LDG.E`) |
+| shared load/store instructions | 17 (`16× LDS.U.U8` + `1× STS.U8`) | 2 (`1× LDS.U.128` + `1× STS.128`) |
+| **memory instructions total** | **30** | **7** |
+| SASS instructions in kernel | 200 | 144 |
+| registers / spills | 57 / none | 43 / none |
+
+The two reverted predecessors only ever touched the weight loads. The `8× LDG.E` were the scalar
+**activation** loads and the `16× LDS.U.U8` were `getScaleMinK4` being re-evaluated from shared eight
+times per super-block — together 24 of the 30 memory instructions, and neither was addressed before.
+That is the argument for why this attempt should behave differently from those two; only the T4 can
+settle it.
