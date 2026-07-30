@@ -41,8 +41,10 @@ Reference-environment numbers only. GPU rows must be filled from a real device
 |------|--------|---------|--------|-------------:|-------:|--------------:|-------|
 | 2026-07-29 | 6dea5a0 | cpu | Docker Ubuntu (container CPU, Release) | ~1.2 | ~836 | ~1.2 | small workload (prompt 8 gen 8); reference sanity only, not a target |
 | 2026-07-29 | 6dea5a0 | vulkan | Mesa lavapipe (CPU software Vulkan) | ~0.14 | ~7040 | ~0.15 | correctness path; **not** a perf figure — do not optimize against this |
-| **2026-07-30** | **4ad49c8** | **cuda** | **Tesla T4 (Colab, driver 580.82.07)** | **86.65** | **11.54** | **99.38** | **the CUDA baseline.** `load 0.89 s`, median of 3 (min 11.51 / max 11.63 ms/tok), `gpu-check` argmax parity PASS |
-| _pending_ | — | vulkan | discrete GPU (real hardware) | — | — | — | Colab T4 run did not complete (see note below); needs a re-run or another device |
+| 2026-07-30 | 4ad49c8 | cuda | Tesla T4 (Colab, driver 580.82.07) | 86.65 | 11.54 | 99.38 | the first CUDA baseline; superseded by the row below |
+| **2026-07-30** | **cfd1fa9** | **cuda** | **Tesla T4 (Colab)** | **114.82** | **8.71** | **140.15** | **current.** `load 0.75 s`, median of 3 (min 8.70 / max 8.71 ms/tok), `gpu-check` PASS (max abs err 7.15e-06, rel err 4.61e-07) |
+| 2026-07-30 | cfd1fa9 | cpu | Colab host CPU (light ref) | 1.24 | 805 | 1.41 | prompt 8 / gen 16; sanity only, not a target |
+| _pending_ | — | vulkan | discrete GPU (real hardware) | — | — | — | **TIMEOUT after 900 s** on the T4 at cfd1fa9 — that build predates the device-local fix (d8cb8c5), which is still unmeasured |
 
 Raw JSON for the CUDA row (`scripts/colab_bench.sh`, notebook cell 22):
 
@@ -113,7 +115,7 @@ outcome — it stops us from repeating it (as the reverted Q4_K vectorized-load 
 
 | Date | Commit | Backend | Change | decode tok/s before→after | parity | verdict |
 |------|--------|---------|--------|---------------------------|--------|---------|
-| 2026-07-30 | _this commit_ | cuda | Q4_K GEMV re-blocked: 4 contiguous elements/lane so activations load as `float4` and weights as one `uint32`; header decoded from one shared `uint4` instead of 8 `getScaleMinK4` calls | 86.65 → _pending T4_ | _pending_ | _awaiting measurement_ |
+| 2026-07-30 | 5404523 | cuda | Q4_K GEMV re-blocked: 4 contiguous elements/lane so activations load as `float4` and weights as one `uint32`; header decoded from one shared `uint4` instead of 8 `getScaleMinK4` calls | **86.65 → 114.82 (+32.5%)** | **PASS** | **SHIPPED** |
 
 **Static evidence for the pending row** (what the dev box can prove without a GPU). SASS for `sm_75`,
 per super-block iteration of `qmatmulQ4_KKernel`:
@@ -132,23 +134,22 @@ times per super-block — together 24 of the 30 memory instructions, and neither
 That is the argument for why this attempt should behave differently from those two; only the T4 can
 settle it.
 
-### Decision rule for the pending row — agreed 2026-07-30, do not skip
+### Decision rule — RESOLVED 2026-07-30
 
-**No further GPU kernel changes until this row has a measured number.** Static evidence (30 → 7
-memory instructions) is a hypothesis about the bottleneck, not a result. Run `scripts/colab_bench.sh`
-on the T4 first, then branch on what it says:
+The rule was: no further GPU kernel changes until the row had a measured number, then branch on
+*decode improves over 86.65* → extend the re-blocking to Q6_K, or *decode does not move* → abandon
+the line and re-profile from scratch.
 
-- **Decode improves over 86.65** → the memory-instruction-issue theory is confirmed. Extend the same
-  re-blocking to the Q6_K GEMV (it is the same shape: 75% L1TEX, still on a `__shfl` broadcast for
-  `d`, still decoding scales per element).
-- **Decode does not move** → **stop this line.** Three attempts will have failed to move a kernel
-  whose instruction count provably fell 4×, which would mean MIO issue pressure is not the binding
-  constraint and the model of this kernel is wrong. Do not try a fourth variant of the same idea.
-  Re-profile from scratch (`scripts/colab_ncu_profile.sh`) and find the next dominant bottleneck
-  before writing any kernel code.
+**Measured: 114.82 tok/s, +32.5%, argmax parity held.** The memory-instruction-issue model of this
+kernel is confirmed, and the branch taken is **extend the same re-blocking to the Q6_K GEMV** — same
+shape, and per the last `ncu` run it is still at 75% L1TEX with a `__shfl` broadcast for `d` and a
+per-element scale decode.
 
-This rule exists because the same mistake has already been made twice (4637be5, a341822): a plausible
-mechanism was iterated on instead of re-measured.
+Worth keeping: the static evidence predicted the direction but **not** the size. Memory instructions
+fell 4.3× (30 → 7) and decode rose 1.33×, because the kernel was never purely issue-bound — Amdahl
+across the rest of the forward pass, and DRAM starts to matter as issue pressure drops. Instruction
+counts are a hypothesis generator, not a speedup estimate. The freeze is what made that distinction
+visible, and it is why the same rule should apply to the Q6_K attempt.
 
 ## External reference: llama.cpp
 
