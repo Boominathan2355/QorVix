@@ -338,7 +338,7 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 **Status (2026-07-30):** Phases 0–9 complete, Phase 8.5 (cross-vendor + unified engine) complete,
 Phase 10 started. **Qorvix runs correct inference on real models across three backends behind one
-seam** — CPU, CUDA (**86.65 decode tok/s measured on a Tesla T4**, argmax parity, see BENCHMARKS.md),
+seam** — CPU, CUDA (**114.82 decode tok/s measured on a Tesla T4**, argmax parity, see BENCHMARKS.md),
 and Vulkan (cross-vendor, argmax parity verified GPU-free on lavapipe, rel err 2.6e-06). Test suite:
 **131 cases / 4429 assertions green**; the CPU-only, CUDA, and Vulkan builds all compile and link.
 
@@ -446,12 +446,15 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
 
 Measurement before features — everything below is validated against `qorvix bench` / BENCHMARKS.md.
 
-1. **CUDA optimization** 🟡 — *highest priority.* Phase 8c: the Q4_K GEMV on the T4. Baseline is
-   set (86.65 tok/s @ 4ad49c8) and the re-blocked kernel is in — it needs a T4 re-run to confirm.
-   Next candidates once that number lands: the same re-blocking for Q6_K (128 GB/s, 75% L1TEX, and
-   it still uses a `__shfl` broadcast), then staging `x` in shared per block.
-2. **Vulkan optimization** 🟡 — after CUDA (device-local buffers, command-buffer reuse, subgroups).
-   The T4 Vulkan bench has never completed; get a number before tuning anything.
+1. **CUDA optimization** 🟡 — *highest priority.* Phase 8c. The Q4_K GEMV re-blocking **shipped**:
+   86.65 → **114.82 tok/s** on the T4 (+32.5%), argmax parity held. Next, per the decision rule:
+   the same re-blocking for Q6_K (75% L1TEX, still a `__shfl` broadcast for `d`, still a per-element
+   scale decode), then staging `x` in shared per block. Each behind the same measure-first gate.
+2. **Vulkan optimization** 🟡 — device-local buffers **done** (d8cb8c5: weights were in host RAM,
+   streamed over PCIe every token — invisible on lavapipe, which has one memory type flagged both
+   DEVICE_LOCAL and HOST_VISIBLE). Unmeasured: the T4 run at cfd1fa9 predates it and timed out at
+   900 s. Still open: command-buffer reuse (~377 dispatches/token, each re-allocating a descriptor
+   set), device-local KV, subgroups.
 3. **Real-hardware benchmarks** 🟡🖥️ — T4 CUDA row is filled. Still open: T4 Vulkan, and
    RTX / AMD / Intel via `scripts/colab_bench.sh`.
 4. **Batched prefill** ⬜ — measured T4 prefill (99 tok/s) is barely above decode (87), the
