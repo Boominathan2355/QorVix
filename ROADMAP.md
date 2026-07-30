@@ -407,8 +407,10 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
 - **Performance:** Vulkan kernel opt ⬜ · CUDA throughput 🟡 (Phase 8c, T4) · command-buffer reuse /
   graph replay (Vulkan) ⬜ · device-local buffers + staging ⬜ · subgroup/warp opt ⬜ · kernel
   fusion ⬜ · per-GPU autotune ⬜. *(All 🖥️ for real numbers — lavapipe perf is meaningless.)*
-- **Backends:** CUDA ✅ · Vulkan ✅ (cross-vendor) · native HIP/ROCm ⬜🖥️ · native Metal ⬜🖥️ ·
-  SYCL/OpenCL ⬜. *(Vulkan already covers AMD/Apple/Intel; native backends are a perf option.)*
+- **Backends:** CPU ✅ (all CPUs) · CUDA ✅ (NVIDIA) · Vulkan ✅ (cross-vendor: AMD/Apple/Intel/NVIDIA)
+  · native HIP/ROCm ⬜🖥️ (AMD) · native Metal ⬜🖥️ (Apple) · native SYCL/oneAPI ⬜🖥️ (Intel).
+  *(Vulkan already covers AMD/Apple/Intel functionally; the three native backends are a perf option,
+  each gated on its own hardware.)*
 - **Inference:** continuous batching ✅ (Phase 7) · paged KV ✅ (CPU) · prefix cache ✅ (`sharePrefix`)
   · scheduler ✅ · sliding-window attn ⬜ · speculative decoding ⬜ · multi-GPU 🟡 (TP math done,
   NCCL 🖥️).
@@ -432,7 +434,7 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
   active. NEON/SVE (ARM/Apple Silicon) 🟡 (kernel written, aarch64-compile-gated, hardware-unverified)
   · AVX-512 kernel ⬜ · RISC-V vector ⬜🖥️ · SIMD dequant (the actual CPU-decode bottleneck — dot is
   already SIMD) ⬜ · NUMA-aware KV/weight placement ⬜🖥️ · thread affinity / pinning ⬜🖥️.
-  *(x86 verifiable here; ARM/RISC-V/NUMA need their own hardware, like HIP/Metal on the GPU side.)*
+  *(x86 verifiable here; ARM/RISC-V/NUMA need their own hardware, like HIP/Metal/SYCL on the GPU side.)*
 - **Platform:** Linux ✅ · Windows/macOS/AMD/Intel GPU validation ⬜🖥️.
 - **Production:** model hot-swap/cache ⬜ · graceful OOM ⬜ · fault recovery ⬜ · telemetry ⬜.
 - **Empty module dirs (not started; scaffolded only when their phase begins, to keep the build free
@@ -456,8 +458,16 @@ Measurement before features — everything below is validated against `qorvix be
    signature of a token-at-a-time prefill. GEMV → GEMM for the prompt phase is a large, separate
    win that does not touch `decode_tok_per_sec`.
 5. **Documentation & release** ⬜ — publish results once numbers stabilize.
-6. **Native HIP / Metal** ⬜🖥️ — only after cross-vendor Vulkan performance stabilizes (Vulkan
-   already covers those vendors functionally).
+6. **Native vendor backends** ⬜🖥️ — the compute-backend set is CPU · CUDA · Vulkan · **HIP · Metal
+   · SYCL**, of which the last three are not started:
+   - **HIP/ROCm** ⬜🖥️ — AMD native fast path (needs an AMD GPU + ROCm).
+   - **Metal** ⬜🖥️ — Apple Silicon native fast path (needs macOS).
+   - **SYCL/oneAPI** ⬜🖥️ — Intel Arc / Xe native fast path (needs an Intel GPU + oneAPI).
+
+   All three are a *performance* option, not a coverage one: Vulkan already runs on AMD, Apple and
+   Intel functionally, which is why it was built first. None starts before cross-vendor Vulkan
+   performance stabilizes — and each needs its own hardware, so none can be verified on this box
+   (same constraint as ARM/RISC-V on the CPU side).
 
 ### Former architectural gap (now resolved by Phase 8.5)
 
