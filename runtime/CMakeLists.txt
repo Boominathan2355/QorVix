@@ -6,6 +6,7 @@ add_library(qorvix_runtime STATIC
   src/qmatmul.cpp
   src/model_config.cpp
   src/weights.cpp
+  src/encoder_weights.cpp
   src/text_model.cpp
   src/sampler.cpp
   src/generator.cpp

@@ -19,6 +19,7 @@ if(Catch2_FOUND)
     dequant_test.cpp
     qmatmul_test.cpp
     model_config_test.cpp
+    encoder_weights_test.cpp
     text_model_test.cpp
     tokenizer_test.cpp
     wordpiece_test.cpp

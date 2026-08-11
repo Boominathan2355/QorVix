@@ -54,6 +54,15 @@ inline void wmatmul(float* out, const WeightMat& w, const float* x) {
   }
 }
 
+// out[rows] = W * x[cols] + bias[rows]. An empty `bias` is exactly wmatmul — which is the path
+// nomic-bert's biasless FFN and every decoder projection take, with no per-element branch.
+inline void wmatmulBias(float* out, const WeightMat& w, const float* x,
+                        const std::vector<float>& bias) {
+  wmatmul(out, w, x);
+  if (bias.empty()) return;
+  for (int r = 0; r < w.rows; ++r) out[r] += bias[r];
+}
+
 // Writes row `r` (cols elements) of an embedding table into dst.
 inline void embeddingRow(const WeightMat& w, int r, float* dst) {
   if (w.quant) {
