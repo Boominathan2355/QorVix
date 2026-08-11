@@ -73,11 +73,46 @@ Its strongest tier needs a reference captured once from sentence-transformers:
 pip install sentence-transformers torch
 python scripts/capture_embed_reference.py BAAI/bge-small-en-v1.5 \
   > tests/data/embed_reference_bge_small_en_v15.txt
-qorvix embed-check models/bge-small-en-v1.5-f16.gguf \
-  --ref tests/data/embed_reference_bge_small_en_v15.txt
+python scripts/capture_embed_reference.py sentence-transformers/all-MiniLM-L6-v2 \
+  > tests/data/embed_reference_all_minilm_l6_v2.txt
 ```
 
 Without `--ref` the invariant and triplet-ordering tiers still run and still gate.
+
+### Measured results
+
+```sh
+qorvix embed-check models/bge-small-en-v1.5-f16.gguf \
+  --ref tests/data/embed_reference_bge_small_en_v15.txt
+# Tokenizer parity: 7/7 exact | Vector parity: min cos 1.00000 | RESULT: PASS
+
+qorvix embed-check models/all-MiniLM-L6-v2-Q4_K_M.gguf \
+  --ref tests/data/embed_reference_all_minilm_l6_v2.txt --min-cos 0.97
+# Tokenizer parity: 7/7 exact | Vector parity: min cos 0.97598 | RESULT: PASS
+```
+
+**Thresholds are set from evidence, not taste.** F16 reaches cosine 1.00000 against the fp32
+reference, so 0.999 flags real bugs and nothing else. Q4_K_M costs real accuracy — measured
+per probe:
+
+| probe | cos |
+|---|---|
+| "hello world" (4 tok) | 0.99013 |
+| "The capital of France is Paris." (9 tok) | 0.99424 |
+| "Café naïve résumé" (5 tok) | 0.99282 |
+| "antidisestablishmentarianism" (10 tok) | 0.98658 |
+| "query: what is machine learning?" (9 tok) | 0.99298 |
+| long paragraph (522 tok, truncated) | 0.98610 |
+| **empty string (2 tok)** | **0.97598** |
+
+Real text sits at 0.986–0.994. The outlier is the empty string, which is `[CLS] [SEP]` and
+nothing else: with mean pooling over two tokens, quantization noise has no other tokens to average
+against. That is a property of 4-bit weights on a degenerate input, not an encoder bug — so
+`--min-cos 0.97` is the honest gate for Q4_K_M, and the probe stays in the fixture because it also
+verifies an empty input does not crash.
+
+`embed-check` prints the full per-probe breakdown whenever the vector tier fails, so a future
+regression names which input moved rather than reporting one aggregate number.
 
 ### What these files actually contain
 

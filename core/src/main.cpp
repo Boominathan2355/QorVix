@@ -402,6 +402,11 @@ struct EmbedReference {
   int dim = 0;
   std::string pooling = "cls";
   bool normalize = true;
+  // The reference implementation's own truncation limit, which is NOT always the GGUF's context
+  // length: sentence-transformers caps all-MiniLM-L6-v2 at 256 in its config while the model (and
+  // the GGUF) support 512. Comparing a 512-token vector against a 256-token one would report a
+  // difference that is a configuration mismatch, not an encoder bug.
+  int maxSeqLen = 0;
   std::vector<std::string> texts;
   std::vector<std::vector<int>> ids;
   std::vector<std::vector<float>> vecs;
@@ -425,6 +430,8 @@ bool loadEmbedReference(const std::string& path, EmbedReference& ref, std::strin
       ls >> ref.dim;
     } else if (key == "pooling") {
       ls >> ref.pooling;
+    } else if (key == "max_seq_len") {
+      ls >> ref.maxSeqLen;
     } else if (key == "normalize") {
       int n = 1;
       ls >> n;
@@ -485,10 +492,17 @@ int cmdEmbedCheck(const std::vector<std::string_view>& args) {
               << qorvix::runtime::poolingName(engine->defaultPooling()) << ", ctx "
               << engine->maxSeqLen() << "\n\n";
 
-    auto embedText = [&](const std::string& text, std::vector<float>& out) {
-      const std::vector<int> ids = truncateForEncoder(
-          tok->encode(text, true), static_cast<int>(engine->maxSeqLen()), tok->special().sep);
+    // Truncation limit for this run. The reference's own limit wins when it is lower, so the two
+    // implementations see the same token sequence.
+    int seqCap = static_cast<int>(engine->maxSeqLen());
+
+    auto embedTextAt = [&](const std::string& text, int cap, std::vector<float>& out) {
+      const std::vector<int> ids =
+          truncateForEncoder(tok->encode(text, true), cap, tok->special().sep);
       return engine->embed(ids, out, err);
+    };
+    auto embedText = [&](const std::string& text, std::vector<float>& out) {
+      return embedTextAt(text, seqCap, out);
     };
 
     bool pass = true;
@@ -510,10 +524,25 @@ int cmdEmbedCheck(const std::vector<std::string_view>& args) {
                   << " — wrong fixture for this model.\n\nRESULT: MISMATCH\n";
         return 1;
       }
+      const std::string ourPooling = qorvix::runtime::poolingName(engine->defaultPooling());
+      if (ref.pooling != ourPooling) {
+        std::cout << "Reference pooling '" << ref.pooling << "' != model pooling '" << ourPooling
+                  << "' — comparing these would report an encoder bug that does not exist.\n\n"
+                  << "RESULT: MISMATCH\n";
+        return 1;
+      }
+      if (ref.maxSeqLen > 0 && ref.maxSeqLen < seqCap) {
+        std::cout << "note: truncating to the reference's " << ref.maxSeqLen
+                  << "-token limit (model allows " << seqCap << ")\n\n";
+        seqCap = ref.maxSeqLen;
+      }
       int tokOk = 0;
       std::string tokWorst;
       for (std::size_t i = 0; i < ref.texts.size(); ++i) {
-        const std::vector<int> got = tok->encode(ref.texts[i], true);
+        // Truncate the same way the capture did, or the long probe reports a mismatch that is
+        // an artefact of where each side cut the sequence.
+        const std::vector<int> got =
+            truncateForEncoder(tok->encode(ref.texts[i], true), seqCap, tok->special().sep);
         if (got == ref.ids[i]) {
           ++tokOk;
         } else if (tokWorst.empty()) {
@@ -528,6 +557,7 @@ int cmdEmbedCheck(const std::vector<std::string_view>& args) {
 
       float worstCos = 2.0f;
       std::string worstText;
+      std::vector<std::pair<std::string, float>> perProbe;
       for (std::size_t i = 0; i < ref.texts.size(); ++i) {
         std::vector<float> v;
         if (!embedText(ref.texts[i], v)) {
@@ -536,16 +566,29 @@ int cmdEmbedCheck(const std::vector<std::string_view>& args) {
           continue;
         }
         const float c = qorvix::runtime::ops::cosineSimilarity(v.data(), ref.vecs[i].data(), d);
+        perProbe.emplace_back(ref.texts[i], c);
         if (c < worstCos) {
           worstCos = c;
           worstText = ref.texts[i];
         }
       }
+      const bool vecPass = worstCos >= minCos;
       std::cout << std::fixed << std::setprecision(5)
                 << "Vector parity vs reference:      min cos " << worstCos << "  (worst: \""
-                << worstText << "\")\n"
-                << std::defaultfloat;
-      if (worstCos < minCos) pass = false;
+                << worstText << "\")\n";
+      // On failure, show every probe. The fixture is built so each string isolates one cause, and
+      // that only pays off if a failure names which one — "min cos 0.976" alone does not say
+      // whether one degenerate input or the whole encoder is off.
+      if (!vecPass) {
+        for (const auto& [text, c] : perProbe) {
+          std::string label = text.size() > 44 ? text.substr(0, 41) + "..." : text;
+          if (label.empty()) label = "(empty string)";
+          std::cout << "    " << (c < minCos ? "FAIL " : "ok   ") << std::setw(8) << c << "  \""
+                    << label << "\" (" << tok->encode(text, true).size() << " tok)\n";
+        }
+      }
+      std::cout << std::defaultfloat;
+      if (!vecPass) pass = false;
     } else {
       std::cout << "Tokenizer parity:                SKIPPED (no --ref fixture)\n"
                 << "Vector parity vs reference:      SKIPPED (no --ref fixture)\n";

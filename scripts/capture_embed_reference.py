@@ -48,15 +48,32 @@ def main() -> int:
 
     model = SentenceTransformer(name)
     tok = model.tokenizer
-    pooling = "cls"
+    # sentence-transformers >= 3 exposes a single `pooling_mode` string; older versions used
+    # boolean pooling_mode_* flags. Read both, and fail loudly rather than defaulting — a fixture
+    # that silently claims the wrong pooling would make embed-check compare cls against mean and
+    # report an encoder bug that does not exist.
+    pooling = None
     for mod in model.modules():
-        if type(mod).__name__ == "Pooling":
-            if getattr(mod, "pooling_mode_mean_tokens", False):
-                pooling = "mean"
-            elif getattr(mod, "pooling_mode_cls_token", False):
-                pooling = "cls"
-            break
+        if type(mod).__name__ != "Pooling":
+            continue
+        mode = getattr(mod, "pooling_mode", None)
+        if mode:
+            pooling = str(mode)
+        elif getattr(mod, "pooling_mode_mean_tokens", False):
+            pooling = "mean"
+        elif getattr(mod, "pooling_mode_cls_token", False):
+            pooling = "cls"
+        break
+    if pooling not in ("mean", "cls", "lasttoken"):
+        raise SystemExit(f"could not determine pooling mode (got {pooling!r})")
+    if pooling == "lasttoken":
+        pooling = "last"
 
+    # Truncate the recorded ids exactly as the model truncates internally when encoding. Calling
+    # the tokenizer bare returns the FULL sequence (522 tokens for the long probe), while the
+    # vector beside it was computed from the first 512 — so an untruncated id row would make the
+    # tokenizer tier report a mismatch that is an artefact of the capture, not a real difference.
+    max_len = model.max_seq_length
     vecs = model.encode(TEXTS, normalize_embeddings=True, convert_to_numpy=True)
 
     print("# qorvix embedding reference fixture v1")
@@ -70,8 +87,9 @@ def main() -> int:
     print(f"dim {vecs.shape[1]}")
     print(f"pooling {pooling}")
     print("normalize 1")
+    print(f"max_seq_len {max_len}")
     for text, vec in zip(TEXTS, vecs):
-        ids = tok(text)["input_ids"]
+        ids = tok(text, truncation=True, max_length=max_len)["input_ids"]
         print(f"text {text}")
         print("ids " + " ".join(str(i) for i in ids))
         print("vec " + " ".join(f"{v:.8g}" for v in vec))

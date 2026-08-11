@@ -32,16 +32,25 @@ bool qmatmul(float* out, const void* weight, std::uint32_t ggmlType, const float
   const std::size_t rowBytes = static_cast<std::size_t>(nBlocks) * traits->typeSize;
   const auto* base = static_cast<const std::uint8_t*>(weight);
 
+  // Fill the scratch buffer with as many WHOLE BLOCKS as it holds, rather than one block per
+  // call. For the K-quants (blockSize 256) this is the same single block as before, but the
+  // small-block types were pathological: F16 and BF16 have blockSize 1, so a 384-column row meant
+  // 384 dequantize() dispatches and 384 dot-product calls of length ONE — the SIMD kernel never
+  // engaged, and per-call overhead dominated entirely. An F16 bge-small embed spent 5.5 s on four
+  // tokens because of it. Batching to 256 elements cuts both call counts by 256x and lets
+  // dotProductF32 reach its vector path.
+  const int elemsPerBatch = (kMaxBlock / blockSize) * blockSize;  // <= 256, a multiple of blockSize
+
 #pragma omp parallel for schedule(static)
   for (int r = 0; r < rows; ++r) {
     const std::uint8_t* rowPtr = base + static_cast<std::size_t>(r) * rowBytes;
     float buf[kMaxBlock];
     float acc = 0.0f;
-    for (int b = 0; b < nBlocks; ++b) {
-      // Dequantize one block into the stack buffer, then fold it into the running dot product.
-      dequantize(ggmlType, rowPtr + static_cast<std::size_t>(b) * traits->typeSize, buf, blockSize);
-      const float* xb = x + static_cast<std::size_t>(b) * blockSize;
-      acc += vecDotF32(buf, xb, blockSize);
+    for (int e = 0; e < cols; e += elemsPerBatch) {
+      const int n = cols - e < elemsPerBatch ? cols - e : elemsPerBatch;
+      const std::size_t byteOff = static_cast<std::size_t>(e / blockSize) * traits->typeSize;
+      dequantize(ggmlType, rowPtr + byteOff, buf, static_cast<std::size_t>(n));
+      acc += vecDotF32(buf, x + e, n);
     }
     out[r] = acc;
   }
