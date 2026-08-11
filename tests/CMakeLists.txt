@@ -21,6 +21,7 @@ if(Catch2_FOUND)
     model_config_test.cpp
     text_model_test.cpp
     tokenizer_test.cpp
+    wordpiece_test.cpp
     sampler_test.cpp
     generator_test.cpp
     scheduler_test.cpp
