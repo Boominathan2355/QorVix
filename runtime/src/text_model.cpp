@@ -56,6 +56,15 @@ std::optional<TextModel> TextModel::fromGguf(gguf::GgufFile file, std::string& e
                                             std::uint32_t maxSeqLen, std::uint32_t maxSessions) {
   ModelConfig cfg = configFromGguf(file, error);
   if (!cfg.valid()) return std::nullopt;
+  // Encoders reach here through cmdGpuCheck/cmdVulkanCheck, which call configFromGguf +
+  // loadWeights directly rather than going through createEngine. Without this guard, widening the
+  // arch allowlist to accept 'bert' turns a clear rejection into a confusing "missing tensor
+  // 'output_norm.weight'" from deep inside the weight loader.
+  if (cfg.isEncoder()) {
+    error = "'" + cfg.architecture +
+            "' is an encoder model with no LM head — use `qorvix embed`, not the generation path";
+    return std::nullopt;
+  }
   auto weights = loadWeights(file, cfg, error);  // borrows pointers into file's mmap
   if (!weights) return std::nullopt;
 

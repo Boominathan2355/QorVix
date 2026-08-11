@@ -200,17 +200,29 @@ int cmdModelInfo(const std::string& path) {
       std::cerr << "error: " << (err.empty() ? "could not derive model config" : err) << "\n";
       return 1;
     }
-    std::cout << "Architecture:      " << cfg.architecture << "\n"
+    std::cout << "Architecture:      " << cfg.architecture
+              << (cfg.isEncoder() ? "  (encoder / embeddings)" : "  (decoder / generation)") << "\n"
               << "Vocab size:        " << cfg.vocabSize << "\n"
               << "Context length:    " << cfg.contextLength << "\n"
               << "Embedding (d_model): " << cfg.embeddingLength << "\n"
               << "Layers:            " << cfg.blockCount << "\n"
               << "FFN hidden:        " << cfg.feedForwardLength << "\n"
               << "Attention heads:   " << cfg.headCount << " (kv " << cfg.headCountKv << ", head_dim "
-              << cfg.headDim() << ")\n"
-              << "RoPE:              dim=" << cfg.ropeDimensionCount << " freq_base="
-              << cfg.ropeFreqBase << "\n"
-              << "RMSNorm eps:       " << cfg.normEpsilon << "\n";
+              << cfg.headDim() << ")\n";
+    if (cfg.isEncoder()) {
+      std::cout << "Attention:         bidirectional, "
+                << (cfg.attnBias ? "q/k/v/o carry bias" : "no bias") << "\n"
+                << "Position:          "
+                << (cfg.hasPositionEmbd ? "learned table" : "rope") << "\n"
+                << "FFN:               " << (cfg.ffnGated ? "gated" : "single") << ", GELU\n"
+                << "Token types:       " << cfg.tokenTypeCount << "\n"
+                << "Pooling:           " << qorvix::runtime::poolingName(cfg.pooling) << "\n"
+                << "LayerNorm eps:     " << cfg.normEpsilon << "\n";
+    } else {
+      std::cout << "RoPE:              dim=" << cfg.ropeDimensionCount << " freq_base="
+                << cfg.ropeFreqBase << "\n"
+                << "RMSNorm eps:       " << cfg.normEpsilon << "\n";
+    }
     return 0;
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";

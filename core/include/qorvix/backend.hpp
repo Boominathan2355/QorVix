@@ -173,6 +173,13 @@ inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, 
     if (err.empty()) err = "invalid model config";
     return nullptr;
   }
+  // The CPU path is guarded inside TextModel::fromGguf; guard the device paths here, before
+  // loadWeights goes looking for tensors an encoder does not have.
+  if (cfg.isEncoder()) {
+    err = "'" + cfg.architecture +
+          "' is an encoder model with no LM head — use `qorvix embed`, not the generation path";
+    return nullptr;
+  }
   auto weights = rt::loadWeights(file, cfg, err);
   if (!weights) return nullptr;
 
