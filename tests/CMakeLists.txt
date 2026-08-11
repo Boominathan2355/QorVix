@@ -20,6 +20,7 @@ if(Catch2_FOUND)
     qmatmul_test.cpp
     model_config_test.cpp
     encoder_weights_test.cpp
+    bert_model_test.cpp
     text_model_test.cpp
     tokenizer_test.cpp
     wordpiece_test.cpp
@@ -33,7 +34,7 @@ if(Catch2_FOUND)
   )
   target_link_libraries(qorvix_tests PRIVATE
     qorvix_core qorvix_gguf qorvix_memory qorvix_cuda qorvix_runtime qorvix_tokenizer
-    qorvix_scheduler qorvix_api Catch2::Catch2WithMain)
+    qorvix_scheduler qorvix_api qorvix_embeddings Catch2::Catch2WithMain)
 
   # The plugin test dlopen's the real example plugin; hand it the built library path and make
   # sure that library is built before the tests run.

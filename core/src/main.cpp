@@ -27,6 +27,7 @@
 #include "qorvix/runtime/dequant.hpp"
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
+#include "qorvix/runtime/pooling.hpp"
 #include "qorvix/runtime/text_model.hpp"
 #include "qorvix/runtime/weights.hpp"
 #include "qorvix/scheduler/scheduler.hpp"
@@ -366,6 +367,109 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
     }
     const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
     return runGenerate(*engine, *tok, prompt, cfg, loadSec);
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
+// Truncates a token sequence to the encoder's limit, keeping the closing [SEP]. Dropping the tail
+// outright would leave the sequence unterminated, which shifts the vector on a CLS-pooled model
+// (every layer attends to [SEP]) — so the last slot is overwritten rather than lost.
+std::vector<int> truncateForEncoder(std::vector<int> ids, int maxSeq, int sepId) {
+  if (static_cast<int>(ids.size()) <= maxSeq) return ids;
+  ids.resize(maxSeq);
+  if (sepId >= 0) ids.back() = sepId;
+  return ids;
+}
+
+int cmdEmbed(const std::vector<std::string_view>& args) {
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string text = flagValue(args, "--text");
+  if (path.empty() || text.empty()) {
+    std::cerr << "usage: qorvix embed <file.gguf> --text \"...\" "
+                 "[--pooling mean|cls|last] [--no-normalize] [--dims N] [--json]\n";
+    return 1;
+  }
+  const bool json = hasFlag(args, "--json");
+  const bool normalize = !hasFlag(args, "--no-normalize");
+  int dims = 0;
+  if (auto v = flagValue(args, "--dims"); !v.empty()) dims = std::stoi(v);
+
+  const qorvix::Backend backend = backendFromArgs(args);
+  try {
+    using clock = std::chrono::steady_clock;
+    const auto tLoad0 = clock::now();
+    auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    // Tokenizer first (it copies the vocab out), then the file moves into the engine, which keeps
+    // it mapped for the borrowed quantized weights.
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) {
+      std::cerr << "error: tokenizer: " << err << "\n";
+      return 1;
+    }
+    auto engine = qorvix::createEmbeddingEngine(backend, std::move(file), 0, err);
+    if (!engine) {
+      std::cerr << "error: " << qorvix::backendName(backend) << " embedding engine: " << err << "\n";
+      return 1;
+    }
+    const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+    qorvix::runtime::PoolingType pooling = engine->defaultPooling();
+    if (auto v = flagValue(args, "--pooling"); !v.empty()) {
+      if (!qorvix::runtime::parsePooling(v, pooling)) {
+        std::cerr << "error: unknown pooling '" << v << "' (expected mean, cls, or last)\n";
+        return 1;
+      }
+    }
+
+    const std::vector<int> ids = truncateForEncoder(
+        tok->encode(text, true), static_cast<int>(engine->maxSeqLen()), tok->special().sep);
+
+    const auto tRun0 = clock::now();
+    std::vector<float> vec;
+    if (!engine->embedWith(ids, pooling, normalize, vec, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    const double runSec = std::chrono::duration<double>(clock::now() - tRun0).count();
+
+    // Matryoshka truncation: only meaningful for models trained for it (bge-m3, nomic v1.5), but
+    // clients send it regardless, so honour it rather than erroring.
+    if (dims > 0 && dims < static_cast<int>(vec.size())) {
+      vec.resize(dims);
+      if (normalize) qorvix::runtime::ops::l2Normalize(vec.data(), static_cast<int>(vec.size()));
+    }
+
+    if (json) {
+      std::cout << "[";
+      for (std::size_t i = 0; i < vec.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << vec[i];
+      }
+      std::cout << "]\n";
+      return 0;
+    }
+
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "model:    " << engine->config().architecture << " (" << engine->backendName()
+              << ")\n"
+              << "tokens:   " << ids.size() << " / " << engine->maxSeqLen() << "\n"
+              << "pooling:  " << qorvix::runtime::poolingName(pooling)
+              << (normalize ? ", L2-normalized" : ", unnormalized") << "\n"
+              << "dim:      " << vec.size() << "\n"
+              << "L2 norm:  " << qorvix::runtime::ops::l2Norm(vec.data(),
+                                                              static_cast<int>(vec.size()))
+              << "\n"
+              << "first 8:  [";
+    for (std::size_t i = 0; i < vec.size() && i < 8; ++i) {
+      if (i) std::cout << ", ";
+      std::cout << vec[i];
+    }
+    std::cout << (vec.size() > 8 ? ", ...]\n" : "]\n");
+    std::cout << std::defaultfloat << "[load " << loadSec << "s | embed " << runSec << "s]\n";
+    return 0;
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;
@@ -971,6 +1075,9 @@ int printUsage() {
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
             << "  generate <file> --prompt \"...\" [--gpu|--vulkan|--auto]  Generate text\n"
+            << "  embed <file> --text \"...\"       Embed text with an encoder model (bert)\n"
+            << "                                  [--pooling mean|cls|last] [--no-normalize]\n"
+            << "                                  [--dims N] [--json]\n"
             << "  serve <file> [--gpu|--vulkan|--auto] [--port N]  OpenAI-compatible HTTP server\n"
             << "                                  (default port " << qorvix::ports::kRuntime
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
@@ -1007,6 +1114,7 @@ int main(int argc, char** argv) {
   if (command == "gguf-info") return cmdGgufInfo(arg1);
   if (command == "model-info") return cmdModelInfo(arg1);
   if (command == "generate") return cmdGenerate(args);
+  if (command == "embed") return cmdEmbed(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();

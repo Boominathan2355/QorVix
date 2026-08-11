@@ -8,6 +8,8 @@
 
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
+#include "qorvix/embeddings/bert_model.hpp"
+#include "qorvix/embeddings/embedding_engine.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/gpu_engine.hpp"
 #include "qorvix/runtime/dequant.hpp"
@@ -23,6 +25,11 @@
 // runtime::IInferenceEngine seam, and createEngine() is the single place that builds one from a
 // GGUF file. `generate`, `serve`, and the *-check commands all go through this — there is no
 // per-backend branching or parallel generation loop anywhere above this header.
+//
+// Phase 11a adds a SECOND seam alongside it: embeddings::IEmbeddingEngine, built by
+// createEmbeddingEngine(). One seam per task, one factory per seam — the invariant being kept is
+// "no parallel path", not "one interface for everything" (see embedding_engine.hpp for why an
+// encoder cannot implement the generation seam).
 namespace qorvix {
 
 enum class Backend { Cpu, Cuda, Vulkan };
@@ -193,6 +200,29 @@ inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, 
                              static_cast<int>(maxSessions));
   if (!vm) return nullptr;
   return std::make_unique<VulkanEngine>(std::move(vm), cfg, maxSeq);
+}
+
+// THE construction point for encoders — the embedding twin of createEngine(). Two seams, two
+// factories: an encoder's unit of work is `tokens[N] -> vector[d]`, which IInferenceEngine cannot
+// express (see embedding_engine.hpp). There is still no parallel path — `embed`, `embed-check`,
+// `serve --embed-model` and the RAG commands all come through here.
+//
+// Phase 11a implements Backend::Cpu only. The device backends report honestly rather than
+// silently falling back to CPU, because a silent fallback would make `--gpu` a lie in the logs.
+inline std::unique_ptr<embeddings::IEmbeddingEngine> createEmbeddingEngine(
+    Backend backend, gguf::GgufFile file, std::uint32_t maxSeq, std::string& err) {
+  if (!backendAvailable(backend)) {
+    err = std::string(backendName(backend)) + " backend unavailable (not built in, or no device)";
+    return nullptr;
+  }
+  if (backend != Backend::Cpu) {
+    err = std::string(backendName(backend)) +
+          " embedding backend is not implemented yet — use the CPU path";
+    return nullptr;
+  }
+  auto m = embeddings::BertModel::fromGguf(std::move(file), err, maxSeq);
+  if (!m) return nullptr;
+  return std::make_unique<embeddings::BertModel>(std::move(*m));
 }
 
 }  // namespace qorvix
