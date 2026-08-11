@@ -6,69 +6,13 @@
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/runtime/dequant.hpp"
 
+#include "weights_detail.hpp"
+
 namespace qorvix::runtime {
 
-namespace {
-
-// Resolves a tensor's raw bytes inside the file's mmap. Sets error and returns nullptr if the
-// tensor is missing, the element count is wrong, or the file wasn't memory-mapped.
-const std::uint8_t* tensorBytes(const gguf::GgufFile& file, const std::string& name,
-                                std::size_t expectElements, const gguf::GgufTensor** outT,
-                                std::string& error) {
-  const gguf::GgufTensor* t = file.tensor(name);
-  if (!t) {
-    error = "missing tensor '" + name + "'";
-    return nullptr;
-  }
-  if (t->nElements != expectElements) {
-    error = "tensor '" + name + "' has " + std::to_string(t->nElements) + " elements, expected " +
-            std::to_string(expectElements);
-    return nullptr;
-  }
-  const auto all = file.mapping().bytes();
-  const std::uint64_t start = file.dataOffset() + t->offset;
-  if (all.empty() || start + t->nBytes > all.size()) {
-    error = "tensor '" + name + "' data is out of range (file not opened via mmap?)";
-    return nullptr;
-  }
-  *outT = t;
-  return reinterpret_cast<const std::uint8_t*>(all.data()) + start;
-}
-
-// Borrows a matmul weight [rows, cols] straight from the mmap, keeping it quantized.
-bool loadMat(const gguf::GgufFile& file, const std::string& name, int rows, int cols,
-             WeightMat& out, std::string& error) {
-  const gguf::GgufTensor* t = nullptr;
-  const std::uint8_t* ptr =
-      tensorBytes(file, name, static_cast<std::size_t>(rows) * cols, &t, error);
-  if (!ptr) return false;
-  if (!qmatmulSupports(t->typeRaw)) {
-    error = "tensor '" + name + "' uses unsupported type " + t->typeName();
-    return false;
-  }
-  out = WeightMat::quantized(ptr, t->typeRaw, rows, cols);
-  return true;
-}
-
-// Copies a small norm/bias vector, dequantizing to F32 (norms are F32 in practice).
-bool loadVec(const gguf::GgufFile& file, const std::string& name, int n, std::vector<float>& out,
-             std::string& error) {
-  const gguf::GgufTensor* t = nullptr;
-  const std::uint8_t* ptr = tensorBytes(file, name, static_cast<std::size_t>(n), &t, error);
-  if (!ptr) return false;
-  if (!canDequantize(t->typeRaw)) {
-    error = "tensor '" + name + "' uses unsupported type " + t->typeName();
-    return false;
-  }
-  out.resize(n);
-  return dequantize(t->typeRaw, ptr, out.data(), static_cast<std::size_t>(n));
-}
-
-std::string blk(int i, const char* suffix) {
-  return "blk." + std::to_string(i) + "." + suffix;
-}
-
-}  // namespace
+using detail::blk;
+using detail::loadMat;
+using detail::loadVec;
 
 std::optional<Weights> loadWeights(const gguf::GgufFile& file, const ModelConfig& cfg,
                                    std::string& error) {
