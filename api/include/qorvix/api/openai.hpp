@@ -8,7 +8,8 @@
 
 // OpenAI-compatible request/response schema mapping (SPEC "OpenAI Compatible API"). Pure
 // JSON <-> struct translation with no runtime coupling — the server (core) bridges these structs
-// to the scheduler. Covers /v1/models, /v1/chat/completions, /v1/completions (streaming + not).
+// to the scheduler. Covers /v1/models, /v1/chat/completions, /v1/completions (streaming + not),
+// and /v1/embeddings.
 namespace qorvix::api {
 
 struct ChatMessage {
@@ -72,6 +73,24 @@ std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages
 // One of: "chatml", "llama3", "gemma", "phi3", "zephyr", "mistral", "generic".
 std::string detectChatTemplateFamily(const std::string& chatTemplate);
 
+// POST /v1/embeddings. `input` accepts four shapes in the OpenAI schema — a string, an array of
+// strings, an array of ints (ONE pre-tokenized sequence), and an array of int arrays — so text and
+// token inputs are collected separately rather than forced into one field.
+struct EmbeddingsRequest {
+  bool valid = false;
+  std::string model;
+  std::vector<std::string> input;             // text inputs
+  std::vector<std::vector<int>> inputTokens;  // pre-tokenized inputs
+  std::string encodingFormat = "float";       // "float" | "base64"
+  int dimensions = 0;                         // 0 = model default (Matryoshka truncation)
+  std::string user;
+
+  // Total inputs across both forms, in request order (texts first, then token sequences).
+  std::size_t count() const { return input.size() + inputTokens.size(); }
+};
+
+EmbeddingsRequest parseEmbeddingsRequest(const json::Value& body, std::string& error);
+
 // ---- responses (return JSON values; the server serializes + frames them) -------------------
 
 json::Value modelsResponse(const std::vector<std::string>& modelIds);
@@ -88,6 +107,17 @@ json::Value completion(const std::string& id, const std::string& model, const st
                        int promptTokens, int completionTokens, const std::string& finishReason);
 json::Value completionChunk(const std::string& id, const std::string& model,
                             const std::string& text, const std::string& finishReason);
+
+// One "data" entry per vector, in request order. Embeddings usage carries only prompt_tokens and
+// total_tokens — there is no completion half — so it does not reuse the chat usage object.
+// `base64` emits each vector as little-endian float32 then base64, which is what OpenAI's own
+// Python SDK requests BY DEFAULT; without it the most common client gets numbers it cannot read.
+json::Value embeddingsResponse(const std::string& model,
+                               const std::vector<std::vector<float>>& vectors, int promptTokens,
+                               bool base64 = false);
+
+// Little-endian float32 bytes, base64-encoded. Exposed for tests and for the server's own use.
+std::string embeddingsBase64(const std::vector<float>& v);
 
 json::Value errorResponse(const std::string& message, const std::string& type = "invalid_request_error");
 

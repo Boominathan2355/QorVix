@@ -1,5 +1,8 @@
 #include "qorvix/api/openai.hpp"
 
+#include <cstdint>
+#include <cstring>
+
 namespace qorvix::api {
 
 namespace {
@@ -170,7 +173,79 @@ json::Value modelsResponse(const std::vector<std::string>& modelIds) {
   return root;
 }
 
+EmbeddingsRequest parseEmbeddingsRequest(const json::Value& body, std::string& error) {
+  EmbeddingsRequest req;
+  if (!body.isObject()) {
+    error = "request body must be a JSON object";
+    return req;
+  }
+  const auto* input = body.get("input");
+  if (!input) {
+    error = "'input' is required";
+    return req;
+  }
+
+  if (input->isString()) {
+    req.input.push_back(input->asString());
+  } else if (input->isArray() && input->size() > 0) {
+    // Disambiguate the three array shapes by the first element's type.
+    const auto& first = input->items()[0];
+    if (first.isString()) {
+      for (const auto& e : input->items()) {
+        if (!e.isString()) {
+          error = "'input' array must be all strings";
+          return req;
+        }
+        req.input.push_back(e.asString());
+      }
+    } else if (first.isNumber()) {
+      std::vector<int> ids;
+      for (const auto& e : input->items()) {
+        if (!e.isNumber()) {
+          error = "'input' array must be all token ids";
+          return req;
+        }
+        ids.push_back(e.asInt(0));
+      }
+      req.inputTokens.push_back(std::move(ids));
+    } else if (first.isArray()) {
+      for (const auto& row : input->items()) {
+        if (!row.isArray()) {
+          error = "'input' array must be all token-id arrays";
+          return req;
+        }
+        std::vector<int> ids;
+        for (const auto& e : row.items()) ids.push_back(e.asInt(0));
+        req.inputTokens.push_back(std::move(ids));
+      }
+    } else {
+      error = "'input' must be a string, array of strings, or token ids";
+      return req;
+    }
+  }
+
+  if (req.count() == 0) {
+    error = "'input' must be a non-empty string, array of strings, or array of token ids";
+    return req;
+  }
+
+  if (const auto* v = body.get("model")) req.model = v->asString();
+  if (const auto* v = body.get("user")) req.user = v->asString();
+  if (const auto* v = body.get("dimensions")) req.dimensions = v->asInt(0);
+  if (const auto* v = body.get("encoding_format")) {
+    const std::string fmt = v->asString();
+    if (fmt != "float" && fmt != "base64") {
+      error = "'encoding_format' must be \"float\" or \"base64\"";
+      return req;
+    }
+    req.encodingFormat = fmt;
+  }
+  req.valid = true;
+  return req;
+}
+
 namespace {
+
 json::Value usage(int prompt, int completion) {
   json::Value u = json::Value::object();
   u["prompt_tokens"] = prompt;
@@ -178,7 +253,75 @@ json::Value usage(int prompt, int completion) {
   u["total_tokens"] = prompt + completion;
   return u;
 }
+
+// Embeddings usage has no completion half, so this is a separate object rather than usage(n, 0) —
+// emitting "completion_tokens": 0 would be a field the OpenAI schema does not define here.
+json::Value embeddingUsage(int prompt) {
+  json::Value u = json::Value::object();
+  u["prompt_tokens"] = prompt;
+  u["total_tokens"] = prompt;
+  return u;
+}
+
 }  // namespace
+
+std::string embeddingsBase64(const std::vector<float>& v) {
+  static const char* kAlphabet =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  // OpenAI's base64 form is the raw little-endian float32 buffer. Serialize explicitly rather
+  // than memcpy'ing the vector, so the output is byte-identical on a big-endian host.
+  std::string raw;
+  raw.reserve(v.size() * 4);
+  for (float f : v) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    raw.push_back(static_cast<char>(bits & 0xFF));
+    raw.push_back(static_cast<char>((bits >> 8) & 0xFF));
+    raw.push_back(static_cast<char>((bits >> 16) & 0xFF));
+    raw.push_back(static_cast<char>((bits >> 24) & 0xFF));
+  }
+
+  std::string out;
+  out.reserve(((raw.size() + 2) / 3) * 4);
+  for (std::size_t i = 0; i < raw.size(); i += 3) {
+    const std::uint32_t b0 = static_cast<unsigned char>(raw[i]);
+    const std::uint32_t b1 = i + 1 < raw.size() ? static_cast<unsigned char>(raw[i + 1]) : 0;
+    const std::uint32_t b2 = i + 2 < raw.size() ? static_cast<unsigned char>(raw[i + 2]) : 0;
+    const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+    out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+    out.push_back(i + 1 < raw.size() ? kAlphabet[(triple >> 6) & 0x3F] : '=');
+    out.push_back(i + 2 < raw.size() ? kAlphabet[triple & 0x3F] : '=');
+  }
+  return out;
+}
+
+json::Value embeddingsResponse(const std::string& model,
+                               const std::vector<std::vector<float>>& vectors, int promptTokens,
+                               bool base64) {
+  json::Value root = json::Value::object();
+  root["object"] = "list";
+  json::Value data = json::Value::array();
+  for (std::size_t i = 0; i < vectors.size(); ++i) {
+    json::Value e = json::Value::object();
+    e["object"] = "embedding";
+    e["index"] = static_cast<int>(i);
+    if (base64) {
+      e["embedding"] = embeddingsBase64(vectors[i]);
+    } else {
+      json::Value arr = json::Value::array();
+      // json::Value has no float ctor; float promotes to double, and dump()'s %.10g round-trips
+      // float32 exactly (float needs 9 significant digits).
+      for (float x : vectors[i]) arr.push(json::Value(static_cast<double>(x)));
+      e["embedding"] = std::move(arr);
+    }
+    data.push(std::move(e));
+  }
+  root["data"] = std::move(data);
+  root["model"] = model;
+  root["usage"] = embeddingUsage(promptTokens);
+  return root;
+}
 
 json::Value chatCompletion(const std::string& id, const std::string& model,
                            const std::string& content, int promptTokens, int completionTokens,

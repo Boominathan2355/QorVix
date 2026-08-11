@@ -159,3 +159,124 @@ TEST_CASE("empty role defaults to user in every family", "[openai][chat]") {
   REQUIRE(buildChatPromptWithTemplate(msgs, "<|im_start|>").find("<|im_start|>user\n") == 0);
   REQUIRE(buildChatPromptWithTemplate(msgs, "<|user|>{{eos_token}}").find("<|user|>\n") == 0);
 }
+
+// ---- /v1/embeddings (Phase 11a) --------------------------------------------------------------
+
+namespace {
+qorvix::api::EmbeddingsRequest parseEmb(const std::string& body, std::string& err) {
+  const auto v = json::parse(body);
+  REQUIRE(v.has_value());
+  return parseEmbeddingsRequest(*v, err);
+}
+}  // namespace
+
+TEST_CASE("parse embeddings request accepts a bare string", "[openai]") {
+  std::string err;
+  const auto req = parseEmb(R"({"model":"bge","input":"hello world"})", err);
+  REQUIRE(req.valid);
+  REQUIRE(err.empty());
+  REQUIRE(req.model == "bge");
+  REQUIRE(req.input.size() == 1);
+  REQUIRE(req.input[0] == "hello world");
+  REQUIRE(req.inputTokens.empty());
+  REQUIRE(req.count() == 1);
+  REQUIRE(req.encodingFormat == "float");
+  REQUIRE(req.dimensions == 0);
+}
+
+TEST_CASE("parse embeddings request accepts an array of strings", "[openai]") {
+  std::string err;
+  const auto req = parseEmb(R"({"input":["a","b","c"]})", err);
+  REQUIRE(req.valid);
+  REQUIRE(req.input.size() == 3);
+  REQUIRE(req.input[2] == "c");
+}
+
+TEST_CASE("parse embeddings request accepts one pre-tokenized sequence", "[openai]") {
+  // OpenAI allows a flat int array, meaning ONE sequence — not N single-token sequences. Getting
+  // that wrong would silently turn a 5-token document into 5 one-token embeddings.
+  std::string err;
+  const auto req = parseEmb(R"({"input":[101,7592,2088,102]})", err);
+  REQUIRE(req.valid);
+  REQUIRE(req.input.empty());
+  REQUIRE(req.inputTokens.size() == 1);
+  REQUIRE(req.inputTokens[0] == std::vector<int>{101, 7592, 2088, 102});
+  REQUIRE(req.count() == 1);
+}
+
+TEST_CASE("parse embeddings request accepts many pre-tokenized sequences", "[openai]") {
+  std::string err;
+  const auto req = parseEmb(R"({"input":[[101,102],[101,7592,102]]})", err);
+  REQUIRE(req.valid);
+  REQUIRE(req.inputTokens.size() == 2);
+  REQUIRE(req.inputTokens[1].size() == 3);
+}
+
+TEST_CASE("parse embeddings request rejects a missing, empty, or mixed input", "[openai]") {
+  std::string err;
+  REQUIRE_FALSE(parseEmb(R"({"model":"bge"})", err).valid);
+  REQUIRE(err.find("input") != std::string::npos);
+
+  REQUIRE_FALSE(parseEmb(R"({"input":[]})", err).valid);
+  // A mixed array is rejected rather than silently dropping the odd element, which is what the
+  // `stop` field does — acceptable there, not here, where a dropped element shifts every later
+  // vector's index in the response.
+  REQUIRE_FALSE(parseEmb(R"({"input":["a",5]})", err).valid);
+  REQUIRE_FALSE(parseEmb(R"({"input":true})", err).valid);
+}
+
+TEST_CASE("parse embeddings request reads encoding_format and dimensions", "[openai]") {
+  std::string err;
+  const auto req = parseEmb(R"({"input":"x","encoding_format":"base64","dimensions":128})", err);
+  REQUIRE(req.valid);
+  REQUIRE(req.encodingFormat == "base64");
+  REQUIRE(req.dimensions == 128);
+
+  REQUIRE_FALSE(parseEmb(R"({"input":"x","encoding_format":"protobuf"})", err).valid);
+}
+
+TEST_CASE("embeddings response indexes each vector in request order", "[openai]") {
+  const std::vector<std::vector<float>> vecs{{1.0f, 2.0f}, {3.0f, 4.0f}};
+  const auto v = embeddingsResponse("bge", vecs, 7);
+  REQUIRE(v.get("object")->asString() == "list");
+  REQUIRE(v.get("model")->asString() == "bge");
+
+  const auto* data = v.get("data");
+  REQUIRE(data->size() == 2);
+  for (int i = 0; i < 2; ++i) {
+    const auto& e = data->at(static_cast<std::size_t>(i));
+    REQUIRE(e.get("object")->asString() == "embedding");
+    REQUIRE(e.get("index")->asInt() == i);
+    REQUIRE(e.get("embedding")->size() == 2);
+  }
+  REQUIRE(data->at(1).get("embedding")->at(0).asNumber() == 3.0);
+}
+
+TEST_CASE("embeddings usage reports prompt and total but no completion tokens", "[openai]") {
+  // The chat usage object carries completion_tokens; the embeddings schema does not define it.
+  const auto v = embeddingsResponse("bge", {{1.0f}}, 7);
+  const auto* u = v.get("usage");
+  REQUIRE(u->get("prompt_tokens")->asInt() == 7);
+  REQUIRE(u->get("total_tokens")->asInt() == 7);
+  REQUIRE(u->get("completion_tokens") == nullptr);
+}
+
+TEST_CASE("base64 embeddings encode little-endian float32", "[openai]") {
+  // 1.0f is 0x3F800000, little-endian bytes 00 00 80 3F -> "AACAPw==". OpenAI's Python SDK
+  // requests base64 by default, so this is the format most clients actually receive.
+  REQUIRE(embeddingsBase64({1.0f}) == "AACAPw==");
+  REQUIRE(embeddingsBase64({0.0f}) == "AAAAAA==");
+  // Padding follows the byte count, not the float count: 2 floats are 8 bytes (8 % 3 == 2, so one
+  // '='), while 3 floats are 12 bytes and divide evenly.
+  const std::string two = embeddingsBase64({1.0f, 2.0f});
+  REQUIRE(two.size() == 12);
+  REQUIRE(two.find('=') == 11);
+
+  const std::string three = embeddingsBase64({1.0f, 2.0f, 3.0f});
+  REQUIRE(three.size() == 16);
+  REQUIRE(three.find('=') == std::string::npos);
+
+  const auto v = embeddingsResponse("bge", {{1.0f}}, 1, /*base64=*/true);
+  REQUIRE(v.get("data")->at(0).get("embedding")->isString());
+  REQUIRE(v.get("data")->at(0).get("embedding")->asString() == "AACAPw==");
+}
