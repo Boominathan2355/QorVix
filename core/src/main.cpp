@@ -741,16 +741,23 @@ int cmdServe(const std::vector<std::string_view>& args) {
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   if (path.empty()) {
     std::cerr << "usage: qorvix serve <file.gguf> [--gpu|--vulkan|--auto] [--port N] "
-                 "[--max-concurrent N] [--ctx N]\n";
+                 "[--max-concurrent N] [--ctx N] [--embed-model <file.gguf>] [--max-batch N]\n";
     return 1;
   }
+  // SPEC: "Everything must run from ONE server process." The positional model stays the generation
+  // model and embeddings are opt-in, so this is backwards compatible. A general --model registry
+  // with per-request name routing is the right long-term shape — it is what port 2006 (Gateway) is
+  // reserved for — but it needs a loaded-engine registry, name->engine dispatch, and an eviction
+  // policy; --embed-model is the seam that grows into it.
+  const std::string embedPath = flagValue(args, "--embed-model");
   // Same backend selection as generate: --gpu / --vulkan / --auto / (default) CPU. serve reaches
   // every backend through the ONE createEngine() factory + the IInferenceEngine seam.
   const qorvix::Backend backend = backendFromArgs(args);
-  int port = qorvix::ports::kRuntime, maxConcurrent = 4, ctx = 4096;
+  int port = qorvix::ports::kRuntime, maxConcurrent = 4, ctx = 4096, maxBatch = 64;
   if (auto v = flagValue(args, "--port"); !v.empty()) port = std::stoi(v);
   if (auto v = flagValue(args, "--max-concurrent"); !v.empty()) maxConcurrent = std::stoi(v);
   if (auto v = flagValue(args, "--ctx"); !v.empty()) ctx = std::stoi(v);
+  if (auto v = flagValue(args, "--max-batch"); !v.empty()) maxBatch = std::stoi(v);
 
   if (!qorvix::backendAvailable(backend)) {
     std::cerr << "error: " << qorvix::backendName(backend)
@@ -786,7 +793,34 @@ int cmdServe(const std::vector<std::string_view>& args) {
     return 1;
   }
 
+  // Second engine, second seam, same process. It carries its OWN tokenizer — an embedding model
+  // is WordPiece while the chat model is SPM or BPE, so they cannot be shared.
+  std::optional<qorvix::tokenizer::Tokenizer> embedTok;
+  std::unique_ptr<qorvix::embeddings::IEmbeddingEngine> embedEngine;
+  if (!embedPath.empty()) {
+    try {
+      auto ef = qorvix::gguf::GgufFile::open(embedPath);
+      embedTok = qorvix::tokenizer::Tokenizer::fromGguf(ef, err);
+      if (!embedTok) {
+        std::cerr << "error: embedding tokenizer: " << err << "\n";
+        return 1;
+      }
+      // CPU only for now (see createEmbeddingEngine); the flag deliberately does not follow the
+      // chat backend, so `serve --gpu --embed-model x` does not silently claim a GPU encoder.
+      embedEngine = qorvix::createEmbeddingEngine(qorvix::Backend::Cpu, std::move(ef), 0, err);
+      if (!embedEngine) {
+        std::cerr << "error: embedding engine: " << err << "\n";
+        return 1;
+      }
+    } catch (const qorvix::gguf::GgufParseError& e) {
+      std::cerr << "error: embedding model: " << e.what() << "\n";
+      return 1;
+    }
+  }
+
   const std::string modelId = engine->config().architecture + "/" + path;
+  const std::string embedModelId =
+      embedEngine ? embedEngine->config().architecture + "/" + embedPath : std::string();
   qorvix::scheduler::Scheduler sched(*engine, *tok, {maxConcurrent});
   std::atomic<long long> idCounter{0};
 
@@ -799,6 +833,13 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // blocks, but generations still run one at a time. Overlapping them needs the scheduler to
   // batch across requests (IInferenceEngine::forwardBatch) rather than draining per request.
   std::mutex schedMutex;
+
+  // A SEPARATE lock, not schedMutex. That one exists for two specific objects: the single-threaded
+  // Scheduler and the generation engine's one reused logits buffer. BertModel is a different
+  // object with its own scratch — sharing schedMutex would queue every embedding behind every
+  // in-flight generation for no reason, while sharing nothing would corrupt scratch under the
+  // one-detached-thread-per-connection model.
+  std::mutex embedMutex;
 
   api::HttpServer server(port);
   if (!server.start(err)) {
@@ -819,8 +860,16 @@ int cmdServe(const std::vector<std::string_view>& args) {
             << "  backend: " << engine->backendName() << " | max-concurrent: " << maxConcurrent
             << " | ctx: " << ctx << "\n"
             << "  chat template: " << chatFamily
-            << (chatTemplate.empty() ? " (model has none; using generic prompt)" : "") << "\n"
-            << "  POST /v1/chat/completions   POST /v1/completions   GET /v1/models\n"
+            << (chatTemplate.empty() ? " (model has none; using generic prompt)" : "") << "\n";
+  if (embedEngine) {
+    std::cout << "  embeddings: " << embedPath << " | dim " << embedEngine->dim() << " | pooling "
+              << qorvix::runtime::poolingName(embedEngine->defaultPooling()) << " | max-batch "
+              << maxBatch << "\n";
+  } else {
+    std::cout << "  embeddings: none (pass --embed-model <file.gguf> to enable /v1/embeddings)\n";
+  }
+  std::cout << "  POST /v1/chat/completions   POST /v1/completions   POST /v1/embeddings\n"
+            << "  GET /v1/models\n"
             << "  (Ctrl-C to stop)\n";
 
   auto handler = [&](const api::HttpRequest& req, api::HttpResponder& res) {
@@ -829,7 +878,88 @@ int cmdServe(const std::vector<std::string_view>& args) {
       return;
     }
     if (req.method == "GET" && req.target == "/v1/models") {
-      res.send(200, "application/json", api::modelsResponse({modelId}).dump());
+      std::vector<std::string> ids{modelId};
+      if (embedEngine) ids.push_back(embedModelId);
+      res.send(200, "application/json", api::modelsResponse(ids).dump());
+      return;
+    }
+
+    if (req.target == "/v1/embeddings") {
+      if (req.method != "POST") {
+        res.send(405, "application/json",
+                 api::errorResponse("use POST for /v1/embeddings", "invalid_request_error").dump());
+        return;
+      }
+      if (!embedEngine) {
+        // 501, not 404: the route exists, this process just has no encoder loaded. 404 would tell
+        // a client to stop trying rather than to start the server differently.
+        res.send(501, "application/json",
+                 api::errorResponse(
+                     "no embedding model loaded — restart with --embed-model <file.gguf>",
+                     "not_implemented")
+                     .dump());
+        return;
+      }
+      std::string perr;
+      auto ebody = api::json::parse(req.body, &perr);
+      if (!ebody) {
+        res.send(400, "application/json", api::errorResponse("invalid JSON: " + perr).dump());
+        return;
+      }
+      auto er = api::parseEmbeddingsRequest(*ebody, perr);
+      if (!er.valid) {
+        res.send(400, "application/json", api::errorResponse(perr).dump());
+        return;
+      }
+      if (static_cast<int>(er.count()) > maxBatch) {
+        // A 384-dim vector is ~5 KB of JSON, so an unbounded batch becomes a multi-megabyte
+        // single send() on a server that has no chunked encoding.
+        res.send(400, "application/json",
+                 api::errorResponse("batch of " + std::to_string(er.count()) +
+                                        " exceeds --max-batch " + std::to_string(maxBatch))
+                     .dump());
+        return;
+      }
+
+      // Tokenize outside the lock; only the forward pass needs exclusion.
+      std::vector<std::vector<int>> batch;
+      batch.reserve(er.count());
+      const int cap = static_cast<int>(embedEngine->maxSeqLen());
+      for (const auto& text : er.input) {
+        batch.push_back(truncateForEncoder(embedTok->encode(text, true), cap,
+                                           embedTok->special().sep));
+      }
+      for (const auto& ids : er.inputTokens) {
+        batch.push_back(truncateForEncoder(ids, cap, embedTok->special().sep));
+      }
+
+      int promptTokens = 0;
+      for (const auto& ids : batch) promptTokens += static_cast<int>(ids.size());
+
+      std::vector<std::vector<float>> vecs;
+      {
+        std::lock_guard<std::mutex> lock(embedMutex);
+        if (!embedEngine->embedBatch(batch, vecs, perr)) {
+          res.send(400, "application/json", api::errorResponse(perr).dump());
+          return;
+        }
+      }
+
+      // Matryoshka truncation. Only meaningful for models trained for it, but clients send it
+      // reflexively, so honour it rather than erroring.
+      if (er.dimensions > 0 && er.dimensions < static_cast<int>(embedEngine->dim())) {
+        for (auto& v : vecs) {
+          v.resize(er.dimensions);
+          if (embedEngine->defaultNormalize()) {
+            qorvix::runtime::ops::l2Normalize(v.data(), static_cast<int>(v.size()));
+          }
+        }
+      }
+
+      const std::string respId = er.model.empty() ? embedModelId : er.model;
+      res.send(200, "application/json",
+               api::embeddingsResponse(respId, vecs, promptTokens, er.encodingFormat == "base64")
+                   .dump());
       return;
     }
     if (req.method == "GET" && (req.target == "/" || req.target == "/health")) {
@@ -1321,7 +1451,8 @@ int printUsage() {
             << "  embed <file> --text \"...\"       Embed text with an encoder model (bert)\n"
             << "                                  [--pooling mean|cls|last] [--no-normalize]\n"
             << "                                  [--dims N] [--json]\n"
-            << "  serve <file> [--gpu|--vulkan|--auto] [--port N]  OpenAI-compatible HTTP server\n"
+            << "  serve <file> [--gpu|--vulkan|--auto] [--port N] [--embed-model <f.gguf>]\n"
+            << "                                  OpenAI-compatible HTTP server\n"
             << "                                  (default port " << qorvix::ports::kRuntime
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
             << qorvix::ports::kRangeLast << ")\n"
