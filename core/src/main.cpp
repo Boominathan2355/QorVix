@@ -4,6 +4,7 @@
 #include <mutex>
 #include <iomanip>
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -381,6 +382,248 @@ std::vector<int> truncateForEncoder(std::vector<int> ids, int maxSeq, int sepId)
   ids.resize(maxSeq);
   if (sepId >= 0) ids.back() = sepId;
   return ids;
+}
+
+// ---- embed-check: the Phase 11a correctness gate -------------------------------------------
+//
+// Every prior phase diffed a new implementation against an existing one (gpu-check compares CUDA
+// to the CPU reference). There is no second embedding implementation, so ground truth has to be
+// imported: a fixture captured once from sentence-transformers by scripts/capture_embed_reference.py.
+//
+// The gate is split into tiers because a single "cosine > 0.99" says THAT something is wrong and
+// nothing about WHAT:
+//   tokens exact + cosine 0.9999 -> correct
+//   tokens exact + cosine 0.7    -> encoder math (pooling, eps, GELU variant, mask, positions)
+//   tokens mismatched            -> tokenizer; fix that first, then re-read the vector tier
+// Without the token tier those are indistinguishable — and a WordPiece convention bug produced
+// exactly the second signature during this phase's development.
+struct EmbedReference {
+  std::string model;
+  int dim = 0;
+  std::string pooling = "cls";
+  bool normalize = true;
+  std::vector<std::string> texts;
+  std::vector<std::vector<int>> ids;
+  std::vector<std::vector<float>> vecs;
+};
+
+bool loadEmbedReference(const std::string& path, EmbedReference& ref, std::string& error) {
+  std::ifstream in(path);
+  if (!in) {
+    error = "cannot open '" + path + "'";
+    return false;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream ls(line);
+    std::string key;
+    ls >> key;
+    if (key == "model") {
+      ls >> ref.model;
+    } else if (key == "dim") {
+      ls >> ref.dim;
+    } else if (key == "pooling") {
+      ls >> ref.pooling;
+    } else if (key == "normalize") {
+      int n = 1;
+      ls >> n;
+      ref.normalize = n != 0;
+    } else if (key == "text") {
+      std::string rest;
+      std::getline(ls, rest);
+      if (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+      ref.texts.push_back(rest);
+    } else if (key == "ids") {
+      std::vector<int> v;
+      int id = 0;
+      while (ls >> id) v.push_back(id);
+      ref.ids.push_back(std::move(v));
+    } else if (key == "vec") {
+      std::vector<float> v;
+      float f = 0.0f;
+      while (ls >> f) v.push_back(f);
+      ref.vecs.push_back(std::move(v));
+    }
+  }
+  if (ref.texts.empty() || ref.texts.size() != ref.ids.size() ||
+      ref.texts.size() != ref.vecs.size()) {
+    error = "malformed fixture: " + std::to_string(ref.texts.size()) + " texts, " +
+            std::to_string(ref.ids.size()) + " id rows, " + std::to_string(ref.vecs.size()) +
+            " vec rows";
+    return false;
+  }
+  return true;
+}
+
+int cmdEmbedCheck(const std::vector<std::string_view>& args) {
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (path.empty()) {
+    std::cerr << "usage: qorvix embed-check <file.gguf> [--ref <fixture>] [--min-cos 0.999]\n";
+    return 1;
+  }
+  const std::string refPath = flagValue(args, "--ref");
+  float minCos = 0.999f;
+  if (auto v = flagValue(args, "--min-cos"); !v.empty()) minCos = std::stof(v);
+
+  try {
+    auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) {
+      std::cerr << "error: tokenizer: " << err << "\n";
+      return 1;
+    }
+    auto engine = qorvix::createEmbeddingEngine(qorvix::Backend::Cpu, std::move(file), 0, err);
+    if (!engine) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    const int d = static_cast<int>(engine->dim());
+    std::cout << "model:   " << path << "\n"
+              << "config:  " << engine->config().architecture << ", dim " << d << ", pooling "
+              << qorvix::runtime::poolingName(engine->defaultPooling()) << ", ctx "
+              << engine->maxSeqLen() << "\n\n";
+
+    auto embedText = [&](const std::string& text, std::vector<float>& out) {
+      const std::vector<int> ids = truncateForEncoder(
+          tok->encode(text, true), static_cast<int>(engine->maxSeqLen()), tok->special().sep);
+      return engine->embed(ids, out, err);
+    };
+
+    bool pass = true;
+
+    // ---- tier 1+2: parity against the captured reference ----
+    EmbedReference ref;
+    bool haveRef = false;
+    if (!refPath.empty()) {
+      if (!loadEmbedReference(refPath, ref, err)) {
+        std::cerr << "error: reference: " << err << "\n";
+        return 1;
+      }
+      haveRef = true;
+    }
+
+    if (haveRef) {
+      if (ref.dim != d) {
+        std::cout << "Reference dim " << ref.dim << " != model dim " << d
+                  << " — wrong fixture for this model.\n\nRESULT: MISMATCH\n";
+        return 1;
+      }
+      int tokOk = 0;
+      std::string tokWorst;
+      for (std::size_t i = 0; i < ref.texts.size(); ++i) {
+        const std::vector<int> got = tok->encode(ref.texts[i], true);
+        if (got == ref.ids[i]) {
+          ++tokOk;
+        } else if (tokWorst.empty()) {
+          tokWorst = ref.texts[i];
+        }
+      }
+      std::cout << "Tokenizer parity (" << ref.texts.size() << " strings):     " << tokOk << "/"
+                << ref.texts.size() << " exact";
+      if (tokOk != static_cast<int>(ref.texts.size())) std::cout << "  (first mismatch: \"" << tokWorst << "\")";
+      std::cout << "\n";
+      if (tokOk != static_cast<int>(ref.texts.size())) pass = false;
+
+      float worstCos = 2.0f;
+      std::string worstText;
+      for (std::size_t i = 0; i < ref.texts.size(); ++i) {
+        std::vector<float> v;
+        if (!embedText(ref.texts[i], v)) {
+          std::cout << "  embed failed on \"" << ref.texts[i] << "\": " << err << "\n";
+          pass = false;
+          continue;
+        }
+        const float c = qorvix::runtime::ops::cosineSimilarity(v.data(), ref.vecs[i].data(), d);
+        if (c < worstCos) {
+          worstCos = c;
+          worstText = ref.texts[i];
+        }
+      }
+      std::cout << std::fixed << std::setprecision(5)
+                << "Vector parity vs reference:      min cos " << worstCos << "  (worst: \""
+                << worstText << "\")\n"
+                << std::defaultfloat;
+      if (worstCos < minCos) pass = false;
+    } else {
+      std::cout << "Tokenizer parity:                SKIPPED (no --ref fixture)\n"
+                << "Vector parity vs reference:      SKIPPED (no --ref fixture)\n";
+    }
+
+    // ---- tier 3: invariants, which need no fixture and so always run ----
+    std::vector<float> a, b, a2;
+    const bool okA = embedText("A dog runs in the park", a);
+    const bool okB = embedText("A canine sprints across the grass", b);
+    const bool okA2 = embedText("A dog runs in the park", a2);
+    if (!okA || !okB || !okA2) {
+      std::cout << "Invariants:                      FAILED to embed (" << err << ")\n";
+      pass = false;
+    } else {
+      const float norm = qorvix::runtime::ops::l2Norm(a.data(), d);
+      const bool unit = !engine->defaultNormalize() || std::abs(norm - 1.0f) < 1e-4f;
+      const bool self = qorvix::runtime::ops::cosineSimilarity(a.data(), a.data(), d) > 0.9999f;
+      const bool sym = std::abs(qorvix::runtime::ops::cosineSimilarity(a.data(), b.data(), d) -
+                                qorvix::runtime::ops::cosineSimilarity(b.data(), a.data(), d)) < 1e-6f;
+      bool finite = true;
+      for (float x : a) finite = finite && std::isfinite(x);
+      const bool deterministic = a == a2;
+      std::cout << "Invariants:                      "
+                << (unit ? "unit norm OK" : "UNIT NORM FAIL") << " · "
+                << (self ? "self-cos OK" : "SELF-COS FAIL") << " · "
+                << (sym ? "symmetry OK" : "SYMMETRY FAIL") << " · "
+                << (finite ? "finite OK" : "NON-FINITE") << " · "
+                << (deterministic ? "deterministic OK" : "NONDETERMINISTIC") << "\n";
+      pass = pass && unit && self && sym && finite && deterministic;
+    }
+
+    // ---- tier 4: triplet ordering. Catches gross breakage with no fixture at all. ----
+    struct Triplet {
+      const char* anchor;
+      const char* positive;
+      const char* negative;
+    };
+    const Triplet triplets[] = {
+        {"A dog runs in the park", "A canine sprints across the grass",
+         "The stock market closed lower today"},
+        {"How do I install the software?", "What are the setup instructions?",
+         "The cat slept on the windowsill"},
+        {"Paris is the capital of France", "France's capital city is Paris",
+         "Photosynthesis occurs in chloroplasts"},
+    };
+    int trip = 0;
+    float minMargin = 1e9f;
+    for (const auto& t : triplets) {
+      std::vector<float> va, vp, vn;
+      if (!embedText(t.anchor, va) || !embedText(t.positive, vp) || !embedText(t.negative, vn)) {
+        pass = false;
+        continue;
+      }
+      const float cp = qorvix::runtime::ops::cosineSimilarity(va.data(), vp.data(), d);
+      const float cn = qorvix::runtime::ops::cosineSimilarity(va.data(), vn.data(), d);
+      if (cp > cn + 0.10f) ++trip;
+      minMargin = std::min(minMargin, cp - cn);
+    }
+    std::cout << std::fixed << std::setprecision(3) << "Triplet ordering:                " << trip
+              << "/3" << " (min margin " << minMargin << ")\n"
+              << std::defaultfloat;
+    if (trip != 3) pass = false;
+
+    std::cout << "\nRESULT: " << (pass ? "PASS" : "MISMATCH");
+    if (pass && !haveRef) {
+      std::cout << " (invariants only — no reference fixture)\n"
+                << "note: capture one with scripts/capture_embed_reference.py and pass --ref to\n"
+                << "      gate on vectors, which is the tier that catches subtle encoder bugs.\n";
+      // Returning 0 without a fixture matches gpu-check, which also exits 0 when its reference
+      // simply isn't available rather than treating "cannot check" as "failed".
+      return 0;
+    }
+    std::cout << "\n";
+    return pass ? 0 : 1;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
 }
 
 int cmdEmbed(const std::vector<std::string_view>& args) {
@@ -1089,6 +1332,8 @@ int printUsage() {
             << "  vulkan              Show Vulkan devices and run compute-backend self-tests\n"
             << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
             << "  vulkan-check <file> Compare Vulkan vs CPU forward-pass logits for a GGUF model\n"
+            << "  embed-check <file> [--ref F] [--min-cos C]   Gate embeddings against a\n"
+            << "                      captured sentence-transformers reference\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
             << "  help                Show this help\n";
@@ -1115,6 +1360,7 @@ int main(int argc, char** argv) {
   if (command == "model-info") return cmdModelInfo(arg1);
   if (command == "generate") return cmdGenerate(args);
   if (command == "embed") return cmdEmbed(args);
+  if (command == "embed-check") return cmdEmbedCheck(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();
