@@ -28,6 +28,22 @@ float silu(float z);
 // SwiGLU FFN activation: out[i] = silu(gate[i]) * up[i].
 void swiglu(float* out, const float* gate, const float* up, int n);
 
+// GELU — the BERT/encoder FFN activation (Llama-family decoders use SwiGLU above instead).
+//
+// Two variants exist in the wild and they are NOT interchangeable: the exact erf form is what
+// PyTorch's `nn.GELU()` / HuggingFace `hidden_act: "gelu"` compute, while ggml's GGML_OP_GELU is
+// the tanh approximation. They differ by up to ~1e-3 around |z| ~ 2 — invisible in a loss curve,
+// but not free when `embed-check` gates cosine-vs-reference at 0.999. Both are provided so the
+// gate can settle empirically which one a given GGUF conversion assumed.
+//
+//   gelu(z)    = 0.5*z*(1 + erf(z/sqrt(2)))                                   [exact]
+//   geluTanh(z)= 0.5*z*(1 + tanh(sqrt(2/pi) * (z + 0.044715*z^3)))            [approximation]
+float gelu(float z);
+float geluTanh(float z);
+
+// Applies gelu() elementwise in place over n elements (the encoder FFN's activation step).
+void geluInPlace(float* x, int n);
+
 // Elementwise residual add: out[i] += x[i].
 void add(float* out, const float* x, int n);
 

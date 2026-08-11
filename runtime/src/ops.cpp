@@ -74,6 +74,21 @@ void swiglu(float* out, const float* gate, const float* up, int n) {
   for (int i = 0; i < n; ++i) out[i] = silu(gate[i]) * up[i];
 }
 
+// 1/sqrt(2) and sqrt(2/pi) — named so the constants below aren't bare magic numbers.
+constexpr float kInvSqrt2 = 0.70710678118654752f;
+constexpr float kSqrt2OverPi = 0.79788456080286536f;
+
+float gelu(float z) { return 0.5f * z * (1.0f + std::erf(z * kInvSqrt2)); }
+
+float geluTanh(float z) {
+  const float inner = kSqrt2OverPi * (z + 0.044715f * z * z * z);
+  return 0.5f * z * (1.0f + std::tanh(inner));
+}
+
+void geluInPlace(float* x, int n) {
+  for (int i = 0; i < n; ++i) x[i] = gelu(x[i]);
+}
+
 void add(float* out, const float* x, int n) {
   for (int i = 0; i < n; ++i) out[i] += x[i];
 }

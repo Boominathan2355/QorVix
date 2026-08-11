@@ -15,6 +15,7 @@ if(Catch2_FOUND)
     cuda_test.cpp
     tensor_parallel_test.cpp
     ops_test.cpp
+    pooling_test.cpp
     dequant_test.cpp
     qmatmul_test.cpp
     model_config_test.cpp
