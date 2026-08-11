@@ -330,6 +330,15 @@ Tokenizer::Tokenizer(TokenizerModel model, std::vector<std::string> tokens,
   // which of these keys they emit, and a missing [UNK] in particular would turn every
   // out-of-vocabulary word into id -1 rather than a real token.
   if (model_ == TokenizerModel::WordPiece) {
+    // Detect the vocabulary convention (see encodeWordPiece). llama.cpp's GGUF conversion rewrites
+    // a WordPiece vocab into SentencePiece shape — word-initial pieces gain a U+2581 marker and
+    // continuations lose their "##" — so a real bert GGUF holds "▁the", not "the".
+    for (const std::string& t : tokens_) {
+      if (t.size() >= 3 && t.compare(0, 3, "\xE2\x96\x81") == 0) {
+        wpmSpaceMarker_ = true;
+        break;
+      }
+    }
     auto resolve = [&](int current, int alias, const char* piece) {
       if (current >= 0) return current;
       if (alias >= 0) return alias;
@@ -374,14 +383,26 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool addBos) const {
 
 std::vector<int> Tokenizer::encodeWordPiece(const std::string& text) const {
   std::vector<int> ids;
-  for (const std::string& word : wpmBasicTokenize(text, lowercase_)) {
-    if (word.size() > kMaxWordChars) {
+  for (const std::string& rawWord : wpmBasicTokenize(text, lowercase_)) {
+    if (rawWord.size() > kMaxWordChars) {
       ids.push_back(special_.unk);
       continue;
     }
 
-    // Greedy longest-match-first: take the longest vocabulary prefix, then continue from there
-    // with a "##" marker on every subsequent piece.
+    // Two vocabulary conventions exist, and picking the wrong one is silent rather than fatal:
+    // every word still resolves to SOMETHING (usually [UNK], sometimes a real-but-wrong id), so
+    // the embedding stays finite and unit-norm while meaning nothing.
+    //
+    //   HuggingFace: word-initial "the", continuation "##ing".
+    //   llama.cpp GGUF: word-initial "▁the", continuation bare "ing" — the conversion rewrites a
+    //     WordPiece vocab into SentencePiece shape. This is what real bert GGUFs on disk contain.
+    //
+    // With the marker convention the whole word gains a leading ▁ and the match runs over that
+    // string, so continuation pieces start mid-string and are naturally unprefixed — exactly how
+    // llama.cpp does it.
+    const std::string word = wpmSpaceMarker_ ? "\xE2\x96\x81" + rawWord : rawWord;
+
+    // Greedy longest-match-first over `word`.
     std::vector<int> pieces;
     std::size_t start = 0;
     bool covered = true;
@@ -390,13 +411,14 @@ std::vector<int> Tokenizer::encodeWordPiece(const std::string& text) const {
       int found = -1;
       while (start < end) {
         std::string sub = word.substr(start, end - start);
-        if (start > 0) sub.insert(0, "##");
+        if (!wpmSpaceMarker_ && start > 0) sub.insert(0, "##");
         if (const int id = tokenToId(sub); id >= 0) {
           found = id;
           break;
         }
         // Step back one whole UTF-8 character, not one byte — otherwise a multibyte character
-        // gets cut mid-sequence and every subsequent lookup is against invalid UTF-8.
+        // (including the 3-byte ▁ marker) gets cut mid-sequence and every subsequent lookup is
+        // against invalid UTF-8.
         --end;
         while (end > start && isUtf8Continuation(word[end])) --end;
       }
@@ -537,10 +559,18 @@ void Tokenizer::appendTokenText(int id, std::string& out) const {
   }
 
   if (model_ == TokenizerModel::WordPiece) {
-    // "##xyz" continues the previous token; anything else starts a new whitespace-separated word.
-    // Normalization is lossy (case and accents are gone), so this reconstructs the token stream,
-    // not the original input.
-    if (tok.size() > 2 && tok[0] == '#' && tok[1] == '#') {
+    // Mirror of the encode convention. Normalization is lossy (case and accents are gone), so
+    // this reconstructs the token stream, not the original input.
+    if (wpmSpaceMarker_) {
+      // ▁ marks a word start, exactly as in SPM; continuations are bare and simply concatenate.
+      for (const std::string& ch : utf8Chars(tok)) {
+        if (ch == "\xE2\x96\x81") {
+          if (!out.empty()) out.push_back(' ');
+        } else {
+          out += ch;
+        }
+      }
+    } else if (tok.size() > 2 && tok[0] == '#' && tok[1] == '#') {
       out.append(tok, 2, std::string::npos);
     } else {
       if (!out.empty()) out.push_back(' ');

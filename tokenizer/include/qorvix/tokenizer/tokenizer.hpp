@@ -76,6 +76,9 @@ class Tokenizer {
   std::unordered_map<std::string, int> mergeRank_;  // "left right" -> rank (BPE)
   SpecialTokens special_;
   bool lowercase_ = true;
+  // Which WordPiece vocabulary convention this model uses; detected from the vocab at
+  // construction. See encodeWordPiece() for why there are two.
+  bool wpmSpaceMarker_ = false;
 };
 
 }  // namespace qorvix::tokenizer
