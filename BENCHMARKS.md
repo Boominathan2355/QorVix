@@ -107,6 +107,32 @@ descriptor set for every one of ~377 dispatches per token (22 layers × 17 ops +
 compute→compute barrier after each. That is CPU-side submission overhead the T4 run will expose once
 the PCIe streaming is gone.
 
+## Encoder axis — `embed_tok_per_sec` (Phase 11a)
+
+Embeddings are a second seam, so they get a second measurement core (`runEmbedBenchmark` in
+`embeddings/embed_benchmark.hpp`) — `runBenchmark` takes an `IInferenceEngine&` and its result is
+decode-shaped. Still **one CLI and one file**: `qorvix bench` dispatches on the model family.
+
+```
+qorvix bench <encoder.gguf> --seq 256 --batch 1 --warmup 1 --runs 3 [--json]
+```
+
+**The decision rule, restated for this axis:** a change that does not move `embed_tok_per_sec` on
+the fixed encoder workload — while `embed-check` still reports the same tokenizer parity and
+vector cosine — does not ship. The correctness gate here is `embed-check`, not argmax parity;
+it is a CLI gate rather than a CTest case because the Docker test image has no GGUF.
+
+**Fixed encoder workload:** `bge-small-en-v1.5 F16`, `seq=256 batch=1 warmup=1 runs=3`.
+
+| Date | Commit | Backend | Device | embed tok/s | ms/seq | Notes |
+|------|--------|---------|--------|------------:|-------:|-------|
+| 2026-08-13 | 6b43f25 | cpu | i7 (this box, AVX2) | 27.72 | 9236.24 | baseline after the F16 dequant-batching fix |
+| 2026-08-13 | 97e9c0c | cpu | i7 (this box, AVX2) | **225.65** | 1134.50 | batched GEMV (`qmatmulN`) |
+| — | — | cuda | 🖥️ pending | — | — | no GPU encoder backend yet (Phase 11c) |
+
+End-to-end effect on the RAG pipeline, indexing the repo's own `docs/` (4 documents → 37 chunks,
+5795 tokens): **562.3 s → 20.4 s (27.5×)**.
+
 ## Optimization log
 
 Append one row per attempt: what changed, the before→after `decode_tok_per_sec` on the fixed
@@ -116,6 +142,15 @@ outcome — it stops us from repeating it (as the reverted Q4_K vectorized-load 
 | Date | Commit | Backend | Change | decode tok/s before→after | parity | verdict |
 |------|--------|---------|--------|---------------------------|--------|---------|
 | 2026-07-30 | 5404523 | cuda | Q4_K GEMV re-blocked: 4 contiguous elements/lane so activations load as `float4` and weights as one `uint32`; header decoded from one shared `uint4` instead of 8 `getScaleMinK4` calls | **86.65 → 114.82 (+32.5%)** | **PASS** | **SHIPPED** |
+| 2026-08-13 | 6b43f25 | cpu | `qmatmul` filled its 256-float scratch with one BLOCK per call. F16/BF16 have `blockSize == 1`, so a 384-column row meant 384 `dequantize()` dispatches and 384 dot calls of length **one** — the SIMD kernel never engaged. Now fills with as many whole blocks as it holds. | *(encoder axis)* **5.51 s → 0.73 s** on a 4-token embed | byte-identical | **SHIPPED** |
+| 2026-08-13 | 97e9c0c | cpu | `qmatmulN`: dequantize each weight block once and fold it into all N dot products, instead of re-streaming the matrix once per token. Decode has an N=1 case that hides this cost; an encoder never does. | *(encoder axis)* **27.72 → 225.65 tok/s (8.1×)** | bit-identical | **SHIPPED** |
+
+The two CPU rows above are on the encoder axis and do **not** move `decode_tok_per_sec` — decode is
+N=1, so `qmatmulN` is a no-op there by construction. That is exactly why the encoder needed its own
+axis before the change could be justified at all: measured against the decode workload it would have
+scored zero and been correctly rejected. Wiring `qmatmulN` into the decoder's **prefill** (where N is
+the prompt length) is the open follow-up — it is the same kernel as the "batched prefill" item in
+the ROADMAP priorities, and the T4 prefill/decode gap (99 vs 87 tok/s) is its signature.
 
 **Static evidence for the pending row** (what the dev box can prove without a GPU). SASS for `sm_75`,
 per super-block iteration of `qmatmulQ4_KKernel`:

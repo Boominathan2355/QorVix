@@ -317,10 +317,88 @@ split; needs ≥2 GPUs to execution-verify) and a sharded `GpuModel` that runs t
 pipeline parallelism, expert parallelism, load balancing.
 
 ## Phase 11 — Multimodal Expansion
-Vision engine (Qwen-VL, Llama Vision, MiniCPM-V, InternVL; OCR, grounding), audio engine
-(STT/TTS/voice cloning), image generation (Flux/SDXL/SD; txt2img/img2img/inpaint/outpaint/
-upscale/controlnet), embeddings (text/vision/audio/cross-modal), RAG (loaders, chunking, hybrid
-search, vector store), multi-agent workflows.
+
+The original scope bundled six engines: vision (Qwen-VL, Llama Vision, MiniCPM-V, InternVL; OCR,
+grounding), audio (STT/TTS/voice cloning), image generation (Flux/SDXL/SD), embeddings
+(text/vision/audio/cross-modal), RAG (loaders, chunking, hybrid search, vector store), and
+multi-agent workflows. Split so each part can end in something that compiles, runs, and is gated.
+
+### Phase 11a — Text embeddings + RAG ✅
+
+**Encoder engine (`embeddings` module).** BERT-family encoders from GGUF: `IEmbeddingEngine` is a
+**second seam** beside `IInferenceEngine`, built by `createEmbeddingEngine` in the same
+`backend.hpp`. Not a subclass — that seam's sessions *are* KV-cache allocations, its `forward` is
+one autoregressive step at a position, and its output is vocab logits; an encoder has no KV cache,
+consumes all N tokens at once, and has no LM head at all. Subclassing would have meant three stub
+methods and a `forward` that doesn't return logits, which is the fake seam Phase 8.5 removed. One
+seam per task, one factory per seam, still zero parallel paths.
+
+Bidirectional attention, post-norm LayerNorm with bias, GELU FFN, learned position table, token-type
+embeddings, and cls/mean/last pooling read from `<arch>.pooling_type`. `ModelConfig` gained an
+`ArchFamily` and seven encoder fields whose defaults leave every decoder path byte-identical;
+`createEngine` and `TextModel::fromGguf` both reject encoders explicitly, so widening the allowlist
+could not silently route a `bert` file into the generation path.
+
+**WordPiece tokenizer.** `TokenizerModel::WordPiece` with BERT's BasicTokenizer normalization
+(control deletion, punctuation isolation, CJK per-character splitting, case-folding + accent
+stripping over Latin-1/Latin-Extended-A) and explicit `[CLS]`/`[SEP]` wrapping. Supports **both**
+vocabulary conventions: HuggingFace's `##` continuations and llama.cpp's SentencePiece-shaped
+`▁word` markers, detected from the vocabulary — real bert GGUFs use the latter, and guessing wrong
+is silent (every word still resolves to *something*, usually `[UNK]`, and the vector stays finite
+and unit-norm while meaning nothing).
+
+**The gate: `qorvix embed-check`.** Every prior phase diffed against an existing implementation;
+there is no second embedding implementation, so ground truth is imported from
+**sentence-transformers** (independent of both this codebase and llama.cpp, so it validates the GGUF
+conversion too) by `scripts/capture_embed_reference.py`, committed under `tests/data/`. Tiered so a
+failure is diagnosable: tokenizer parity (exact ids), vector parity (cosine), then invariants and
+triplet ordering that need no fixture and always run.
+
+| model | tokenizer parity | vector parity | gate |
+|---|---|---|---|
+| bge-small-en-v1.5 **F16** | 7/7 exact | **min cos 1.00000** | PASS (`--min-cos 0.999`) |
+| all-MiniLM-L6-v2 **Q4_K_M** | 7/7 exact | min cos 0.97598 | PASS (`--min-cos 0.97`) |
+
+Cosine 1.00000 against fp32 settles the GELU variant empirically: exact erf, not the tanh
+approximation. On the quantized model, real text lands at 0.986–0.994 and the only outlier is the
+empty string (2 tokens, where mean pooling gives quantization noise nothing to average against) —
+which is why the gate prints a per-probe breakdown on failure.
+
+**Serving.** `POST /v1/embeddings` (all four OpenAI `input` shapes, base64 encoding — the default
+its Python SDK requests — `dimensions` truncation, `--max-batch` bound), and
+`serve <chat.gguf> --embed-model <encoder.gguf>`: **two engines in one process**, per SPEC, each
+with its own tokenizer and its own mutex. `/v1/models` lists both. Without the flag the route
+returns 501, not 404 — the route exists, this process just has no encoder loaded.
+
+**RAG (`rag` module).** Token-aware chunking using the embedding model's own tokenizer (a
+character-count chunker cannot honour a token budget, and over-long chunks are silently truncated at
+embed time), `.txt`/`.md`/`.csv`/`.tsv` loaders, a flat vector store with exact cosine top-k, BM25
+over whole-word terms (deliberately not WordPiece — `##ation` is not a term anyone searches for),
+and Reciprocal Rank Fusion (rank-based, so the incomparable cosine and BM25 scales never need a
+calibration that does not exist). Native `.qvx` format shaped like GGUF: magic, version, validated
+header, contiguous float matrix, then chunk records and the lexical index in the same file.
+Verified self-hosting on the repo's own `docs/`.
+
+**Performance.** Two CPU wins, both bit-identical and both invisible on the decode axis:
+`qmatmul` was dequantizing one *block* per call, which for F16 (`blockSize == 1`) meant one call per
+*element* (5.51 s → 0.73 s on a 4-token embed); then `qmatmulN` batches the GEMV across tokens
+(**27.72 → 225.65 embed tok/s**, and RAG indexing 562 s → 20 s). See BENCHMARKS.md.
+
+**Explicitly not done in 11a:** vision, audio, image generation, **vision/audio/cross-modal
+embeddings** (SPEC lists four; this ships text only), multi-agent workflows, reranker models, GPU
+embedding backends, PDF/DOCX loaders (gated on a from-scratch DEFLATE decoder — doing them badly
+would silently poison every embedding derived from them), SQLite/Postgres vector stores, ANN
+indexing, `nomic-bert` (rope-based encoders are refused rather than approximated), and multi-model
+name routing in `serve`.
+
+### Phase 11b — Vision / audio / image generation ⬜
+Vision engine, audio engine, image generation, cross-modal embeddings, multi-agent workflows.
+`vision/`, `audio/`, `image/`, `agents/` are still 0 files.
+
+### Phase 11c — GPU embedding backends ⬜🖥️
+CUDA and Vulkan implementations of `IEmbeddingEngine`. `createEmbeddingEngine` reports honestly for
+now rather than silently falling back to CPU. Note `buildGpuModel`/`buildVulkanModel` are *not*
+reusable (they unconditionally read `L.ffnGate`); `detail::toGpuWeight`/`toVkWeight` are.
 
 ## Phase 12 — Web UI
 React/TS/Vite/Tailwind/shadcn app: Dashboard, Chat, Vision, Audio, Image Generation, Model,
@@ -336,11 +414,17 @@ targets in SPEC.md. Tune until targets are met or document the gap honestly.
 
 ---
 
-**Status (2026-07-30):** Phases 0–9 complete, Phase 8.5 (cross-vendor + unified engine) complete,
-Phase 10 started. **Qorvix runs correct inference on real models across three backends behind one
-seam** — CPU, CUDA (**114.82 decode tok/s measured on a Tesla T4**, argmax parity, see BENCHMARKS.md),
-and Vulkan (cross-vendor, argmax parity verified GPU-free on lavapipe, rel err 2.6e-06). Test suite:
-**131 cases / 4429 assertions green**; the CPU-only, CUDA, and Vulkan builds all compile and link.
+**Status (2026-08-13):** Phases 0–9 complete, Phase 8.5 (cross-vendor + unified engine) complete,
+Phase 10 started, **Phase 11a (text embeddings + RAG) complete**. **Qorvix runs correct inference on
+real models across three backends behind one seam** — CPU, CUDA (**114.82 decode tok/s measured on a
+Tesla T4**, argmax parity, see BENCHMARKS.md), and Vulkan (cross-vendor, argmax parity verified
+GPU-free on lavapipe, rel err 2.6e-06) — **and correct text embeddings behind a second seam**
+(bge-small F16 matches sentence-transformers at cosine 1.00000). Test suite green; the CPU-only,
+CUDA, and Vulkan builds all compile and link.
+
+**Three correctness gates, one per numerical path**, all CLI rather than CTest because each needs a
+GGUF the test image does not have: `gpu-check` (CUDA vs CPU logits), `vulkan-check` (Vulkan vs CPU
+logits), and `embed-check` (embeddings vs a captured sentence-transformers reference).
 
 - **Unified backend ✅** — one `IInferenceEngine` seam, three implementations (CPU/CUDA/Vulkan), one
   `createEngine` factory, one generation loop. `generate` and `serve` reach any backend via
@@ -359,9 +443,14 @@ and Vulkan (cross-vendor, argmax parity verified GPU-free on lavapipe, rel err 2
   (Phase 1, tested). `plugins/` is real, not a placeholder.
 - **Measurement ✅** — `qorvix bench` (backend-agnostic, median-of-runs, JSON), BENCHMARKS.md as the
   single source of truth, and performance-regression tests in the suite.
+- **Embeddings + RAG ✅** — BERT/WordPiece encoders from GGUF behind a second seam
+  (`IEmbeddingEngine`), `qorvix embed`, `POST /v1/embeddings`, `serve --embed-model` hosting a chat
+  and an embedding model in one process, and a RAG layer (chunking, `.qvx` vector store, BM25,
+  RRF hybrid search). Gated by `embed-check` against a sentence-transformers reference:
+  bge-small F16 min cos **1.00000**, all-MiniLM Q4_K_M **0.97598**, both with exact tokenizer parity.
 - **Not started (empty dirs, 0 files each)** — `vision/`, `image/`, `monitoring/`, `agents/`,
-  `audio/`, `embeddings/`, `rag/`, `ui/`, `cli/` — Phase 11–12 placeholders, scaffolded only when
-  their phase begins (see the status-annotated backlog above).
+  `audio/`, `ui/`, `cli/` — Phase 11b–12 placeholders, scaffolded only when their phase begins
+  (see the status-annotated backlog above).
 
 ## Phase 8.5 — Cross-vendor Vulkan backend + unified engine ✅ (retrofit)
 
@@ -415,12 +504,15 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
   · scheduler ✅ · sliding-window attn ⬜ · speculative decoding ⬜ · multi-GPU 🟡 (TP math done,
   NCCL 🖥️).
 - **Models:** GGUF F16/BF16/Q4_0..Q8_0/K-quants ✅ · more quant formats (IQ-quants) ⬜ · MoE ⬜ ·
-  vision ⬜ · embeddings/reranker ⬜ (Phase 11).
-- **Serving:** OpenAI API ✅ · SSE streaming ✅ · WebSocket ⬜ · auth ⬜ (Phase 13, port 2006) ·
+  vision ⬜ · text embeddings ✅ (BERT/WPM; bge-small + all-MiniLM verified) ·
+  vision/audio/cross-modal embeddings ⬜ · reranker ⬜.
+- **Serving:** OpenAI API ✅ (`/v1/models`, `/v1/chat/completions`, `/v1/completions`,
+  `/v1/embeddings`) · two models in one process ✅ (`serve --embed-model`) · SSE streaming ✅ ·
+  WebSocket ⬜ · auth ⬜ (Phase 13, port 2006) ·
   Prometheus `/metrics` ⬜ (Phase 12, port 2009) · rate limiting ⬜.
 - **Memory:** paged KV + eviction/offload ✅ · GPU memory pooling 🟡 · zero-copy 🟡 · prefetch ⬜ ·
   graceful OOM ⬜.
-- **Testing:** unit suite ✅ (128 cases) · cross-vendor bench ⬜🖥️ · perf regression ⬜🖥️ ·
+- **Testing:** unit suite ✅ (106 cases / 1289 checks incl. embeddings + RAG) · cross-vendor bench ⬜🖥️ · perf regression ⬜🖥️ ·
   multi-GPU CI ⬜🖥️ · long-context validation ⬜.
 - **Dev-ex:** `backends`/self-tests ✅ · backend auto-select ✅ · benchmark tool ✅ (`qorvix bench`
   + BENCHMARKS.md + regression tests) · profiler integration 🟡 (`colab_ncu_profile.sh`) · runtime
@@ -440,7 +532,8 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
 - **Empty module dirs (not started; scaffolded only when their phase begins, to keep the build free
   of content-less libraries):** `vision/` ⬜ (Phase 11 — vision models/OCR) · `image/` ⬜ (Phase 11 —
   image generation) · `monitoring/` ⬜ (Phase 12 — Prometheus/metrics exporter, port 2009) ·
-  `audio/` · `embeddings/` · `rag/` · `agents/` · `ui/` (Phase 12) · `cli/` — all 0 files today.
+  `audio/` · `agents/` · `ui/` (Phase 12) · `cli/` — all 0 files today. (`embeddings/` and `rag/`
+  are real as of Phase 11a.)
 
 ### Current priorities (2026-07-29)
 
@@ -457,9 +550,12 @@ Measurement before features — everything below is validated against `qorvix be
    set), device-local KV, subgroups.
 3. **Real-hardware benchmarks** 🟡🖥️ — T4 CUDA row is filled. Still open: T4 Vulkan, and
    RTX / AMD / Intel via `scripts/colab_bench.sh`.
-4. **Batched prefill** ⬜ — measured T4 prefill (99 tok/s) is barely above decode (87), the
+4. **Batched prefill** 🟡 — measured T4 prefill (99 tok/s) is barely above decode (87), the
    signature of a token-at-a-time prefill. GEMV → GEMM for the prompt phase is a large, separate
-   win that does not touch `decode_tok_per_sec`.
+   win that does not touch `decode_tok_per_sec`. **The CPU kernel now exists**: Phase 11a's
+   `qmatmulN` is exactly this — dequantize each weight block once, fold it into all N dot products
+   — and it took the encoder from 27.7 to 225.7 tok/s. Wiring it into `TextModel`'s prefill is the
+   remaining half; do not build it twice.
 5. **Documentation & release** ⬜ — publish results once numbers stabilize.
 6. **Native vendor backends** ⬜🖥️ — the compute-backend set is CPU · CUDA · Vulkan · **HIP · Metal
    · SYCL**, of which the last three are not started:
