@@ -25,6 +25,9 @@
 #include "qorvix/ports.hpp"
 #include "qorvix/embeddings/embed_benchmark.hpp"
 #include "qorvix/rag/pipeline.hpp"
+#include "qorvix/vision/clip_model.hpp"
+#include "qorvix/vision/image.hpp"
+#include "qorvix/vision/vision_check.hpp"
 #include "qorvix/runtime/benchmark.hpp"
 #include "qorvix/runtime/cpu_features.hpp"
 #include "qorvix/runtime/dequant.hpp"
@@ -758,6 +761,228 @@ int cmdEmbed(const std::vector<std::string_view>& args) {
     std::cout << (vec.size() > 8 ? ", ...]\n" : "]\n");
     std::cout << std::defaultfloat << "[load " << loadSec << "s | embed " << runSec << "s]\n";
     return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
+// ---- vision: CLIP tower + LLaVA projector ---------------------------------------------------
+
+int cmdImageEmbed(const std::vector<std::string_view>& args) {
+  namespace vis = qorvix::vision;
+  const std::string mm = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string imagePath = flagValue(args, "--image");
+  if (mm.empty() || imagePath.empty()) {
+    std::cerr << "usage: qorvix image-embed <mmproj.gguf> --image <file.png> [--project] [--json]\n";
+    return 1;
+  }
+  const bool json = hasFlag(args, "--json");
+  const bool project = hasFlag(args, "--project");
+
+  try {
+    using clock = std::chrono::steady_clock;
+    const auto tLoad0 = clock::now();
+    std::string err;
+    auto model = vis::ClipVisionModel::fromGguf(qorvix::gguf::GgufFile::open(mm), err);
+    if (!model) {
+      std::cerr << "error: vision tower: " << err << "\n";
+      return 1;
+    }
+    const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+    vis::Image img;
+    if (!vis::loadImage(imagePath, img, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+
+    const auto tRun0 = clock::now();
+    std::vector<float> hidden;
+    if (!model->encodeImage(img, hidden, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    std::vector<float> projected;
+    if (project) {
+      if (!model->project(hidden, projected, err)) {
+        std::cerr << "error: " << err << "\n";
+        return 1;
+      }
+    }
+    const double runSec = std::chrono::duration<double>(clock::now() - tRun0).count();
+
+    const std::vector<float>& outv = project ? projected : hidden;
+    const int tokens = static_cast<int>(model->patchTokens());
+    const int dim = project ? model->projectedDim() : static_cast<int>(model->embeddingLength());
+
+    if (json) {
+      std::cout << std::fixed << std::setprecision(6) << "{\"tokens\":" << tokens
+                << ",\"dim\":" << dim << ",\"projected\":" << (project ? "true" : "false")
+                << ",\"features\":[";
+      for (std::size_t i = 0; i < outv.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << outv[i];
+      }
+      std::cout << "]}\n";
+      return 0;
+    }
+
+    std::cout << std::fixed << std::setprecision(6) << "model:    " << model->config().name
+              << " (cpu)\n"
+              << "image:    " << imagePath << "  " << img.width << "x" << img.height << " -> "
+              << model->config().imageSize << "x" << model->config().imageSize << "\n"
+              << "tower:    " << model->config().blockCount << " layers, d "
+              << model->config().embeddingLength << ", patch " << model->config().patchSize << ", "
+              << (model->config().useGelu ? "gelu" : "quick-gelu") << "\n"
+              << "features: " << tokens << " patch tokens x " << dim
+              << (project ? "  (projected for the language model)" : "  (vision hidden states)")
+              << "\n"
+              << "first 8:  [";
+    for (int i = 0; i < 8 && i < static_cast<int>(outv.size()); ++i) {
+      if (i) std::cout << ", ";
+      std::cout << outv[static_cast<std::size_t>(i)];
+    }
+    std::cout << ", ...]\n"
+              << std::defaultfloat << "[load " << loadSec << "s | encode " << runSec << "s]\n";
+    return 0;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
+// The Phase 11b analogue of embed-check. Tiered the same way and for the same reason: the vision
+// path has two independently-wrong halves, and one aggregate verdict would not say which.
+int cmdVisionCheck(const std::vector<std::string_view>& args) {
+  namespace vis = qorvix::vision;
+  const std::string mm = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string refPath = flagValue(args, "--ref");
+  std::string imagePath = flagValue(args, "--image");
+  if (mm.empty() || refPath.empty()) {
+    std::cerr << "usage: qorvix vision-check <mmproj.gguf> --ref <fixture> [--image <file.png>] "
+                 "[--min-cos 0.999]\n";
+    return 1;
+  }
+  if (imagePath.empty()) imagePath = "tests/data/vision_probe.png";
+  float minCos = 0.999f;
+  if (auto v = flagValue(args, "--min-cos"); !v.empty()) minCos = std::stof(v);
+
+  try {
+    std::string err;
+    vis::VisionReference ref;
+    if (!ref.load(refPath, err)) {
+      std::cerr << "error: reference: " << err << "\n";
+      return 1;
+    }
+    vis::Image img;
+    if (!vis::loadImage(imagePath, img, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    auto model = vis::ClipVisionModel::fromGguf(qorvix::gguf::GgufFile::open(mm), err);
+    if (!model) {
+      std::cerr << "error: vision tower: " << err << "\n";
+      return 1;
+    }
+
+    std::cout << "tower:   " << mm << "\n"
+              << "config:  " << model->config().blockCount << " layers, d "
+              << model->config().embeddingLength << ", " << model->patchTokens() << " patches, "
+              << (model->config().useGelu ? "gelu" : "quick-gelu") << "\n"
+              << "image:   " << imagePath << " (" << img.width << "x" << img.height << ")\n"
+              << "ref:     " << ref.model << "\n\n";
+
+    if (static_cast<int>(model->config().imageSize) != ref.imageSize) {
+      std::cout << "Reference image size " << ref.imageSize << " != tower's "
+                << model->config().imageSize << " — wrong fixture.\n\nRESULT: MISMATCH\n";
+      return 1;
+    }
+
+    bool pass = true;
+
+    // ---- tier 1: preprocessing ----
+    // Separated because it is the half most likely to be subtly wrong and the half whose errors
+    // are invisible: a different resize filter or crop origin moves every downstream value and
+    // reports nothing. Both faults found while building this were here, not in the transformer.
+    std::vector<float> chw;
+    if (!vis::preprocessClip(img, model->preprocessConfig(), chw, err)) {
+      std::cerr << "error: preprocess: " << err << "\n";
+      return 1;
+    }
+    double mean = 0.0, absMean = 0.0;
+    for (float v : chw) {
+      mean += v;
+      absMean += std::abs(v);
+    }
+    mean /= static_cast<double>(chw.size());
+    absMean /= static_cast<double>(chw.size());
+    double worstPixel = std::max(std::abs(mean - ref.pixelMean), std::abs(absMean - ref.pixelAbsMean));
+    const int S = ref.imageSize;
+    for (const auto& p : ref.pixelProbes) {
+      const float got = chw[(static_cast<std::size_t>(p.c) * S + p.y) * S + p.x];
+      worstPixel = std::max(worstPixel, static_cast<double>(std::abs(got - p.value)));
+    }
+    std::cout << std::scientific << std::setprecision(2)
+              << "Preprocessing vs reference:      max |diff| " << worstPixel << "  ("
+              << ref.pixelProbes.size() << " pixel probes + mean/abs-mean)\n";
+    if (worstPixel > 1e-3) pass = false;
+
+    // ---- tier 2: the transformer ----
+    std::vector<float> hidden;
+    if (!model->encodePixels(chw, hidden, err)) {
+      std::cerr << "error: encode: " << err << "\n";
+      return 1;
+    }
+    const int P = static_cast<int>(model->patchTokens());
+    const int D = static_cast<int>(model->embeddingLength());
+    if (P != ref.patches || D != ref.dim) {
+      std::cout << "Feature shape " << P << "x" << D << " != reference " << ref.patches << "x"
+                << ref.dim << "\n\nRESULT: MISMATCH\n";
+      return 1;
+    }
+
+    const float cosRow0 = qorvix::runtime::ops::cosineSimilarity(hidden.data(), ref.row0.data(), D);
+    double maxRow0 = 0.0;
+    for (int i = 0; i < D; ++i) {
+      maxRow0 = std::max(maxRow0, static_cast<double>(std::abs(hidden[i] - ref.row0[i])));
+    }
+
+    std::vector<float> means(static_cast<std::size_t>(P));
+    for (int p = 0; p < P; ++p) {
+      double m = 0.0;
+      for (int i = 0; i < D; ++i) m += hidden[static_cast<std::size_t>(p) * D + i];
+      means[static_cast<std::size_t>(p)] = static_cast<float>(m / D);
+    }
+    const float cosMeans =
+        qorvix::runtime::ops::cosineSimilarity(means.data(), ref.rowMeans.data(), P);
+
+    std::cout << std::fixed << std::setprecision(7)
+              << "Patch-token parity (row 0):      cos " << cosRow0 << std::scientific
+              << std::setprecision(2) << "   max |diff| " << maxRow0 << "\n"
+              << std::fixed << std::setprecision(7)
+              << "All-patch parity (row means):    cos " << cosMeans << "\n"
+              << std::defaultfloat;
+    if (cosRow0 < minCos || cosMeans < minCos) pass = false;
+
+    // ---- tier 3: the projector, when the tower carries one ----
+    if (model->hasProjector()) {
+      std::vector<float> projected;
+      if (!model->project(hidden, projected, err)) {
+        std::cerr << "error: project: " << err << "\n";
+        return 1;
+      }
+      bool finite = true;
+      for (float v : projected) finite = finite && std::isfinite(v);
+      std::cout << "LLaVA projector:                 " << P << " x " << model->projectedDim()
+                << (finite ? "  finite OK" : "  NON-FINITE") << "\n";
+      pass = pass && finite;
+    } else {
+      std::cout << "LLaVA projector:                 absent in this tower\n";
+    }
+
+    std::cout << "\nRESULT: " << (pass ? "PASS" : "MISMATCH") << "\n";
+    return pass ? 0 : 1;
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;
@@ -1754,6 +1979,8 @@ int main(int argc, char** argv) {
   if (command == "generate") return cmdGenerate(args);
   if (command == "embed") return cmdEmbed(args);
   if (command == "embed-check") return cmdEmbedCheck(args);
+  if (command == "image-embed") return cmdImageEmbed(args);
+  if (command == "vision-check") return cmdVisionCheck(args);
   if (command == "rag") return cmdRag(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();

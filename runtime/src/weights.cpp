@@ -6,7 +6,7 @@
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/runtime/dequant.hpp"
 
-#include "weights_detail.hpp"
+#include "qorvix/runtime/tensor_load.hpp"
 
 namespace qorvix::runtime {
 

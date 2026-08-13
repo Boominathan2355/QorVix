@@ -1,11 +1,15 @@
 #pragma once
 
-// Shared internals of the GGUF weight loaders. Private to runtime/src — deliberately NOT under
-// include/, so nothing outside the module can depend on it.
+// Shared internals of the GGUF weight loaders: resolving a tensor's bytes inside the file's mmap,
+// borrowing a quantized matmul weight, and materializing a small F32 vector.
 //
-// These four helpers were an anonymous namespace inside weights.cpp until the BERT encoder loader
-// needed the identical logic. The alternative was copy-paste, which would have meant two places to
-// fix the next time a tensor-lookup edge case turns up.
+// These began as an anonymous namespace inside weights.cpp, moved to a private header when the
+// BERT encoder loader needed the identical logic, and moved here when the CLIP vision tower became
+// the third consumer — at which point reaching into another module's src/ directory was worse than
+// admitting this is shared.
+//
+// `detail` is the contract: these are loader internals, not a stable API. Anything outside a
+// weight loader should be using Weights / EncoderWeights / ClipWeights instead.
 
 #include <cstddef>
 #include <cstdint>

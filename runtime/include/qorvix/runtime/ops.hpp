@@ -41,8 +41,14 @@ void swiglu(float* out, const float* gate, const float* up, int n);
 float gelu(float z);
 float geluTanh(float z);
 
+// "Quick" GELU: z * sigmoid(1.702 * z). A third variant, and not interchangeable with the other
+// two — it is what OpenAI's CLIP was trained with, and a clip GGUF selects it via `clip.use_gelu`
+// being false. Substituting exact GELU here shifts every vision feature without erroring.
+float geluQuick(float z);
+
 // Applies gelu() elementwise in place over n elements (the encoder FFN's activation step).
 void geluInPlace(float* x, int n);
+void geluQuickInPlace(float* x, int n);
 
 // Elementwise residual add: out[i] += x[i].
 void add(float* out, const float* x, int n);

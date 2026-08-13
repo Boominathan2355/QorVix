@@ -85,8 +85,14 @@ float geluTanh(float z) {
   return 0.5f * z * (1.0f + std::tanh(inner));
 }
 
+float geluQuick(float z) { return z / (1.0f + std::exp(-1.702f * z)); }
+
 void geluInPlace(float* x, int n) {
   for (int i = 0; i < n; ++i) x[i] = gelu(x[i]);
+}
+
+void geluQuickInPlace(float* x, int n) {
+  for (int i = 0; i < n; ++i) x[i] = geluQuick(x[i]);
 }
 
 void add(float* out, const float* x, int n) {

@@ -17,4 +17,4 @@ target_link_libraries(qorvix_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 
 add_executable(qorvix src/main.cpp)
 target_link_libraries(qorvix PRIVATE qorvix_core qorvix_gguf qorvix_cuda qorvix_vulkan qorvix_runtime
-  qorvix_embeddings qorvix_rag qorvix_tokenizer qorvix_scheduler qorvix_api)
+  qorvix_embeddings qorvix_vision qorvix_rag qorvix_tokenizer qorvix_scheduler qorvix_api)
