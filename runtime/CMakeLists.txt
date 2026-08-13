@@ -8,6 +8,7 @@ add_library(qorvix_runtime STATIC
   src/weights.cpp
   src/encoder_weights.cpp
   src/text_model.cpp
+  src/multimodal.cpp
   src/sampler.cpp
   src/generator.cpp
 )

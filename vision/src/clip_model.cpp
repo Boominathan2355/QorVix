@@ -229,4 +229,18 @@ bool ClipVisionModel::project(const std::vector<float>& hidden, std::vector<floa
   return true;
 }
 
+bool ClipVisionModel::encodeProjected(const Image& img, std::vector<float>& out,
+                                      std::string& error) {
+  error.clear();
+  if (!w_.hasProjector()) {
+    // Named before any work happens: a tower-only file is a different artifact, not a broken one,
+    // and the caller needs to know to fetch an mmproj rather than to retry.
+    error = "this clip file has no llava projector — vision-language chat needs an mmproj file";
+    return false;
+  }
+  std::vector<float> hidden;
+  if (!encodeImage(img, hidden, error)) return false;
+  return project(hidden, out, error);
+}
+
 }  // namespace qorvix::vision

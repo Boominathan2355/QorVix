@@ -131,3 +131,60 @@ guesses during Phase 11a:
   `ffn_{up,down}.{weight,bias}`, `layer_output_norm.{weight,bias}`. No `ffn_gate`, no
   `output_norm`, no `output.weight` — an encoder has no LM head.
 
+
+## Validating vision-language chat (Phase 11b-2)
+
+Two files are needed and **they must be a matching pair** — the mmproj's projector emits vectors
+in one specific decoder's input space:
+
+```sh
+# the vision half (already required by Phase 11b-1's vision-check)
+curl -fsSL -o models/llava-v1.5-7b-mmproj-f16.gguf \
+  https://huggingface.co/mys/ggml_llava-v1.5-7b/resolve/main/mmproj-model-f16.gguf
+# the matching language model (~4.1 GB)
+curl -fsSL -o models/llava-v1.5-7b-Q4_K_M.gguf \
+  https://huggingface.co/jartine/llava-v1.5-7B-GGUF/resolve/main/llava-v1.5-7b-Q4_K_M.gguf
+```
+
+```sh
+qorvix vlm-check models/llava-v1.5-7b-Q4_K_M.gguf \
+  --mmproj models/llava-v1.5-7b-mmproj-f16.gguf --image tests/data/vision_probe.png
+
+qorvix generate models/llava-v1.5-7b-Q4_K_M.gguf \
+  --mmproj models/llava-v1.5-7b-mmproj-f16.gguf --image tests/data/vision_probe.png \
+  --prompt "USER: <image>
+What is in this image? ASSISTANT:" --temp 0 --max 40
+```
+
+**Pairing is checked before any work happens.** The projector's output width is compared against
+the decoder's `d_model` as soon as both headers are mapped, so a mismatched pair costs a second,
+not a full CLIP encode:
+
+```
+$ qorvix vlm-check models/tinyllama-1.1b-chat-q4km.gguf \
+    --mmproj models/llava-v1.5-7b-mmproj-f16.gguf --image tests/data/vision_probe.png
+tier 3  image splice
+        projector 1024 -> 4096 vs decoder d_model 2048  -> MISMATCH (this mmproj belongs to a different model)
+```
+
+### What is and is not verified here
+
+`vlm-check` tiers 1 and 2 need **no vision model at all**, because the property they assert is
+self-checking: feeding a token's own embedding row through `forwardEmbedding` must reproduce, bit
+for bit, what feeding its id through `forward` produced. Measured on TinyLlama 1.1B Q4_K_M:
+
+```
+tier 1  single-step splice identity over 6 tokens
+        max |diff| 0.00e+00, argmax mismatches 0  -> PASS
+tier 2  full-prefill splice identity (6 positions)
+        max |diff| 0.00e+00, argmax identical  -> PASS
+```
+
+Tier 3 is a **smoke test, and says so in its own output** — it asserts the projector width, that
+the spliced prefill runs, and that the logits are finite. It does not assert output fidelity,
+because no LLaVA reference is captured in this repo. Capturing one (the `capture_vision_reference.py`
+treatment applied to a full LLaVA forward) is the honest next step.
+
+Like `embed-check`, `gpu-check` and `vulkan-check`, this is a **CLI gate rather than a CTest case**:
+the Docker test image has no GGUFs, so a model-dependent test would fail the image build. The
+seam's mechanics are covered by `tests/multimodal_test.cpp`, which needs no model.

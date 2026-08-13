@@ -1,10 +1,12 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <mutex>
 #include <iomanip>
 #include <iostream>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -33,6 +35,7 @@
 #include "qorvix/runtime/dequant.hpp"
 #include "qorvix/runtime/generator.hpp"
 #include "qorvix/runtime/model_config.hpp"
+#include "qorvix/runtime/multimodal.hpp"
 #include "qorvix/runtime/pooling.hpp"
 #include "qorvix/runtime/text_model.hpp"
 #include "qorvix/runtime/weights.hpp"
@@ -245,6 +248,18 @@ std::string flagValue(const std::vector<std::string_view>& args, std::string_vie
   return {};
 }
 
+// Every occurrence of a repeatable `--flag value` option, in command-line order. `--image` is
+// repeatable because a VLM turn can carry more than one image and their ORDER is what pairs them
+// with the <image> markers in the prompt.
+std::vector<std::string> flagValues(const std::vector<std::string_view>& args,
+                                    std::string_view flag) {
+  std::vector<std::string> out;
+  for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+    if (args[i] == flag) out.emplace_back(args[i + 1]);
+  }
+  return out;
+}
+
 // The weight-bridge + model builders (buildGpuModel/buildVulkanModel) and the createEngine factory
 // now live in qorvix/backend.hpp — the single unified backend layer. main.cpp only ever talks to
 // runtime::IInferenceEngine via createEngine(), never to a concrete backend.
@@ -273,9 +288,12 @@ qorvix::Backend backendFromArgs(const std::vector<std::string_view>& args) {
 // (openSession -> forward -> sample -> decode), so CPU/CUDA/Vulkan run byte-identical host code and
 // the only difference is which engine createEngine() handed back. Splits per-token wall time into
 // forward / sampling / stdout so the bottleneck is visible on any backend.
+// `mm` is the prefill sequence — text tokens, plus image patches for a vision-language turn (which
+// is why this takes a MultimodalPrompt rather than a string). `echo` is what to print back as the
+// prompt; image positions have no text, so the caller decides how they read.
 int runGenerate(qorvix::runtime::IInferenceEngine& engine, qorvix::tokenizer::Tokenizer& tok,
-                const std::string& prompt, const qorvix::runtime::GenerationConfig& cfg,
-                double loadSec) {
+                const qorvix::runtime::MultimodalPrompt& mm, const std::string& echo,
+                const qorvix::runtime::GenerationConfig& cfg, double loadSec) {
   using clock = std::chrono::steady_clock;
   const auto session = engine.openSession();
   if (session == qorvix::memory::kInvalidSession) {
@@ -284,21 +302,21 @@ int runGenerate(qorvix::runtime::IInferenceEngine& engine, qorvix::tokenizer::To
   }
   const int maxSeq = static_cast<int>(engine.maxSeqLen());
   qorvix::runtime::Sampler sampler(cfg.sampling, cfg.seed);
-  const auto promptIds = tok.encode(prompt, cfg.addBos);
-  std::vector<int> history = promptIds;
+  const auto inputs = mm.steps();
+  std::vector<int> history = mm.textIds();
   const int eos = tok.special().eos;
   auto since = [](const clock::time_point& t0) {
     return std::chrono::duration<double>(clock::now() - t0).count();
   };
 
-  std::cout << prompt << std::flush;
+  std::cout << echo << std::flush;
   const auto tGen0 = clock::now();
   double tFwd = 0, tSample = 0, tIo = 0;
   int pos = 0;
   std::vector<float> logits;
-  for (std::size_t i = 0; i < promptIds.size() && pos < maxSeq; ++i, ++pos) {
+  for (std::size_t i = 0; i < inputs.size() && pos < maxSeq; ++i, ++pos) {
     const auto t = clock::now();
-    logits = engine.forward(session, promptIds[i], pos);
+    logits = engine.forwardInput(session, inputs[i], pos);
     tFwd += since(t);
   }
   int next;
@@ -317,8 +335,14 @@ int runGenerate(qorvix::runtime::IInferenceEngine& engine, qorvix::tokenizer::To
   engine.closeSession(session);
 
   const double genSec = since(tGen0);
-  const int forwards = static_cast<int>(promptIds.size()) + generated;
-  std::cout << "\n\n[" << engine.backendName() << " | " << promptIds.size() << " prompt tokens, "
+  const int forwards = static_cast<int>(inputs.size()) + generated;
+  std::ostringstream promptDesc;
+  promptDesc << inputs.size() << " prompt tokens";
+  if (mm.hasImages()) {
+    promptDesc << " (" << mm.textTokens() << " text + " << mm.imageTokens() << " image, "
+               << mm.imageCount() << (mm.imageCount() == 1 ? " image" : " images") << ")";
+  }
+  std::cout << "\n\n[" << engine.backendName() << " | " << promptDesc.str() << ", "
             << generated << " generated" << (hitEos ? ", eos" : "") << "]\n"
             << "[load " << std::fixed << std::setprecision(1) << loadSec << "s | " << forwards
             << " forwards in " << std::setprecision(2) << genSec << "s = "
@@ -331,12 +355,52 @@ int runGenerate(qorvix::runtime::IInferenceEngine& engine, qorvix::tokenizer::To
 }
 
 
+// Encodes each image FILE into projected image parts, ready to splice into a decoder prompt.
+// Shared by `generate --image` and `vlm-check` tier 3; `serve` has its own loop because its images
+// arrive as decoded data:-URI bytes rather than paths.
+//
+// The projector/decoder width check is deliberately NOT here: this function has no decoder to
+// compare against, and both callers know d_model before they call, so they check first and skip
+// the encode entirely on a mismatch.
+bool encodeImageParts(qorvix::vision::ClipVisionModel& tower,
+                      const std::vector<std::string>& paths,
+                      std::vector<qorvix::runtime::PromptPart>& out, std::string& err) {
+  namespace vis = qorvix::vision;
+  out.clear();
+  for (const auto& p : paths) {
+    vis::Image img;
+    if (!vis::loadImage(p, img, err)) {
+      err = p + ": " + err;
+      return false;
+    }
+    std::vector<float> features;
+    if (!tower.encodeProjected(img, features, err)) {
+      err = p + ": " + err;
+      return false;
+    }
+    out.push_back(qorvix::runtime::PromptPart::fromImage(
+        std::move(features), static_cast<int>(tower.patchTokens()), tower.projectedDim()));
+  }
+  return true;
+}
+
 int cmdGenerate(const std::vector<std::string_view>& args) {
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   const std::string prompt = flagValue(args, "--prompt");
+  const std::string mmprojPath = flagValue(args, "--mmproj");
+  const std::vector<std::string> imagePaths = flagValues(args, "--image");
   if (path.empty() || prompt.empty()) {
     std::cerr << "usage: qorvix generate <file.gguf> --prompt \"...\" "
-                 "[--gpu|--vulkan] [--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n";
+                 "[--gpu|--vulkan] [--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n"
+                 "       [--mmproj <clip.gguf> --image <file.png> ...]   (vision-language chat)\n";
+    return 1;
+  }
+  if (!imagePaths.empty() && mmprojPath.empty()) {
+    std::cerr << "error: --image needs --mmproj <clip.gguf> (the vision tower that encodes it)\n";
+    return 1;
+  }
+  if (!mmprojPath.empty() && imagePaths.empty()) {
+    std::cerr << "error: --mmproj was given but no --image — nothing for the tower to encode\n";
     return 1;
   }
 
@@ -355,8 +419,9 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   try {
     using clock = std::chrono::steady_clock;
     const auto tLoad0 = clock::now();
-    auto file = qorvix::gguf::GgufFile::open(path);
     std::string err;
+
+    auto file = qorvix::gguf::GgufFile::open(path);
     // Tokenizer first (it copies the vocab out), then the file is moved into createEngine — the CPU
     // engine keeps it mapped for its borrowed weights; device engines upload and release it.
     auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
@@ -364,15 +429,71 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
       std::cerr << "error: tokenizer: " << err << "\n";
       return 1;
     }
-    const int maxSeq = static_cast<int>(tok->encode(prompt, cfg.addBos).size()) + cfg.maxNewTokens + 4;
+    const int dModel = static_cast<int>(qorvix::runtime::configFromGguf(file, err).embeddingLength);
+
+    // Order here is chosen so every cheap failure precedes every expensive one. Opening the decoder
+    // GGUF only maps its header, so d_model is known before either the CLIP encode (tens of
+    // seconds) or the decoder's weight load. A mismatched mmproj — the likeliest setup mistake —
+    // therefore costs nothing to discover.
+    std::vector<qorvix::runtime::PromptPart> imageParts;
+    std::optional<qorvix::vision::ClipVisionModel> tower;
+    if (!mmprojPath.empty()) {
+      tower = qorvix::vision::ClipVisionModel::fromGguf(
+          qorvix::gguf::GgufFile::open(mmprojPath), err);
+      if (!tower) {
+        std::cerr << "error: vision tower: " << err << "\n";
+        return 1;
+      }
+      if (!tower->hasProjector()) {
+        std::cerr << "error: " << mmprojPath
+                  << " has no llava projector — vision-language chat needs an mmproj file\n";
+        return 1;
+      }
+      if (tower->projectedDim() != dModel) {
+        std::cerr << "error: projector emits " << tower->projectedDim()
+                  << "-d vectors but the decoder's d_model is " << dModel
+                  << " — this mmproj belongs to a different language model\n";
+        return 1;
+      }
+      if (!encodeImageParts(*tower, imagePaths, imageParts, err)) {
+        std::cerr << "error: " << err << "\n";
+        return 1;
+      }
+    }
+
+    std::vector<qorvix::runtime::PromptPart> parts;
+    if (!qorvix::runtime::partsFromPrompt(prompt, std::move(imageParts), parts, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+    qorvix::runtime::MultimodalPrompt mm(dModel);
+    if (!qorvix::runtime::buildPrompt(parts, *tok, cfg.addBos, mm, err)) {
+      std::cerr << "error: " << err << "\n";
+      return 1;
+    }
+
+    const int maxSeq = mm.size() + cfg.maxNewTokens + 4;
     auto engine = qorvix::createEngine(backend, std::move(file), static_cast<std::uint32_t>(maxSeq),
                                        1, err);
     if (!engine) {
       std::cerr << "error: " << qorvix::backendName(backend) << " engine: " << err << "\n";
       return 1;
     }
+    if (mm.hasImages() && !engine->acceptsInputEmbeddings()) {
+      std::cerr << "error: the " << engine->backendName()
+                << " backend cannot take input embeddings, so it cannot serve images — drop the "
+                   "backend flag to run vision-language chat on the CPU\n";
+      return 1;
+    }
     const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
-    return runGenerate(*engine, *tok, prompt, cfg, loadSec);
+
+    // The echoed prompt keeps the <image> marker rather than the 576 positions it stands for.
+    if (mm.hasImages()) {
+      std::cout << "[vision: " << mmprojPath << " | " << imagePaths.size()
+                << (imagePaths.size() == 1 ? " image" : " images") << " -> " << mm.imageTokens()
+                << " patch tokens x " << tower->projectedDim() << "]\n";
+    }
+    return runGenerate(*engine, *tok, mm, prompt, cfg, loadSec);
   } catch (const qorvix::gguf::GgufParseError& e) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;
@@ -989,6 +1110,189 @@ int cmdVisionCheck(const std::vector<std::string_view>& args) {
   }
 }
 
+// ---- vlm-check: the Phase 11b-2 correctness gate ---------------------------------------------
+//
+// Tiered for the same reason embed-check and vision-check are: the vision-language path has
+// separable halves and one aggregate verdict would not say which broke.
+//
+// The first two tiers need NO vision model and NO reference capture, because the property they
+// assert is self-checking: feeding a token's OWN embedding row through the new input-embedding
+// seam must reproduce, bit for bit, what feeding its id through the old path produced. Anything
+// that gets lost in the splice — a wrong stride, a missed scale, a stale KV write — breaks that
+// equality. That is the whole risk of Phase 11b-2's seam, and it is testable on any text GGUF.
+//
+// Tier 3 needs an mmproj + image and is a SMOKE test, not a numerical gate: there is no captured
+// LLaVA reference in this repo, so it asserts shapes and that the spliced sequence runs, and says
+// so rather than implying a verified figure.
+int cmdVlmCheck(const std::vector<std::string_view>& args) {
+  namespace rt = qorvix::runtime;
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string mmprojPath = flagValue(args, "--mmproj");
+  const std::string imagePath = flagValue(args, "--image");
+  if (path.empty()) {
+    std::cerr << "usage: qorvix vlm-check <model.gguf> [--mmproj <clip.gguf> --image <file.png>]\n";
+    return 1;
+  }
+
+  try {
+    std::string err;
+    // Opened twice on purpose: the engine takes ownership of one mapping, and tier 1 needs the
+    // embedding table alongside it to look up the rows it feeds back in.
+    auto weightFile = qorvix::gguf::GgufFile::open(path);
+    const auto cfg = rt::configFromGguf(weightFile, err);
+    if (!cfg.valid()) {
+      std::cerr << "error: " << (err.empty() ? "invalid model config" : err) << "\n";
+      return 1;
+    }
+    auto weights = rt::loadWeights(weightFile, cfg, err);
+    if (!weights) {
+      std::cerr << "error: weights: " << err << "\n";
+      return 1;
+    }
+
+    auto engineFile = qorvix::gguf::GgufFile::open(path);
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(engineFile, err);
+    if (!tok) {
+      std::cerr << "error: tokenizer: " << err << "\n";
+      return 1;
+    }
+    auto engine = qorvix::createEngine(qorvix::Backend::Cpu, std::move(engineFile), 512, 2, err);
+    if (!engine) {
+      std::cerr << "error: engine: " << err << "\n";
+      return 1;
+    }
+
+    const int d = static_cast<int>(cfg.embeddingLength);
+    std::cout << "model:    " << cfg.architecture << "  (" << path << ")\n"
+              << "decoder:  " << cfg.blockCount << " layers, d_model " << d << ", vocab "
+              << cfg.vocabSize << "\n"
+              << "seam:     forwardEmbedding "
+              << (engine->acceptsInputEmbeddings() ? "accepted" : "REFUSED") << " by the "
+              << engine->backendName() << " engine\n\n";
+    if (!engine->acceptsInputEmbeddings()) {
+      std::cerr << "FAIL: the engine does not accept input embeddings\n";
+      return 1;
+    }
+
+    bool pass = true;
+
+    // ---- tier 1: single-step splice identity --------------------------------------------------
+    const auto probeIds = tok->encode("The quick brown fox", /*addBos=*/true);
+    double worstStep = 0.0;
+    int stepArgmaxMismatches = 0;
+    for (int id : probeIds) {
+      const auto sA = engine->openSession();
+      const auto sB = engine->openSession();
+      const std::vector<float> byId = engine->forward(sA, id, 0);
+      std::vector<float> row(d);
+      rt::embeddingRow(weights->tokenEmbd, id, row.data());
+      const std::vector<float> byEmbedding = engine->forwardEmbedding(sB, row.data(), 0);
+      engine->closeSession(sA);
+      engine->closeSession(sB);
+
+      for (std::size_t i = 0; i < byId.size(); ++i)
+        worstStep = std::max(worstStep, std::abs(static_cast<double>(byId[i]) - byEmbedding[i]));
+      if (argmaxOf(byId) != argmaxOf(byEmbedding)) ++stepArgmaxMismatches;
+    }
+    const bool tier1 = worstStep == 0.0 && stepArgmaxMismatches == 0;
+    pass = pass && tier1;
+    std::cout << "tier 1  single-step splice identity over " << probeIds.size() << " tokens\n"
+              << "        max |diff| " << std::scientific << std::setprecision(2) << worstStep
+              << std::defaultfloat << ", argmax mismatches " << stepArgmaxMismatches << "  -> "
+              << (tier1 ? "PASS" : "FAIL") << "\n";
+
+    // ---- tier 2: whole-sequence splice identity -----------------------------------------------
+    // Same comparison across a full prefill, so a splice that only corrupts the KV cache (correct
+    // at pos 0, wrong from pos 1) cannot slip through tier 1.
+    const auto sA = engine->openSession();
+    const auto sB = engine->openSession();
+    std::vector<float> lastA, lastB;
+    std::vector<float> row(d);
+    for (std::size_t i = 0; i < probeIds.size(); ++i) {
+      lastA = engine->forward(sA, probeIds[i], static_cast<int>(i));
+      rt::embeddingRow(weights->tokenEmbd, probeIds[i], row.data());
+      lastB = engine->forwardEmbedding(sB, row.data(), static_cast<int>(i));
+    }
+    engine->closeSession(sA);
+    engine->closeSession(sB);
+    double worstSeq = 0.0;
+    for (std::size_t i = 0; i < lastA.size(); ++i)
+      worstSeq = std::max(worstSeq, std::abs(static_cast<double>(lastA[i]) - lastB[i]));
+    const bool tier2 = worstSeq == 0.0 && argmaxOf(lastA) == argmaxOf(lastB);
+    pass = pass && tier2;
+    std::cout << "tier 2  full-prefill splice identity (" << probeIds.size() << " positions)\n"
+              << "        max |diff| " << std::scientific << std::setprecision(2) << worstSeq
+              << std::defaultfloat << ", argmax "
+              << (argmaxOf(lastA) == argmaxOf(lastB) ? "identical" : "DIFFERENT") << "  -> "
+              << (tier2 ? "PASS" : "FAIL") << "\n";
+
+    // ---- tier 3: the image path (opt-in) ------------------------------------------------------
+    if (mmprojPath.empty() || imagePath.empty()) {
+      std::cout << "tier 3  image splice — SKIPPED (pass --mmproj <clip.gguf> --image <f.png>)\n";
+    } else {
+      auto tower = qorvix::vision::ClipVisionModel::fromGguf(
+          qorvix::gguf::GgufFile::open(mmprojPath), err);
+      if (!tower) {
+        std::cerr << "error: vision tower: " << err << "\n";
+        return 1;
+      }
+      // Width first, encode second: the check is free and the encode is the most expensive step
+      // in the whole gate, so a mismatched mmproj should not cost a full CLIP pass to discover.
+      const bool dimOk = tower->projectedDim() == d;
+      std::cout << "tier 3  image splice\n"
+                << "        projector " << tower->embeddingLength() << " -> "
+                << tower->projectedDim() << " vs decoder d_model " << d << "  -> "
+                << (dimOk ? "match" : "MISMATCH (this mmproj belongs to a different model)")
+                << "\n";
+      pass = pass && dimOk;
+
+      if (dimOk) {
+        std::vector<rt::PromptPart> imageParts;
+        if (!encodeImageParts(*tower, {imagePath}, imageParts, err)) {
+          std::cerr << "error: " << err << "\n";
+          return 1;
+        }
+        std::vector<rt::PromptPart> parts;
+        if (!rt::partsFromPrompt("USER: <image>\nDescribe the image. ASSISTANT:",
+                                 std::move(imageParts), parts, err)) {
+          std::cerr << "error: " << err << "\n";
+          return 1;
+        }
+        rt::MultimodalPrompt mm(d);
+        if (!rt::buildPrompt(parts, *tok, /*addBos=*/true, mm, err)) {
+          std::cerr << "error: " << err << "\n";
+          return 1;
+        }
+        const auto steps = mm.steps();
+        const auto s = engine->openSession();
+        std::vector<float> logits;
+        bool finite = true;
+        for (std::size_t i = 0; i < steps.size(); ++i) {
+          logits = engine->forwardInput(s, steps[i], static_cast<int>(i));
+        }
+        for (float v : logits) finite = finite && std::isfinite(v);
+        engine->closeSession(s);
+        const int top = argmaxOf(logits);
+        std::cout << "        prefill " << mm.textTokens() << " text + " << mm.imageTokens()
+                  << " image positions, logits " << (finite ? "finite" : "NOT FINITE")
+                  << ", next token \"" << tok->decodeToken(top) << "\"\n"
+                  << "        -> " << (finite ? "PASS (smoke test: no LLaVA reference is captured "
+                                                "in this repo, so this asserts shape and "
+                                                "well-formedness, not output fidelity)"
+                                              : "FAIL")
+                  << "\n";
+        pass = pass && finite;
+      }
+    }
+
+    std::cout << "\n" << (pass ? "PASS" : "FAIL") << "\n";
+    return pass ? 0 : 1;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 // ---- rag: index and search over a document directory ----------------------------------------
 
 // Loads an embedding model plus its tokenizer, the pair every RAG command needs. Keeps the
@@ -1153,9 +1457,11 @@ int cmdServe(const std::vector<std::string_view>& args) {
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   if (path.empty()) {
     std::cerr << "usage: qorvix serve <file.gguf> [--gpu|--vulkan|--auto] [--port N] "
-                 "[--max-concurrent N] [--ctx N] [--embed-model <file.gguf>] [--max-batch N]\n";
+                 "[--max-concurrent N] [--ctx N] [--embed-model <file.gguf>] [--max-batch N]\n"
+                 "       [--mmproj <clip.gguf>]   (vision-language chat: image_url content parts)\n";
     return 1;
   }
+  const std::string mmprojPath = flagValue(args, "--mmproj");
   // SPEC: "Everything must run from ONE server process." The positional model stays the generation
   // model and embeddings are opt-in, so this is backwards compatible. A general --model registry
   // with per-request name routing is the right long-term shape — it is what port 2006 (Gateway) is
@@ -1230,6 +1536,42 @@ int cmdServe(const std::vector<std::string_view>& args) {
     }
   }
 
+  // Third engine, third modality, same process. The tower is loaded AFTER the decoder so its
+  // projector width can be checked against the decoder's d_model at startup — pairing an mmproj
+  // with the wrong language model is a setup error, and finding it on the first request instead
+  // of at boot means it surfaces to a user rather than to the operator.
+  std::optional<qorvix::vision::ClipVisionModel> tower;
+  if (!mmprojPath.empty()) {
+    if (!engine->acceptsInputEmbeddings()) {
+      std::cerr << "error: the " << engine->backendName()
+                << " backend cannot take input embeddings, so it cannot serve images — drop the "
+                   "backend flag to run vision-language chat on the CPU\n";
+      return 1;
+    }
+    try {
+      tower = qorvix::vision::ClipVisionModel::fromGguf(
+          qorvix::gguf::GgufFile::open(mmprojPath), err);
+    } catch (const qorvix::gguf::GgufParseError& e) {
+      std::cerr << "error: vision tower: " << e.what() << "\n";
+      return 1;
+    }
+    if (!tower) {
+      std::cerr << "error: vision tower: " << err << "\n";
+      return 1;
+    }
+    if (!tower->hasProjector()) {
+      std::cerr << "error: " << mmprojPath
+                << " has no llava projector — vision-language chat needs an mmproj file\n";
+      return 1;
+    }
+    if (tower->projectedDim() != static_cast<int>(engine->config().embeddingLength)) {
+      std::cerr << "error: projector emits " << tower->projectedDim()
+                << "-d vectors but the decoder's d_model is " << engine->config().embeddingLength
+                << " — this mmproj belongs to a different language model\n";
+      return 1;
+    }
+  }
+
   const std::string modelId = engine->config().architecture + "/" + path;
   const std::string embedModelId =
       embedEngine ? embedEngine->config().architecture + "/" + embedPath : std::string();
@@ -1252,6 +1594,12 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // in-flight generation for no reason, while sharing nothing would corrupt scratch under the
   // one-detached-thread-per-connection model.
   std::mutex embedMutex;
+
+  // And a third, for the same reason: ClipVisionModel keeps its per-call scratch in members, so
+  // two concurrent image encodes would trample each other. It is a separate lock from schedMutex
+  // so encoding an image does not queue behind an in-flight generation — the encode is the long
+  // pole of a multimodal request (tens of seconds on CPU), not something to serialize needlessly.
+  std::mutex visionMutex;
 
   api::HttpServer server(port);
   if (!server.start(err)) {
@@ -1279,6 +1627,12 @@ int cmdServe(const std::vector<std::string_view>& args) {
               << maxBatch << "\n";
   } else {
     std::cout << "  embeddings: none (pass --embed-model <file.gguf> to enable /v1/embeddings)\n";
+  }
+  if (tower) {
+    std::cout << "  vision:     " << mmprojPath << " | " << tower->patchTokens()
+              << " patch tokens x " << tower->projectedDim() << " | images as data: URIs\n";
+  } else {
+    std::cout << "  vision:     none (pass --mmproj <clip.gguf> to accept image_url content parts)\n";
   }
   std::cout << "  POST /v1/chat/completions   POST /v1/completions   POST /v1/embeddings\n"
             << "  GET /v1/models\n"
@@ -1397,11 +1751,63 @@ int cmdServe(const std::vector<std::string_view>& args) {
     std::string prompt, respModel = modelId;
     bool stream = false;
     qorvix::scheduler::RequestParams rp;
+    std::vector<qorvix::runtime::PromptPart> imageParts;
     if (isChat) {
       auto cr = api::parseChatRequest(*body, perr);
       if (!cr.valid) {
         res.send(400, "application/json", api::errorResponse(perr).dump());
         return;
+      }
+      // Rewrites each message's content with <image> where an image part was, and hands back the
+      // URLs in the same order — so the Nth marker in the rendered prompt is the Nth image here.
+      const auto imageUrls =
+          api::flattenContentParts(cr.messages, std::string(qorvix::runtime::kImageMarker));
+      if (!imageUrls.empty()) {
+        // Bounded per request. Each image costs a full CLIP encode (tens of seconds on CPU, under
+        // one mutex) and 576 context positions, so an unbounded count is a cheap way for one
+        // caller to occupy the server for an hour. The 32 MB body cap does not constrain this on
+        // its own — a hundred small PNGs fit easily.
+        constexpr std::size_t kMaxImagesPerRequest = 8;
+        if (imageUrls.size() > kMaxImagesPerRequest) {
+          res.send(400, "application/json",
+                   api::errorResponse("request carries " + std::to_string(imageUrls.size()) +
+                                      " images; the limit is " +
+                                      std::to_string(kMaxImagesPerRequest))
+                       .dump());
+          return;
+        }
+        if (!tower) {
+          // 501 for the same reason /v1/embeddings uses it: the route works, this process just has
+          // no vision tower loaded. A 400 would blame the client for an operator's launch flags.
+          res.send(501, "application/json",
+                   api::errorResponse(
+                       "this server has no vision model loaded — restart with --mmproj <clip.gguf>",
+                       "not_implemented")
+                       .dump());
+          return;
+        }
+        for (const auto& url : imageUrls) {
+          std::vector<std::uint8_t> bytes;
+          if (!api::decodeDataUrl(url, bytes, perr)) {
+            res.send(400, "application/json", api::errorResponse(perr).dump());
+            return;
+          }
+          qorvix::vision::Image img;
+          if (!qorvix::vision::decodeImage(bytes.data(), bytes.size(), img, perr)) {
+            res.send(400, "application/json", api::errorResponse(perr).dump());
+            return;
+          }
+          std::vector<float> features;
+          {
+            std::lock_guard<std::mutex> lock(visionMutex);
+            if (!tower->encodeProjected(img, features, perr)) {
+              res.send(400, "application/json", api::errorResponse(perr).dump());
+              return;
+            }
+          }
+          imageParts.push_back(qorvix::runtime::PromptPart::fromImage(
+              std::move(features), static_cast<int>(tower->patchTokens()), tower->projectedDim()));
+        }
       }
       prompt = api::buildChatPromptWithTemplate(cr.messages, chatTemplate, eosPiece);
       stream = cr.stream;
@@ -1421,16 +1827,33 @@ int cmdServe(const std::vector<std::string_view>& args) {
 
     const std::string id = (isChat ? "chatcmpl-" : "cmpl-") + std::to_string(++idCounter);
 
+    // Splits the rendered prompt at its <image> markers and drops the encoded features into those
+    // slots. With no images this is just [text], so both paths below submit the same way.
+    std::vector<qorvix::runtime::PromptPart> promptParts;
+    if (!qorvix::runtime::partsFromPrompt(prompt, std::move(imageParts), promptParts, perr)) {
+      res.send(400, "application/json", api::errorResponse(perr).dump());
+      return;
+    }
+
     if (stream) {
       res.beginStream(200, "text/event-stream");
       if (isChat) res.writeChunk(api::sseData(api::chatChunk(id, respModel, "", true, "")));
       std::vector<qorvix::scheduler::RequestResult> results;
       {
         std::lock_guard<std::mutex> lock(schedMutex);
-        sched.submit(prompt, rp, [&](qorvix::scheduler::RequestId, const std::string& piece) {
-          res.writeChunk(api::sseData(isChat ? api::chatChunk(id, respModel, piece, false, "")
-                                             : api::completionChunk(id, respModel, piece, "")));
-        });
+        if (sched.submitParts(promptParts, rp, perr,
+                              [&](qorvix::scheduler::RequestId, const std::string& piece) {
+                                res.writeChunk(api::sseData(
+                                    isChat ? api::chatChunk(id, respModel, piece, false, "")
+                                           : api::completionChunk(id, respModel, piece, "")));
+                              }) == 0) {
+          // The stream is already open, so the error has to travel as SSE rather than a status
+          // code — a client that has begun reading chunks will never see a 400.
+          res.writeChunk(api::sseData(api::errorResponse(perr)));
+          res.writeChunk(api::sseDone());
+          res.endStream();
+          return;
+        }
         results = sched.runToCompletion();
       }
       const bool eos = !results.empty() && results.front().hitEos;
@@ -1443,7 +1866,10 @@ int cmdServe(const std::vector<std::string_view>& args) {
       std::vector<qorvix::scheduler::RequestResult> results;
       {
         std::lock_guard<std::mutex> lock(schedMutex);
-        sched.submit(prompt, rp);
+        if (sched.submitParts(promptParts, rp, perr) == 0) {
+          res.send(400, "application/json", api::errorResponse(perr).dump());
+          return;
+        }
         results = sched.runToCompletion();
       }
       if (results.empty()) {
@@ -1929,10 +2355,15 @@ int printUsage() {
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
             << "  generate <file> --prompt \"...\" [--gpu|--vulkan|--auto]  Generate text\n"
+            << "                      [--mmproj <clip.gguf> --image <f.png> ...]  chat about an\n"
+            << "                      image; put <image> in the prompt to place it (cpu only)\n"
             << "  embed <file> --text \"...\"       Embed text with an encoder model (bert)\n"
             << "                                  [--pooling mean|cls|last] [--no-normalize]\n"
             << "                                  [--dims N] [--json]\n"
+            << "  image-embed <mmproj.gguf> --image <f.png>   Encode an image with the CLIP tower\n"
+            << "                      [--project] to project into the language model's space\n"
             << "  serve <file> [--gpu|--vulkan|--auto] [--port N] [--embed-model <f.gguf>]\n"
+            << "               [--mmproj <clip.gguf>]   image_url content parts (cpu only)\n"
             << "                                  OpenAI-compatible HTTP server\n"
             << "                                  (default port " << qorvix::ports::kRuntime
             << "; Qorvix reserves " << qorvix::ports::kRangeFirst << "-"
@@ -1947,6 +2378,10 @@ int printUsage() {
             << "  vulkan-check <file> Compare Vulkan vs CPU forward-pass logits for a GGUF model\n"
             << "  embed-check <file> [--ref F] [--min-cos C]   Gate embeddings against a\n"
             << "                      captured sentence-transformers reference\n"
+            << "  vision-check <mmproj.gguf> --ref F [--image f.png]   Gate the CLIP tower\n"
+            << "                      against a captured transformers reference\n"
+            << "  vlm-check <file> [--mmproj <clip.gguf> --image <f.png>]   Gate the image/text\n"
+            << "                      input-embedding splice (no reference capture needed)\n"
             << "  rag index <dir> --embed-model <f.gguf> --store <out.qvx>\n"
             << "                      Chunk, embed and index documents (.txt/.md/.csv/.tsv)\n"
             << "                      [--chunk-tokens N] [--overlap N]\n"
@@ -1981,6 +2416,7 @@ int main(int argc, char** argv) {
   if (command == "embed-check") return cmdEmbedCheck(args);
   if (command == "image-embed") return cmdImageEmbed(args);
   if (command == "vision-check") return cmdVisionCheck(args);
+  if (command == "vlm-check") return cmdVlmCheck(args);
   if (command == "rag") return cmdRag(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();

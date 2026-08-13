@@ -52,7 +52,15 @@ class Tokenizer {
 
   static std::optional<Tokenizer> fromGguf(const gguf::GgufFile& file, std::string& error);
 
+  // Wraps `text` in the model's opening/closing specials. EOS follows the model's own
+  // add_eos_token metadata.
   std::vector<int> encode(const std::string& text, bool addBos) const;
+
+  // Same, with EOS forced on or off. Needed once a prompt is SPLIT into segments (a multimodal
+  // turn puts image positions between text spans): the metadata rule "append EOS" is about the
+  // end of the sequence, and applying it per segment would bury EOS in the middle of the prompt,
+  // where every model reads it as "the conversation ended here".
+  std::vector<int> encode(const std::string& text, bool addBos, bool addEos) const;
   std::string decode(const std::vector<int>& ids, bool skipSpecial = true) const;
   std::string decodeToken(int id) const;
 

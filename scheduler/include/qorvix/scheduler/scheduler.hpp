@@ -9,6 +9,7 @@
 
 #include "qorvix/memory/kv_cache.hpp"
 #include "qorvix/runtime/inference_engine.hpp"
+#include "qorvix/runtime/multimodal.hpp"
 #include "qorvix/runtime/sampler.hpp"
 
 namespace qorvix::tokenizer {
@@ -33,10 +34,16 @@ struct RequestResult {
   RequestId id = 0;
   std::string text;
   std::vector<int> tokens;  // generated token ids
-  int promptTokens = 0;
+  int promptTokens = 0;     // prefill POSITIONS, so image patches count toward it
   bool hitEos = false;
   bool rejected = false;    // could not be admitted (KV pool exhausted)
 };
+
+// A multimodal prompt piece (text, or one image's projected features) — defined in `runtime`
+// alongside the assembly logic the CLI shares with the scheduler, re-exported here so callers of
+// submitParts need only this header. The scheduler copies the features into the request, so the
+// caller may reuse its buffer immediately.
+using runtime::PromptPart;
 
 struct SchedulerConfig {
   int maxConcurrent = 8;  // max requests decoding at once (bounds the KV pool / batch)
@@ -61,6 +68,17 @@ class Scheduler {
   // Enqueues a request; returns its id. `onToken`, if set, streams each decoded piece.
   RequestId submit(const std::string& prompt, const RequestParams& params,
                    std::function<void(RequestId, const std::string&)> onToken = {});
+
+  // Multimodal twin of submit(). Text parts are tokenized in place (BOS on the first one only);
+  // image parts occupy positions carrying their own input embeddings.
+  //
+  // Returns 0 with `error` set when the request cannot be built — a projector/decoder width
+  // mismatch, or an engine that cannot take input embeddings. That is a synchronous rejection on
+  // purpose: it is a property of the request, knowable before admission, and the HTTP layer needs
+  // a 400 rather than an empty completion.
+  RequestId submitParts(const std::vector<PromptPart>& parts, const RequestParams& params,
+                        std::string& error,
+                        std::function<void(RequestId, const std::string&)> onToken = {});
 
   bool idle() const;  // nothing waiting or running
 

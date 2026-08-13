@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "qorvix/api/json.hpp"
@@ -12,9 +13,27 @@
 // and /v1/embeddings.
 namespace qorvix::api {
 
+// One element of OpenAI's multimodal `content` array. A message whose content is a plain string
+// has no parts; a message whose content is an array has one part per element.
+struct ContentPart {
+  enum class Type { Text, ImageUrl };
+  Type type = Type::Text;
+  std::string text;      // Type::Text
+  std::string imageUrl;  // Type::ImageUrl — the raw url field, usually a data: URI
+};
+
 struct ChatMessage {
   std::string role;
+  // The message as text. For an array content this is the flattened form — see
+  // flattenContentParts, which is what fills it with image markers in the right places.
   std::string content;
+  std::vector<ContentPart> parts;  // empty when `content` arrived as a plain string
+
+  bool hasImages() const {
+    for (const auto& p : parts)
+      if (p.type == ContentPart::Type::ImageUrl) return true;
+    return false;
+  }
 };
 
 // Sampling/decoding parameters common to chat and text completions (OpenAI names).
@@ -72,6 +91,31 @@ std::string buildChatPromptWithTemplate(const std::vector<ChatMessage>& messages
 // Which family buildChatPromptWithTemplate detected — for logging and tests.
 // One of: "chatml", "llama3", "gemma", "phi3", "zephyr", "mistral", "generic".
 std::string detectChatTemplateFamily(const std::string& chatTemplate);
+
+// ---- multimodal content (Phase 11b-2) --------------------------------------------------------
+
+// Rewrites each message's `content` from its parts: text parts verbatim, image parts replaced by
+// `imageMarker`. Returns every image URL across all messages, in the order the markers appear —
+// so the Nth returned URL belongs to the Nth marker in the rendered prompt. Messages with no
+// parts are left untouched.
+//
+// The marker is a PARAMETER rather than a constant here so this layer stays free of any runtime
+// dependency; the server passes runtime::kImageMarker, the one definition of the token.
+std::vector<std::string> flattenContentParts(std::vector<ChatMessage>& messages,
+                                             const std::string& imageMarker);
+
+// Decodes standard base64 (with or without padding). Returns false on an invalid character or a
+// truncated final group.
+bool decodeBase64(std::string_view text, std::vector<std::uint8_t>& out, std::string& error);
+
+// Decodes a `data:[<mediatype>][;base64],<data>` URI into raw bytes.
+//
+// A plain http(s):// URL is REFUSED with an explanatory error rather than fetched. Server-side
+// fetching of a client-supplied URL is an SSRF primitive — it would let any caller make this
+// process issue requests to hosts only it can reach — so the capability is declined outright
+// instead of being added with a blocklist. Clients inline the image as a data: URI, which every
+// OpenAI SDK already supports.
+bool decodeDataUrl(std::string_view url, std::vector<std::uint8_t>& out, std::string& error);
 
 // POST /v1/embeddings. `input` accepts four shapes in the OpenAI schema — a string, an array of
 // strings, an array of ints (ONE pre-tokenized sequence), and an array of int arrays — so text and

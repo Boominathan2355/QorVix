@@ -280,3 +280,119 @@ TEST_CASE("base64 embeddings encode little-endian float32", "[openai]") {
   REQUIRE(v.get("data")->at(0).get("embedding")->isString());
   REQUIRE(v.get("data")->at(0).get("embedding")->asString() == "AACAPw==");
 }
+
+// ---- multimodal content parts (Phase 11b-2) --------------------------------------------------
+
+TEST_CASE("parses image_url content parts", "[openai]") {
+  auto body = json::parse(R"({
+    "messages": [{"role":"user","content":[
+      {"type":"text","text":"what is this? "},
+      {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+      {"type":"text","text":" be terse"}
+    ]}]
+  })");
+  REQUIRE(body.has_value());
+
+  std::string err;
+  ChatRequest req = parseChatRequest(*body, err);
+  REQUIRE(req.valid);
+  REQUIRE(req.messages.size() == 1);
+  REQUIRE(req.messages[0].parts.size() == 3);
+  REQUIRE(req.messages[0].hasImages());
+  REQUIRE(req.messages[0].parts[1].type == ContentPart::Type::ImageUrl);
+  REQUIRE(req.messages[0].parts[1].imageUrl == "data:image/png;base64,AAAA");
+  // Default flattening drops the images, so a caller that never calls flattenContentParts still
+  // gets usable text rather than an empty message.
+  REQUIRE(req.messages[0].content == "what is this?  be terse");
+}
+
+TEST_CASE("accepts the flat image_url string form", "[openai]") {
+  // Not in OpenAI's schema, but several clients send it and the intent is unambiguous.
+  auto body = json::parse(
+      R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"data:image/png;base64,AA"}]}]})");
+  std::string err;
+  ChatRequest req = parseChatRequest(*body, err);
+  REQUIRE(req.valid);
+  REQUIRE(req.messages[0].parts[0].imageUrl == "data:image/png;base64,AA");
+}
+
+TEST_CASE("rejects unsupported and malformed content parts", "[openai]") {
+  std::string err;
+  // An unknown part type is named rather than skipped — silently dropping audio would answer a
+  // question about media the model never received.
+  auto audio = json::parse(
+      R"({"messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}]})");
+  REQUIRE_FALSE(parseChatRequest(*audio, err).valid);
+  REQUIRE(err.find("input_audio") != std::string::npos);
+
+  auto noUrl = json::parse(
+      R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{}}]}]})");
+  REQUIRE_FALSE(parseChatRequest(*noUrl, err).valid);
+  REQUIRE(err.find("url") != std::string::npos);
+}
+
+TEST_CASE("flattenContentParts places markers where the images were", "[openai]") {
+  auto body = json::parse(R"({
+    "messages": [
+      {"role":"system","content":"be terse"},
+      {"role":"user","content":[
+        {"type":"text","text":"left "},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}},
+        {"type":"text","text":" right"},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,BB"}}
+      ]}
+    ]
+  })");
+  std::string err;
+  ChatRequest req = parseChatRequest(*body, err);
+  REQUIRE(req.valid);
+
+  const auto urls = flattenContentParts(req.messages, "<image>");
+  REQUIRE(urls.size() == 2);
+  // Marker order must match URL order — that pairing is what puts each image in its own slot.
+  REQUIRE(urls[0] == "data:image/png;base64,AA");
+  REQUIRE(urls[1] == "data:image/png;base64,BB");
+  REQUIRE(req.messages[1].content == "left <image> right<image>");
+  // A plain-string message has no parts and must be left exactly as it was.
+  REQUIRE(req.messages[0].content == "be terse");
+}
+
+TEST_CASE("decodeBase64 round-trips and rejects bad input", "[openai]") {
+  std::vector<std::uint8_t> out;
+  std::string err;
+
+  REQUIRE(decodeBase64("AACAPw==", out, err));
+  REQUIRE(out == std::vector<std::uint8_t>{0x00, 0x00, 0x80, 0x3F});
+
+  // Unpadded input is legal and common in hand-built data URIs.
+  REQUIRE(decodeBase64("AACAPw", out, err));
+  REQUIRE(out.size() == 4);
+
+  // Clients that wrap long data URIs across lines must still work.
+  REQUIRE(decodeBase64("AACA\nPw==", out, err));
+  REQUIRE(out.size() == 4);
+
+  REQUIRE_FALSE(decodeBase64("AA*A", out, err));
+  REQUIRE(err.find("invalid") != std::string::npos);
+  // One leftover character carries 6 bits — not a byte, so the payload was cut short.
+  REQUIRE_FALSE(decodeBase64("AAAAA", out, err));
+  REQUIRE(err.find("truncated") != std::string::npos);
+}
+
+TEST_CASE("decodeDataUrl accepts data URIs and refuses remote fetches", "[openai]") {
+  std::vector<std::uint8_t> out;
+  std::string err;
+
+  REQUIRE(decodeDataUrl("data:image/png;base64,AACAPw==", out, err));
+  REQUIRE(out.size() == 4);
+
+  // Refused rather than fetched: server-side retrieval of a client-supplied URL is an SSRF
+  // primitive, so the capability is declined instead of filtered.
+  REQUIRE_FALSE(decodeDataUrl("https://example.com/cat.png", out, err));
+  REQUIRE(err.find("data:") != std::string::npos);
+  REQUIRE_FALSE(decodeDataUrl("HTTP://example.com/cat.png", out, err));
+
+  REQUIRE_FALSE(decodeDataUrl("data:image/png,notbase64", out, err));
+  REQUIRE_FALSE(decodeDataUrl("data:image/png;base64", out, err));
+  REQUIRE_FALSE(decodeDataUrl("data:image/png;base64,", out, err));
+}

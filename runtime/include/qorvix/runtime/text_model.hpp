@@ -43,6 +43,14 @@ class TextModel final : public IInferenceEngine {
   // cache, and returns logits ([vocabSize]). `pos` must equal the session's current length.
   const std::vector<float>& forward(memory::SessionId session, int token, int pos) override;
 
+  // Input embeddings (Phase 11b-2): the CPU reference is the multimodal backend, so projected
+  // image patches enter the decoder here. The only difference from forward() is where x_ comes
+  // from — everything after the embedding lookup is the identical code path, which is what
+  // `qorvix vlm-check` tier 1 asserts by feeding a token's own embedding row back in.
+  bool acceptsInputEmbeddings() const override { return true; }
+  const std::vector<float>& forwardEmbedding(memory::SessionId session, const float* embedding,
+                                             int pos) override;
+
   // --- single-sequence convenience (uses a default session opened at construction) ---
   void reset() { kv_.reset(session_); }
   const std::vector<float>& forward(int token, int pos) { return forward(session_, token, pos); }
@@ -53,6 +61,9 @@ class TextModel final : public IInferenceEngine {
 
  private:
   void attention(memory::SessionId session, const LayerWeights& L, int layer, int pos);
+  // The transformer stack proper: runs from an already-populated x_ and returns logits. Both
+  // forward() and forwardEmbedding() are just the two ways of filling x_.
+  const std::vector<float>& forwardFromState(memory::SessionId session, int pos);
 
   ModelConfig cfg_;
   Weights w_;

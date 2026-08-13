@@ -435,10 +435,75 @@ missing feature rather than a corrupt file), Adam7 interlacing, and wiring the p
 into the decoder for actual image chat — that needs `TextModel` to accept input embeddings rather
 than token ids.
 
-### Phase 11b-2 — Vision-language chat ⬜
-Splice the projected image tokens into the decoder's input embeddings and serve multimodal
-`/v1/chat/completions` with `image_url` content parts. The blocker is the seam: `IInferenceEngine`
-takes a token id per step, and image tokens have no id.
+### Phase 11b-2 — Vision-language chat ✅
+
+**The seam, widened.** `IInferenceEngine` took a token id per step and an image patch has no id.
+Rather than mint a fake one (it would collide with a real token and poison the sampler's
+repetition history), the interface gained a second entry point: `forwardEmbedding(session, const
+float*, pos)` runs the stack from a ready-made `[d_model]` vector, guarded by
+`acceptsInputEmbeddings()`. `TextModel::forward` was split at the embedding lookup — everything
+after it is now shared, so the two entry points cannot drift. `forwardInput(InputToken)` dispatches
+between them, and that is what the prefill loops call.
+
+Device backends keep the embedding table in VRAM and look rows up on-device, so accepting a host
+vector is a new upload path and kernel entry point, not a wrapper. Until that exists **CPU is the
+multimodal backend**, and `serve --mmproj --gpu` is refused at startup rather than silently
+degraded — the same rule `createEmbeddingEngine` follows for GPU encoders.
+
+**Prompt assembly (`runtime/multimodal.hpp`).** `MultimodalPrompt` interleaves token ids with
+image-feature blocks; `partsFromPrompt` splits the rendered chat prompt at `<image>` markers and
+drops each image into its slot (no marker → images are prepended, the LLaVA convention). BOS and
+EOS bracket the **sequence**, not each segment — which required `Tokenizer::encode` to gain
+explicit EOS control, since it appends EOS on every call and a split prompt would otherwise bury
+one mid-sequence, where every model reads it as "the conversation ended here". Text-only prompts
+are byte-identical to before, and the scheduler now runs **one** prefill path for both.
+
+Two facts the sampler depends on: image positions contribute nothing to the repetition-penalty
+history (no id to penalize), and `prompt_tokens` counts prefill **positions**, so 576 patches are
+included — reporting only the text would understate the context consumed.
+
+**Surfaces.**
+- `qorvix generate <model.gguf> --mmproj <clip.gguf> --image f.png --prompt "USER: <image>\n..."` —
+  `--image` is repeatable, and order pairs images with markers.
+- `serve --mmproj <clip.gguf>` — multimodal `/v1/chat/completions` with `image_url` content parts,
+  behind its own mutex (CLIP scratch lives in members; the encode is the long pole, so it does not
+  queue behind generation). Projector/decoder width is checked **at startup**, not per request.
+- Images arrive as `data:` URIs. A remote `http(s)://` URL is **refused with an explanation, not
+  fetched**: server-side retrieval of a client-supplied URL is an SSRF primitive, so the capability
+  is declined outright rather than added with a blocklist. Every OpenAI SDK already inlines images.
+- The HTTP reader gained a **32 MB request-body cap answering 413**. It had none: bodies used to be
+  small JSON, so an attacker-controlled `Content-Length` sized a buffer nobody had reason to send.
+  Images make multi-MB bodies routine, which turned a latent hole into a reachable one. Verified:
+  a 40 MB body is refused before a byte of it is read, a 3 MB one reaches the handler.
+- **Max 8 images per request.** Each costs a full CLIP encode (tens of seconds, under one mutex)
+  and 576 context positions, so an unbounded count lets one caller hold the server for an hour.
+  The body cap does not constrain this by itself — a hundred small PNGs fit inside it easily.
+
+**The gate: `qorvix vlm-check <model.gguf>`.** Tiers 1 and 2 need no vision model and no captured
+reference, because the property is self-checking: feeding a token's **own** embedding row through
+the new seam must reproduce, **bit for bit**, what feeding its id through the old path produced.
+
+| tier | asserts | measured (TinyLlama 1.1B Q4_K_M) |
+|---|---|---|
+| 1 | single-step splice identity | max \|diff\| **0.00e+00**, 0 argmax mismatches — **PASS** |
+| 2 | full-prefill identity, so a splice that only corrupts KV cannot pass tier 1 | max \|diff\| **0.00e+00**, argmax identical — **PASS** |
+| 3 | projector width vs `d_model`, spliced prefill runs, logits finite | needs a matched mmproj (below) |
+
+Tier 3 is labelled a **smoke test in its own output**: no LLaVA reference is captured in this
+repo, so it asserts shape and well-formedness, not output fidelity. It is also **the one thing not
+run end-to-end here** — the mmproj on disk is LLaVA-7B's (4096-d) and the only decoder on disk is
+TinyLlama (2048-d), so the pair is refused rather than exercised. `models/README.md` gives the
+exact command for the matching decoder. Capturing a real LLaVA reference is the next step.
+
+Ordering is deliberate throughout: opening a GGUF only maps its header, so `d_model` and the
+projector width are both known before either the CLIP encode or the decoder's weight load. A
+mismatched pair therefore costs **1 second** rather than a full encode of an image whose features
+were always going to be rejected — the same principle in `generate`, `serve` and `vlm-check`.
+
+**Deferred, with the reason stated:** a captured LLaVA reference (tier 3 is a smoke test until
+then); GPU/Vulkan `forwardEmbedding`; multi-image *layout* variants (LLaVA-1.6 tiling); and image
+features in the paged prefix cache — `sharePrefix` keys on token ids, which image positions do not
+have.
 
 ### Phase 11b-3 — Audio / image generation ⬜
 Audio engine (Whisper: FFT + mel + encoder-decoder with cross-attention) and image generation
@@ -449,6 +514,12 @@ Audio engine (Whisper: FFT + mel + encoder-decoder with cross-attention) and ima
 CUDA and Vulkan implementations of `IEmbeddingEngine` and the CLIP tower. `createEmbeddingEngine` reports honestly for
 now rather than silently falling back to CPU. Note `buildGpuModel`/`buildVulkanModel` are *not*
 reusable (they unconditionally read `L.ffnGate`); `detail::toGpuWeight`/`toVkWeight` are.
+
+Phase 11b-2 adds a third item here: **`forwardEmbedding` on the device backends**. They hold the
+embedding table in VRAM and look rows up on-device, so taking a host `[d_model]` vector needs an
+upload path and a kernel entry point that skips the lookup — not a wrapper. Until it exists,
+`acceptsInputEmbeddings()` returns false there and the multimodal surfaces refuse rather than
+silently degrade.
 
 ## Phase 12 — Web UI
 React/TS/Vite/Tailwind/shadcn app: Dashboard, Chat, Vision, Audio, Image Generation, Model,
@@ -502,6 +573,11 @@ logits), `embed-check` (embeddings vs a sentence-transformers reference), and `v
 - **Vision ✅** — CLIP ViT-L/14-336 tower + LLaVA projector from a `clip` mmproj GGUF, with a
   from-scratch DEFLATE/PNG decoder and CLIP preprocessing. Gated by `vision-check` against
   transformers at **cos 1.0000000** (preprocessing exact to 1.2e-07).
+- **Vision-language chat ✅ (CPU only)** — `IInferenceEngine::forwardEmbedding` splices projected
+  image patches into the decoder's input embeddings; `generate --mmproj --image` and
+  `serve --mmproj` (multimodal `/v1/chat/completions`). Gated by `vlm-check`: the splice is
+  **bit-identical** to the id path when fed a token's own embedding row. Device backends refuse
+  images rather than degrading — the GPU embedding upload path is Phase 11c.
 - **Not started (empty dirs, 0 files each)** — `image/`, `monitoring/`, `agents/`,
   `audio/`, `ui/`, `cli/` — Phase 11b–12 placeholders, scaffolded only when their phase begins
   (see the status-annotated backlog above).
@@ -558,10 +634,12 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
   · scheduler ✅ · sliding-window attn ⬜ · speculative decoding ⬜ · multi-GPU 🟡 (TP math done,
   NCCL 🖥️).
 - **Models:** GGUF F16/BF16/Q4_0..Q8_0/K-quants ✅ · more quant formats (IQ-quants) ⬜ · MoE ⬜ ·
-  vision ✅ (CLIP tower; VLM chat is 11b-2) · text embeddings ✅ (BERT/WPM; bge-small + all-MiniLM verified) ·
+  vision ✅ (CLIP tower + VLM chat, CPU only) · text embeddings ✅ (BERT/WPM; bge-small + all-MiniLM verified) ·
   vision/audio/cross-modal embeddings ⬜ · reranker ⬜.
 - **Serving:** OpenAI API ✅ (`/v1/models`, `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`) · two models in one process ✅ (`serve --embed-model`) · SSE streaming ✅ ·
+  multimodal `image_url` content parts ✅ (`serve --mmproj`, data: URIs only — remote URLs are
+  refused, not fetched) ·
   WebSocket ⬜ · auth ⬜ (Phase 13, port 2006) ·
   Prometheus `/metrics` ⬜ (Phase 12, port 2009) · rate limiting ⬜.
 - **Memory:** paged KV + eviction/offload ✅ · GPU memory pooling 🟡 · zero-copy 🟡 · prefetch ⬜ ·
@@ -584,10 +662,10 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
 - **Platform:** Linux ✅ · Windows/macOS/AMD/Intel GPU validation ⬜🖥️.
 - **Production:** model hot-swap/cache ⬜ · graceful OOM ⬜ · fault recovery ⬜ · telemetry ⬜.
 - **Empty module dirs (not started; scaffolded only when their phase begins, to keep the build free
-  of content-less libraries):** `vision/` ⬜ (Phase 11 — vision models/OCR) · `image/` ⬜ (Phase 11 —
-  image generation) · `monitoring/` ⬜ (Phase 12 — Prometheus/metrics exporter, port 2009) ·
-  `audio/` · `agents/` · `ui/` (Phase 12) · `cli/` — all 0 files today. (`embeddings/` and `rag/`
-  are real as of Phase 11a.)
+  of content-less libraries):** `image/` ⬜ (Phase 11b-3 — image generation) · `monitoring/` ⬜
+  (Phase 12 — Prometheus/metrics exporter, port 2009) · `audio/` · `agents/` · `ui/` (Phase 12) ·
+  `cli/` — all 0 files today. (`embeddings/` and `rag/` are real as of Phase 11a; `vision/` as of
+  Phase 11b-1.)
 
 ### Current priorities (2026-07-29)
 

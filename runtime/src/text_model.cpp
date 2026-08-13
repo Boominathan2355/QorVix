@@ -116,6 +116,21 @@ void TextModel::attention(memory::SessionId session, const LayerWeights& L, int 
 }
 
 const std::vector<float>& TextModel::forward(memory::SessionId session, int token, int pos) {
+  // Embedding lookup (dequantizes one row when the table is quantized).
+  embeddingRow(w_.tokenEmbd, token, x_.data());
+  return forwardFromState(session, pos);
+}
+
+const std::vector<float>& TextModel::forwardEmbedding(memory::SessionId session,
+                                                      const float* embedding, int pos) {
+  // The image side of the seam: x_ arrives ready-made (a projected CLIP patch) instead of being
+  // looked up. No scaling or norm is applied here — LLaVA's projector emits vectors already in
+  // the decoder's input space, and any extra transform would be a silent second projection.
+  std::copy_n(embedding, cfg_.embeddingLength, x_.begin());
+  return forwardFromState(session, pos);
+}
+
+const std::vector<float>& TextModel::forwardFromState(memory::SessionId session, int pos) {
   const int d = static_cast<int>(cfg_.embeddingLength);
   const int headDim = static_cast<int>(cfg_.headDim());
 
@@ -123,9 +138,6 @@ const std::vector<float>& TextModel::forward(memory::SessionId session, int toke
   while (kv_.length(session) <= pos) {
     if (!kv_.appendToken(session)) break;  // pool exhausted; attention will clamp to what exists
   }
-
-  // Embedding lookup (dequantizes one row when the table is quantized).
-  embeddingRow(w_.tokenEmbd, token, x_.data());
 
   for (std::uint32_t layer = 0; layer < cfg_.blockCount; ++layer) {
     const LayerWeights& L = w_.layers[layer];

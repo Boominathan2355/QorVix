@@ -30,6 +30,7 @@ if(Catch2_FOUND)
     generator_test.cpp
     scheduler_test.cpp
     inference_engine_test.cpp
+    multimodal_test.cpp
     benchmark_test.cpp
     json_test.cpp
     openai_test.cpp

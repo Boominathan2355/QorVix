@@ -53,15 +53,25 @@ const char* statusText(int code) {
     case 400: return "Bad Request";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 413: return "Content Too Large";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
     default: return "OK";
   }
 }
 
-// Reads one HTTP request (request line + headers + Content-Length body). Returns false on a
-// closed/broken connection or a malformed head.
-bool readRequest(socket_t s, HttpRequest& req) {
+// How large a request body this server will accept.
+//
+// Before Phase 11b-2 every body was small JSON and the limit did not matter. Images changed that:
+// a data:-URI PNG is base64, so a 24 MB body is an ~18 MB image — plausible — while Content-Length
+// itself is attacker-controlled, and an uncapped reader would happily size a buffer to whatever a
+// client claimed. The cap is generous enough for real photographs and finite, which is the point.
+constexpr std::size_t kMaxBodyBytes = 32u << 20;  // 32 MB
+
+enum class ReadStatus { Ok, Closed, TooLarge };
+
+// Reads one HTTP request (request line + headers + Content-Length body).
+ReadStatus readRequest(socket_t s, HttpRequest& req) {
   std::string buf;
   char chunk[4096];
   std::size_t headerEnd = std::string::npos;
@@ -69,10 +79,10 @@ bool readRequest(socket_t s, HttpRequest& req) {
   // Read until the end of headers.
   while (headerEnd == std::string::npos) {
     const int n = ::recv(s, chunk, sizeof(chunk), 0);
-    if (n <= 0) return false;
+    if (n <= 0) return ReadStatus::Closed;
     buf.append(chunk, static_cast<std::size_t>(n));
     headerEnd = buf.find("\r\n\r\n");
-    if (buf.size() > (1u << 20)) return false;  // 1 MB header cap
+    if (buf.size() > (1u << 20)) return ReadStatus::Closed;  // 1 MB header cap
   }
 
   const std::string head = buf.substr(0, headerEnd);
@@ -82,7 +92,7 @@ bool readRequest(socket_t s, HttpRequest& req) {
   // "METHOD SP TARGET SP VERSION"
   const std::size_t sp1 = requestLine.find(' ');
   const std::size_t sp2 = requestLine.find(' ', sp1 + 1);
-  if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
+  if (sp1 == std::string::npos || sp2 == std::string::npos) return ReadStatus::Closed;
   req.method = requestLine.substr(0, sp1);
   req.target = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
 
@@ -91,8 +101,10 @@ bool readRequest(socket_t s, HttpRequest& req) {
   std::string lower = head;
   for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   if (const std::size_t p = lower.find("content-length:"); p != std::string::npos) {
-    contentLength = static_cast<std::size_t>(std::strtoul(lower.c_str() + p + 15, nullptr, 10));
+    contentLength = static_cast<std::size_t>(std::strtoull(lower.c_str() + p + 15, nullptr, 10));
   }
+  // Checked BEFORE reading, so an oversized declaration costs nothing to reject.
+  if (contentLength > kMaxBodyBytes) return ReadStatus::TooLarge;
 
   // Body already partially in buf after the header terminator.
   std::string body = buf.substr(headerEnd + 4);
@@ -102,7 +114,7 @@ bool readRequest(socket_t s, HttpRequest& req) {
     body.append(chunk, static_cast<std::size_t>(n));
   }
   req.body = std::move(body);
-  return true;
+  return ReadStatus::Ok;
 }
 
 }  // namespace
@@ -194,7 +206,15 @@ void HttpServer::run(const HttpHandler& handler) {
     }
     std::thread([client, handler] {
       HttpRequest req;
-      if (readRequest(client, req)) {
+      const ReadStatus status = readRequest(client, req);
+      if (status == ReadStatus::TooLarge) {
+        // Answered rather than dropped: a client that just sent a too-large image needs to be
+        // told that is why, not left to guess at a closed connection.
+        HttpResponder responder(static_cast<std::uint64_t>(client));
+        responder.send(413, "application/json",
+                       R"({"error":{"message":"request body exceeds the 32 MB limit",)"
+                       R"("type":"invalid_request_error"}})");
+      } else if (status == ReadStatus::Ok) {
         HttpResponder responder(static_cast<std::uint64_t>(client));
         handler(req, responder);
         if (!responder.responded()) {

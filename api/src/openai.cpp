@@ -1,5 +1,7 @@
 #include "qorvix/api/openai.hpp"
 
+#include <array>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 
@@ -53,7 +55,54 @@ ChatRequest parseChatRequest(const json::Value& body, std::string& error) {
     }
     ChatMessage cm;
     if (const auto* r = m.get("role")) cm.role = r->asString();
-    if (const auto* c = m.get("content")) cm.content = c->asString();
+    if (const auto* c = m.get("content")) {
+      if (c->isArray()) {
+        // OpenAI's multimodal shape: content is an array of typed parts. Order is significant —
+        // it is what places the image relative to the words about it.
+        for (const auto& part : c->items()) {
+          if (!part.isObject()) {
+            error = "each content part must be an object";
+            return req;
+          }
+          const auto* t = part.get("type");
+          const std::string type = t ? t->asString() : std::string();
+          if (type == "text") {
+            ContentPart p;
+            p.type = ContentPart::Type::Text;
+            if (const auto* v = part.get("text")) p.text = v->asString();
+            cm.parts.push_back(std::move(p));
+          } else if (type == "image_url") {
+            ContentPart p;
+            p.type = ContentPart::Type::ImageUrl;
+            // Accept both the nested {"image_url":{"url":...}} object and the flat string form
+            // some clients send; rejecting the latter would fail on requests that are otherwise
+            // unambiguous.
+            if (const auto* v = part.get("image_url")) {
+              if (v->isString()) {
+                p.imageUrl = v->asString();
+              } else if (const auto* u = v->get("url")) {
+                p.imageUrl = u->asString();
+              }
+            }
+            if (p.imageUrl.empty()) {
+              error = "an image_url content part is missing its 'url'";
+              return req;
+            }
+            cm.parts.push_back(std::move(p));
+          } else {
+            // Named rather than ignored: silently dropping an input_audio part would answer a
+            // question about media the model never received.
+            error = "unsupported content part type '" + type + "' (expected 'text' or 'image_url')";
+            return req;
+          }
+        }
+        // Default flattening, so a caller that never calls flattenContentParts still sees text.
+        for (const auto& p : cm.parts)
+          if (p.type == ContentPart::Type::Text) cm.content += p.text;
+      } else {
+        cm.content = c->asString();
+      }
+    }
     req.messages.push_back(std::move(cm));
   }
   if (const auto* model = body.get("model")) req.model = model->asString();
@@ -264,6 +313,113 @@ json::Value embeddingUsage(int prompt) {
 }
 
 }  // namespace
+
+std::vector<std::string> flattenContentParts(std::vector<ChatMessage>& messages,
+                                             const std::string& imageMarker) {
+  std::vector<std::string> urls;
+  for (auto& m : messages) {
+    if (m.parts.empty()) continue;
+    std::string text;
+    for (const auto& p : m.parts) {
+      if (p.type == ContentPart::Type::Text) {
+        text += p.text;
+      } else {
+        // The marker goes exactly where the part was, so the image lands in the same place in the
+        // rendered prompt that the client put it in the message.
+        text += imageMarker;
+        urls.push_back(p.imageUrl);
+      }
+    }
+    m.content = std::move(text);
+  }
+  return urls;
+}
+
+bool decodeBase64(std::string_view text, std::vector<std::uint8_t>& out, std::string& error) {
+  error.clear();
+  out.clear();
+
+  // Reverse alphabet, built once. -1 = not a base64 character.
+  static const auto kReverse = [] {
+    std::array<signed char, 256> table{};
+    table.fill(-1);
+    const std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (std::size_t i = 0; i < alphabet.size(); ++i)
+      table[static_cast<unsigned char>(alphabet[i])] = static_cast<signed char>(i);
+    return table;
+  }();
+
+  std::uint32_t accum = 0;
+  int bits = 0;
+  out.reserve(text.size() / 4 * 3);
+  for (char c : text) {
+    const auto uc = static_cast<unsigned char>(c);
+    // Data URIs are routinely wrapped across lines by clients that build them by hand.
+    if (uc == '\n' || uc == '\r' || uc == ' ' || uc == '\t') continue;
+    if (uc == '=') break;  // padding: everything after it is padding too
+    const signed char v = kReverse[uc];
+    if (v < 0) {
+      error = "invalid base64 character";
+      return false;
+    }
+    accum = (accum << 6) | static_cast<std::uint32_t>(v);
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<std::uint8_t>((accum >> bits) & 0xFF));
+    }
+  }
+  // A trailing group of exactly one character carries 6 bits — not enough for a byte, so the
+  // input was truncated. Leftover bits from a 2- or 3-character group are the normal padding case.
+  if (bits >= 6) {
+    error = "truncated base64 input";
+    return false;
+  }
+  return true;
+}
+
+bool decodeDataUrl(std::string_view url, std::vector<std::uint8_t>& out, std::string& error) {
+  error.clear();
+  out.clear();
+
+  auto startsWithNoCase = [&](std::string_view prefix) {
+    if (url.size() < prefix.size()) return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+      if (std::tolower(static_cast<unsigned char>(url[i])) != prefix[i]) return false;
+    }
+    return true;
+  };
+
+  if (startsWithNoCase("http://") || startsWithNoCase("https://")) {
+    error =
+        "remote image URLs are not fetched by this server — inline the image as a data: URI "
+        "(data:image/png;base64,...), which every OpenAI SDK supports";
+    return false;
+  }
+  if (!startsWithNoCase("data:")) {
+    error = "image_url must be a data: URI (data:image/png;base64,...)";
+    return false;
+  }
+
+  const std::size_t comma = url.find(',');
+  if (comma == std::string_view::npos) {
+    error = "malformed data: URI (no comma separating the header from the payload)";
+    return false;
+  }
+  const std::string_view header = url.substr(5, comma - 5);
+  if (header.find("base64") == std::string_view::npos) {
+    // Percent-encoded data: URIs are legal but no client sends images that way.
+    error = "only base64-encoded data: URIs are supported";
+    return false;
+  }
+  if (!decodeBase64(url.substr(comma + 1), out, error)) return false;
+  if (out.empty()) {
+    error = "data: URI decoded to zero bytes";
+    return false;
+  }
+  return true;
+}
 
 std::string embeddingsBase64(const std::vector<float>& v) {
   static const char* kAlphabet =

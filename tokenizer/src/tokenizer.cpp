@@ -364,6 +364,10 @@ const std::string& Tokenizer::idToToken(int id) const {
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text, bool addBos) const {
+  return encode(text, addBos, special_.addEos);
+}
+
+std::vector<int> Tokenizer::encode(const std::string& text, bool addBos, bool addEos) const {
   // WordPiece wraps in [CLS] ... [SEP]; SPM/BPE wrap in BOS/EOS. On most BERT GGUFs bos == cls
   // and eos == sep, so routing WordPiece through the bos/eos path would produce the right ids by
   // coincidence — and produce silently wrong ones on a file that omits bos_token_id.
@@ -377,7 +381,7 @@ std::vector<int> Tokenizer::encode(const std::string& text, bool addBos) const {
                           : model_ == TokenizerModel::Bpe ? encodeBpe(text)
                                                           : encodeSpm(text);
   ids.insert(ids.end(), body.begin(), body.end());
-  if (special_.addEos && close >= 0) ids.push_back(close);
+  if (addEos && close >= 0) ids.push_back(close);
   return ids;
 }
 

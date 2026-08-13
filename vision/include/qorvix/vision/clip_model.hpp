@@ -45,6 +45,12 @@ class ClipVisionModel {
   // language model consumes: [patchTokens(), projectedDim()].
   bool project(const std::vector<float>& hidden, std::vector<float>& out, std::string& error);
 
+  // The whole vision half of a VLM turn in one call: image -> preprocess -> tower -> projector,
+  // producing [patchTokens(), projectedDim()] ready to splice into the decoder's input embeddings
+  // (Phase 11b-2). Fails with a clear error when the file carries no projector, since a tower-only
+  // mmproj yields 1024-d vectors that would silently mismatch a 4096-d decoder.
+  bool encodeProjected(const Image& img, std::vector<float>& out, std::string& error);
+
   const ClipConfig& config() const { return cfg_; }
   PreprocessConfig preprocessConfig() const;
   std::uint32_t embeddingLength() const { return cfg_.embeddingLength; }
