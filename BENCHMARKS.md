@@ -141,12 +141,17 @@ point is written down rather than rediscovered.
 
 | Date | Commit | Backend | Device | ms / image | Notes |
 |------|--------|---------|--------|-----------:|-------|
-| 2026-08-13 | 8605279 | cpu | i7 (this box, AVX2) | ~176,000 | ViT-L/14-336, 23 layers, 577 tokens, F16 |
+| 2026-08-13 | 8605279 | cpu | i7 (this box, AVX2) | 55,000 – 66,000 | ViT-L/14-336, 23 layers, 577 tokens, F16 |
 
 Slow because it is 577 tokens through a 300M-parameter tower on a CPU, with the same
 `qmatmulN` path the text encoder uses and no vision-specific work done. The correctness gate
 (`vision-check`) is what matters at this stage; a throughput axis follows when there is something
 to compare against.
+
+The first figure written here was ~176,000 ms, measured minutes after a reference capture and with
+builds still running. Re-measured on a quiet machine it is 55–66 s — a 3x error, in a row that
+would have become the baseline everything after it was compared against. Caught only by applying
+the caution below to my own number.
 
 **A measurement caution, recorded because it nearly produced a wrong entry above.** While tuning
 `kVecTile` this box reported bge-small at 60–123 tok/s against a recorded 225.65, which looked like
