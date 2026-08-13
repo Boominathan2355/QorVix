@@ -7,7 +7,7 @@ namespace qorvix {
 std::string_view startupBanner() {
   static const std::string banner =
       "qorvix AI core v" + std::string(kVersionString) +
-      " — phase 0 scaffold, no inference runtime yet";
+      " — text generation (cpu/cuda/vulkan) + embeddings + RAG";
   return banner;
 }
 
