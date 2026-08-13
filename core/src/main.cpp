@@ -23,6 +23,7 @@
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
 #include "qorvix/ports.hpp"
+#include "qorvix/rag/pipeline.hpp"
 #include "qorvix/runtime/benchmark.hpp"
 #include "qorvix/runtime/cpu_features.hpp"
 #include "qorvix/runtime/dequant.hpp"
@@ -760,6 +761,148 @@ int cmdEmbed(const std::vector<std::string_view>& args) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;
   }
+}
+
+// ---- rag: index and search over a document directory ----------------------------------------
+
+// Loads an embedding model plus its tokenizer, the pair every RAG command needs. Keeps the
+// tokenizer-first-then-move-the-file invariant in one place instead of both subcommands.
+bool openEmbedder(const std::string& path, std::optional<qorvix::tokenizer::Tokenizer>& tok,
+                  std::unique_ptr<qorvix::embeddings::IEmbeddingEngine>& engine) {
+  try {
+    auto file = qorvix::gguf::GgufFile::open(path);
+    std::string err;
+    tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) {
+      std::cerr << "error: tokenizer: " << err << "\n";
+      return false;
+    }
+    engine = qorvix::createEmbeddingEngine(qorvix::Backend::Cpu, std::move(file), 0, err);
+    if (!engine) {
+      std::cerr << "error: embedding engine: " << err << "\n";
+      return false;
+    }
+    return true;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return false;
+  }
+}
+
+int cmdRagIndex(const std::vector<std::string_view>& args) {
+  namespace rag = qorvix::rag;
+  const std::string dir = args.size() > 2 ? std::string(args[2]) : std::string();
+  const std::string modelPath = flagValue(args, "--embed-model");
+  const std::string storePath = flagValue(args, "--store");
+  if (dir.empty() || modelPath.empty() || storePath.empty()) {
+    std::cerr << "usage: qorvix rag index <dir> --embed-model <f.gguf> --store <out.qvx> "
+                 "[--chunk-tokens N] [--overlap N]\n";
+    return 1;
+  }
+  rag::ChunkOptions opt;
+  if (auto v = flagValue(args, "--chunk-tokens"); !v.empty()) opt.maxTokens = std::stoi(v);
+  if (auto v = flagValue(args, "--overlap"); !v.empty()) opt.overlapTokens = std::stoi(v);
+
+  std::optional<qorvix::tokenizer::Tokenizer> tok;
+  std::unique_ptr<qorvix::embeddings::IEmbeddingEngine> engine;
+  if (!openEmbedder(modelPath, tok, engine)) return 1;
+
+  std::cout << "indexing " << dir << "\n"
+            << "  model: " << modelPath << " (dim " << engine->dim() << ", pooling "
+            << qorvix::runtime::poolingName(engine->defaultPooling()) << ")\n"
+            << "  chunks: " << opt.maxTokens << " tokens, " << opt.overlapTokens << " overlap\n";
+
+  using clock = std::chrono::steady_clock;
+  const auto t0 = clock::now();
+  rag::Index index;
+  rag::IndexStats stats;
+  std::string err;
+  // Indexing a directory is minutes of CPU-encoder work; a silent process looks hung.
+  auto progress = [](int done, int total, const std::string& source) {
+    if (!source.empty()) {
+      std::cout << "  [" << done + 1 << "/" << total << "] " << source << "\n" << std::flush;
+    }
+  };
+  if (!rag::buildIndex(dir, *engine, *tok, opt, index, stats, err, progress)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const double sec = std::chrono::duration<double>(clock::now() - t0).count();
+
+  if (!index.save(storePath, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  std::cout << std::fixed << std::setprecision(1) << "\nindexed " << stats.documents
+            << " documents into " << stats.chunks << " chunks (" << stats.tokens << " tokens) in "
+            << sec << "s\n"
+            << "stored: " << storePath << "\n";
+  for (const auto& s : stats.skipped) std::cout << "  skipped " << s << "\n";
+  return 0;
+}
+
+int cmdRagSearch(const std::vector<std::string_view>& args) {
+  namespace rag = qorvix::rag;
+  const std::string storePath = flagValue(args, "--store");
+  const std::string modelPath = flagValue(args, "--embed-model");
+  const std::string query = flagValue(args, "--query");
+  if (storePath.empty() || modelPath.empty() || query.empty()) {
+    std::cerr << "usage: qorvix rag search --store <x.qvx> --embed-model <f.gguf> "
+                 "--query \"...\" [--k 5] [--alpha 0.5]\n";
+    return 1;
+  }
+  rag::HybridOptions opt;
+  if (auto v = flagValue(args, "--k"); !v.empty()) opt.k = std::stoi(v);
+  if (auto v = flagValue(args, "--alpha"); !v.empty()) opt.alpha = std::stof(v);
+
+  std::string err;
+  rag::Index index;
+  if (!rag::Index::load(storePath, index, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  std::optional<qorvix::tokenizer::Tokenizer> tok;
+  std::unique_ptr<qorvix::embeddings::IEmbeddingEngine> engine;
+  if (!openEmbedder(modelPath, tok, engine)) return 1;
+
+  std::vector<rag::SearchHit> hits;
+  if (!rag::queryIndex(index, *engine, *tok, query, opt, hits, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  std::cout << "query: \"" << query << "\"\n"
+            << index.store.size() << " chunks | alpha " << opt.alpha << " ("
+            << (opt.alpha >= 1.0f  ? "dense only"
+                : opt.alpha <= 0.0f ? "lexical only"
+                                    : "hybrid RRF")
+            << ")\n\n";
+  if (hits.empty()) {
+    std::cout << "no results\n";
+    return 0;
+  }
+  for (std::size_t i = 0; i < hits.size(); ++i) {
+    const auto& c = index.store.chunk(hits[i].index);
+    std::string snippet = c.text.substr(0, 160);
+    for (char& ch : snippet) {
+      if (ch == '\n' || ch == '\t') ch = ' ';
+    }
+    std::cout << std::fixed << std::setprecision(4) << "[" << i + 1 << "] " << hits[i].score << "  "
+              << c.source << " #" << c.index << " (bytes " << c.byteStart << "-" << c.byteEnd
+              << ")\n      " << snippet << (c.text.size() > 160 ? "..." : "") << "\n";
+  }
+  return 0;
+}
+
+int cmdRag(const std::vector<std::string_view>& args) {
+  const std::string sub = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (sub == "index") return cmdRagIndex(args);
+  if (sub == "search" || sub == "query") return cmdRagSearch(args);
+  std::cerr << "usage: qorvix rag index|search ...\n"
+            << "  qorvix rag index <dir> --embed-model <f.gguf> --store <out.qvx>\n"
+            << "  qorvix rag search --store <x.qvx> --embed-model <f.gguf> --query \"...\"\n";
+  return 1;
 }
 
 namespace {
@@ -1535,6 +1678,7 @@ int main(int argc, char** argv) {
   if (command == "generate") return cmdGenerate(args);
   if (command == "embed") return cmdEmbed(args);
   if (command == "embed-check") return cmdEmbedCheck(args);
+  if (command == "rag") return cmdRag(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();
