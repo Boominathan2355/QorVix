@@ -70,15 +70,13 @@ void BertModel::attention(const rt::EncoderLayerWeights& L, int n) {
   const int headDim = static_cast<int>(cfg_.headDim());
   const float scale = 1.0f / std::sqrt(static_cast<float>(headDim));
 
-  // Project every position first, then attend. Interleaving projection with attention would work
-  // identically, but this shape is what a batched GEMV (qmatmulN) drops into as a single change:
-  // one pass over each weight matrix instead of one pass per token.
-  for (int t = 0; t < n; ++t) {
-    const float* x = norm_.data() + static_cast<std::size_t>(t) * d;
-    rt::wmatmulBias(q_.data() + static_cast<std::size_t>(t) * d, L.wq, x, L.bq);
-    rt::wmatmulBias(k_.data() + static_cast<std::size_t>(t) * d, L.wk, x, L.bk);
-    rt::wmatmulBias(v_.data() + static_cast<std::size_t>(t) * d, L.wv, x, L.bv);
-  }
+  // All N positions through each projection in one call. A per-token loop would re-stream the
+  // whole weight matrix N times for work that needs a bounded number of passes — the dominant
+  // cost of an encoder forward pass, since unlike decode there is no N=1 case to hide it.
+  const float* xs = norm_.data();
+  rt::wmatmulNBias(q_.data(), L.wq, xs, n, L.bq);
+  rt::wmatmulNBias(k_.data(), L.wk, xs, n, L.bk);
+  rt::wmatmulNBias(v_.data(), L.wv, xs, n, L.bv);
 
   for (int h = 0; h < nHeads; ++h) {
     const int off = h * headDim;
@@ -167,28 +165,27 @@ bool BertModel::encode(const std::vector<int>& tokens, std::string& error) {
     std::copy(states_.begin(), states_.begin() + static_cast<std::size_t>(n) * d, norm_.begin());
     attention(L, n);
 
+    // o-projection for every position, then residual + post-norm per position.
+    rt::wmatmulNBias(tmp_.data(), L.wo, attn_.data(), n, L.bo);
     for (int t = 0; t < n; ++t) {
       float* x = states_.data() + static_cast<std::size_t>(t) * d;
-      rt::wmatmulBias(tmp_.data(), L.wo, attn_.data() + static_cast<std::size_t>(t) * d, L.bo);
-      rt::ops::add(x, tmp_.data(), d);  // residual
+      rt::ops::add(x, tmp_.data() + static_cast<std::size_t>(t) * d, d);  // residual
       rt::ops::layernorm(x, x, L.attnNorm.data(),
                          L.attnNormB.empty() ? nullptr : L.attnNormB.data(), d, eps);
     }
 
+    rt::wmatmulNBias(ffn_.data(), L.ffnUp, states_.data(), n, L.ffnUpB);
+    if (cfg_.ffnGated) {
+      rt::wmatmulNBias(ffnGate_.data(), L.ffnGate, states_.data(), n, {});
+      rt::ops::geluInPlace(ffnGate_.data(), n * ffn);
+      for (int i = 0; i < n * ffn; ++i) ffn_[i] *= ffnGate_[i];
+    } else {
+      rt::ops::geluInPlace(ffn_.data(), n * ffn);
+    }
+    rt::wmatmulNBias(tmp_.data(), L.ffnDown, ffn_.data(), n, L.ffnDownB);
     for (int t = 0; t < n; ++t) {
       float* x = states_.data() + static_cast<std::size_t>(t) * d;
-      float* up = ffn_.data() + static_cast<std::size_t>(t) * ffn;
-      rt::wmatmulBias(up, L.ffnUp, x, L.ffnUpB);
-      if (cfg_.ffnGated) {
-        float* gate = ffnGate_.data() + static_cast<std::size_t>(t) * ffn;
-        rt::wmatmul(gate, L.ffnGate, x);
-        rt::ops::geluInPlace(gate, ffn);
-        for (int i = 0; i < ffn; ++i) up[i] *= gate[i];
-      } else {
-        rt::ops::geluInPlace(up, ffn);
-      }
-      rt::wmatmulBias(tmp_.data(), L.ffnDown, up, L.ffnDownB);
-      rt::ops::add(x, tmp_.data(), d);  // residual
+      rt::ops::add(x, tmp_.data() + static_cast<std::size_t>(t) * d, d);  // residual
       rt::ops::layernorm(x, x, L.ffnNorm.data(),
                          L.ffnNormB.empty() ? nullptr : L.ffnNormB.data(), d, eps);
     }

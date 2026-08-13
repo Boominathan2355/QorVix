@@ -23,6 +23,7 @@
 #include "qorvix/model_registry.hpp"
 #include "qorvix/plugin_registry.hpp"
 #include "qorvix/ports.hpp"
+#include "qorvix/embeddings/embed_benchmark.hpp"
 #include "qorvix/rag/pipeline.hpp"
 #include "qorvix/runtime/benchmark.hpp"
 #include "qorvix/runtime/cpu_features.hpp"
@@ -1529,12 +1530,81 @@ int cmdBackends() {
 
 // Reproducible throughput benchmark over the unified engine seam — the single source of truth for
 // every perf claim. Warmup + timed runs -> median, on whichever backend createEngine() picks.
+// Encoder half of `qorvix bench`. Same warmup/median discipline and the same --json contract, but
+// a different measurement core because the seams differ (see embed_benchmark.hpp).
+int benchEncoder(const std::vector<std::string_view>& args, const std::string& path, bool json) {
+  namespace emb = qorvix::embeddings;
+  emb::EmbedBenchConfig bc;
+  if (auto v = flagValue(args, "--seq"); !v.empty()) bc.seqTokens = std::stoi(v);
+  if (auto v = flagValue(args, "--batch"); !v.empty()) bc.batch = std::stoi(v);
+  if (auto v = flagValue(args, "--warmup"); !v.empty()) bc.warmupRuns = std::stoi(v);
+  if (auto v = flagValue(args, "--runs"); !v.empty()) bc.timedRuns = std::stoi(v);
+
+  using clock = std::chrono::steady_clock;
+  const auto tLoad0 = clock::now();
+  auto file = qorvix::gguf::GgufFile::open(path);
+  std::string err;
+  auto engine = qorvix::createEmbeddingEngine(qorvix::Backend::Cpu, std::move(file), 0, err);
+  if (!engine) {
+    std::cerr << "error: embedding engine: " << err << "\n";
+    return 1;
+  }
+  const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+  if (!json) {
+    std::cerr << "benchmarking cpu encoder | seq " << bc.seqTokens << " batch " << bc.batch
+              << " | warmup " << bc.warmupRuns << " runs " << bc.timedRuns << " ...\n";
+  }
+  auto r = emb::runEmbedBenchmark(*engine, bc);
+  r.loadSec = loadSec;
+  if (!r.ran) {
+    std::cerr << "error: benchmark did not run\n";
+    return 1;
+  }
+
+  if (json) {
+    std::cout << std::fixed << std::setprecision(4) << "{"
+              << "\"kind\":\"embed\",\"backend\":\"" << r.backend << "\",\"model\":\"" << path
+              << "\",\"seq_tokens\":" << r.seqTokens << ",\"batch\":" << r.batch
+              << ",\"runs\":" << r.timedRuns << ",\"load_sec\":" << r.loadSec
+              << ",\"embed_seq_per_sec\":" << r.embedSeqPerSec
+              << ",\"embed_tok_per_sec\":" << r.embedTokPerSec
+              << ",\"ms_per_seq_median\":" << r.msPerSeqMedian
+              << ",\"ms_per_seq_min\":" << r.msPerSeqMin
+              << ",\"ms_per_seq_max\":" << r.msPerSeqMax << "}\n";
+    return 0;
+  }
+  std::cout << std::fixed << std::setprecision(2) << "\n"
+            << "  backend             " << r.backend << " (encoder)\n"
+            << "  model               " << path << "\n"
+            << "  sequence            " << r.seqTokens << " tokens x " << r.batch << "\n"
+            << "  load                " << r.loadSec << " s\n"
+            << "  embed_seq_per_sec   " << r.embedSeqPerSec << "\n"
+            << "  embed_tok_per_sec   " << r.embedTokPerSec << "\n"
+            << "  ms/seq (med/min/max)" << "  " << r.msPerSeqMedian << " / " << r.msPerSeqMin
+            << " / " << r.msPerSeqMax << "\n";
+  return 0;
+}
+
 int cmdBench(const std::vector<std::string_view>& args) {
   namespace rt = qorvix::runtime;
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   if (path.empty()) {
     std::cerr << "usage: qorvix bench <file.gguf> [--gpu|--vulkan|--auto] [--prompt N] [--gen N] "
-                 "[--warmup N] [--runs N] [--json]\n";
+                 "[--warmup N] [--runs N] [--json]\n"
+                 "       encoder models instead take [--seq N] [--batch N]\n";
+    return 1;
+  }
+  // One CLI, two cores: dispatch on the model family so a user never has to know which is which.
+  try {
+    const auto probe = qorvix::gguf::GgufFile::open(path);
+    std::string perr;
+    const auto cfg = qorvix::runtime::configFromGguf(probe, perr);
+    if (cfg.valid() && cfg.isEncoder()) {
+      return benchEncoder(args, path, hasFlag(args, "--json"));
+    }
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
     return 1;
   }
   const qorvix::Backend backend = backendFromArgs(args);

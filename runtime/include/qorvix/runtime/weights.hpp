@@ -63,6 +63,25 @@ inline void wmatmulBias(float* out, const WeightMat& w, const float* x,
   for (int r = 0; r < w.rows; ++r) out[r] += bias[r];
 }
 
+// Batched: out is [nVec, rows], X is [nVec, cols]. Streams the weight matrix a bounded number of
+// times instead of once per vector — see qmatmulN. Bit-identical to calling wmatmulBias per row.
+inline void wmatmulNBias(float* out, const WeightMat& w, const float* X, int nVec,
+                         const std::vector<float>& bias) {
+  if (w.quant) {
+    qmatmulN(out, w.quant, w.type, X, nVec, w.rows, w.cols);
+  } else {
+    for (int v = 0; v < nVec; ++v) {
+      ops::matmul(out + static_cast<std::size_t>(v) * w.rows, w.owned.data(),
+                  X + static_cast<std::size_t>(v) * w.cols, w.rows, w.cols);
+    }
+  }
+  if (bias.empty()) return;
+  for (int v = 0; v < nVec; ++v) {
+    float* row = out + static_cast<std::size_t>(v) * w.rows;
+    for (int r = 0; r < w.rows; ++r) row[r] += bias[r];
+  }
+}
+
 // Writes row `r` (cols elements) of an embedding table into dst.
 inline void embeddingRow(const WeightMat& w, int r, float* dst) {
   if (w.quant) {

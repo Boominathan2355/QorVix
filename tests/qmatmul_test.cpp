@@ -95,3 +95,74 @@ TEST_CASE("qmatmul rejects bad shapes and types", "[qmatmul]") {
   // unsupported type.
   REQUIRE_FALSE(qmatmulSupports(static_cast<std::uint32_t>(GgmlType::Q2_K)));
 }
+
+namespace {
+// A Q8_0 weight of `rows` rows x `blocks` blocks, with well-formed fp16 scales. Building the
+// bytes arbitrarily is a trap: a random byte pair is often a NaN or Inf half, and then both the
+// batched and unbatched paths produce NaN, which compares UNEQUAL to itself and fails an
+// equality test that the code actually passes.
+std::vector<std::uint8_t> q8Weight(int rows, int blocks) {
+  static const std::uint16_t kScales[] = {0x3800, 0x3C00, 0x3400, 0x3E00};  // 0.5, 1.0, 0.25, 1.5
+  std::vector<std::uint8_t> w;
+  for (int r = 0; r < rows; ++r) {
+    for (int b = 0; b < blocks; ++b) pushQ8_0Block(w, kScales[(r + b) % 4], r * 3 + b);
+  }
+  return w;
+}
+}  // namespace
+
+TEST_CASE("qmatmulN is bit-identical to qmatmul called once per vector", "[qmatmul]") {
+  // The batched GEMV exists to stop re-streaming a weight matrix once per token. It accumulates
+  // the same blocks in the same order per output element, so "close enough" is not the bar:
+  // anything short of bit-identical would mean the batched path reassociated the sum, and an
+  // embedding would then drift with how many tokens happened to be in the batch.
+  constexpr int kRows = 12, kCols = 64, kVec = 5;  // 2 blocks per row
+  const auto w = q8Weight(kRows, kCols / 32);
+  std::vector<float> X(static_cast<std::size_t>(kVec) * kCols);
+  for (std::size_t i = 0; i < X.size(); ++i) X[i] = 0.01f * static_cast<float>(i % 23) - 0.1f;
+
+  const auto type = static_cast<std::uint32_t>(GgmlType::Q8_0);
+  std::vector<float> batched(static_cast<std::size_t>(kVec) * kRows, 0.0f);
+  REQUIRE(qmatmulN(batched.data(), w.data(), type, X.data(), kVec, kRows, kCols));
+
+  for (int v = 0; v < kVec; ++v) {
+    std::vector<float> single(kRows, 0.0f);
+    REQUIRE(qmatmul(single.data(), w.data(), type, X.data() + v * kCols, kRows, kCols));
+    for (int r = 0; r < kRows; ++r) {
+      REQUIRE(batched[static_cast<std::size_t>(v) * kRows + r] == single[r]);
+    }
+  }
+}
+
+TEST_CASE("qmatmulN handles more vectors than its internal tile", "[qmatmul]") {
+  // Above the tile width the weight row is streamed more than once; the accumulator must still
+  // land in the right output slots.
+  constexpr int kRows = 4, kCols = 32, kVec = 70;  // kVec > the 64-wide tile
+  const auto w = q8Weight(kRows, kCols / 32);
+  std::vector<float> X(static_cast<std::size_t>(kVec) * kCols);
+  for (std::size_t i = 0; i < X.size(); ++i) X[i] = static_cast<float>(i % 7) * 0.05f;
+
+  const auto type = static_cast<std::uint32_t>(GgmlType::Q8_0);
+  std::vector<float> batched(static_cast<std::size_t>(kVec) * kRows, -1.0f);
+  REQUIRE(qmatmulN(batched.data(), w.data(), type, X.data(), kVec, kRows, kCols));
+
+  for (int v = 0; v < kVec; ++v) {
+    std::vector<float> single(kRows, 0.0f);
+    REQUIRE(qmatmul(single.data(), w.data(), type, X.data() + v * kCols, kRows, kCols));
+    for (int r = 0; r < kRows; ++r) {
+      REQUIRE(batched[static_cast<std::size_t>(v) * kRows + r] == single[r]);
+    }
+  }
+}
+
+TEST_CASE("qmatmulN with one vector matches qmatmul", "[qmatmul]") {
+  constexpr int kRows = 3, kCols = 32;
+  const auto w = q8Weight(kRows, kCols / 32);
+  std::vector<float> x(kCols, 0.25f);
+  const auto type = static_cast<std::uint32_t>(GgmlType::Q8_0);
+
+  std::vector<float> a(kRows), b(kRows);
+  REQUIRE(qmatmulN(a.data(), w.data(), type, x.data(), 1, kRows, kCols));
+  REQUIRE(qmatmul(b.data(), w.data(), type, x.data(), kRows, kCols));
+  REQUIRE(a == b);
+}

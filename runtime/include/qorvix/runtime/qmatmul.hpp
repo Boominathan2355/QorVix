@@ -21,6 +21,18 @@ bool qmatmul(float* out, const void* weight, std::uint32_t ggmlType, const float
 
 // Dequantizes a single row (`cols` elements) of a quantized matrix into `dst` — used for
 // embedding lookup, where only one token's row is needed.
+// Batched GEMV: out is [nVec, rows] row-major, X is [nVec, cols] row-major.
+//
+// The point is to dequantize each weight block ONCE and fold it into all nVec dot products,
+// instead of re-streaming the whole matrix once per vector. qmatmul is a GEMV, so an encoder over
+// N tokens — or a decoder prefilling an N-token prompt — pays N passes over every weight for work
+// that needs one. At N=256 that is two orders of magnitude of avoidable memory traffic.
+//
+// Mathematically identical to calling qmatmul() once per vector: each output element accumulates
+// the same blocks in the same order, so results are bit-identical, not merely close.
+bool qmatmulN(float* out, const void* weight, std::uint32_t ggmlType, const float* X, int nVec,
+              int rows, int cols);
+
 bool dequantRow(const void* weight, std::uint32_t ggmlType, int cols, int row, float* dst);
 
 }  // namespace qorvix::runtime
