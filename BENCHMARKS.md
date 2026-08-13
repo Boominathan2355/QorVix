@@ -133,6 +133,32 @@ it is a CLI gate rather than a CTest case because the Docker test image has no G
 End-to-end effect on the RAG pipeline, indexing the repo's own `docs/` (4 documents → 37 chunks,
 5795 tokens): **562.3 s → 20.4 s (27.5×)**.
 
+## Vision axis — CLIP tower (Phase 11b-1)
+
+The vision tower has no throughput axis worth gating on yet: it is a fixed 577-token forward pass
+with no tuning applied, and `qorvix bench` does not dispatch to it. Recorded here so the starting
+point is written down rather than rediscovered.
+
+| Date | Commit | Backend | Device | ms / image | Notes |
+|------|--------|---------|--------|-----------:|-------|
+| 2026-08-13 | 8605279 | cpu | i7 (this box, AVX2) | ~176,000 | ViT-L/14-336, 23 layers, 577 tokens, F16 |
+
+Slow because it is 577 tokens through a 300M-parameter tower on a CPU, with the same
+`qmatmulN` path the text encoder uses and no vision-specific work done. The correctness gate
+(`vision-check`) is what matters at this stage; a throughput axis follows when there is something
+to compare against.
+
+**A measurement caution, recorded because it nearly produced a wrong entry above.** While tuning
+`kVecTile` this box reported bge-small at 60–123 tok/s against a recorded 225.65, which looked like
+a regression. Building the previous commit in a clean worktree and re-measuring gave 212–222 —
+the drop was contention from a build running concurrently, not code. A follow-up "3.75× worse"
+conclusion about a wider tile evaporated the same way (cleanly re-measured: 202 vs 191, i.e. noise).
+
+The rule this implies: **on a developer box, never accept a benchmark delta measured while
+anything else is running, and confirm a suspected regression by building the prior commit rather
+than by reasoning about the diff.** The GPU numbers in this file come from a dedicated Colab
+runtime and do not have this problem; the CPU ones do.
+
 ## Optimization log
 
 Append one row per attempt: what changed, the before→after `decode_tok_per_sec` on the fixed

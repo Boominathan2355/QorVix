@@ -391,12 +391,62 @@ would silently poison every embedding derived from them), SQLite/Postgres vector
 indexing, `nomic-bert` (rope-based encoders are refused rather than approximated), and multi-model
 name routing in `serve`.
 
-### Phase 11b — Vision / audio / image generation ⬜
-Vision engine, audio engine, image generation, cross-modal embeddings, multi-agent workflows.
-`vision/`, `audio/`, `image/`, `agents/` are still 0 files.
+### Phase 11b-1 — Vision encoder ✅
 
-### Phase 11c — GPU embedding backends ⬜🖥️
-CUDA and Vulkan implementations of `IEmbeddingEngine`. `createEmbeddingEngine` reports honestly for
+**CLIP ViT tower + LLaVA projector (`vision` module).** SPEC's "Image → Vision Encoder →
+Projected Embeddings" stage. A ViT is architecturally a BERT with patch embeddings, so this reuses
+Phase 11a wholesale — bidirectional attention, LayerNorm with bias, the batched quantized GEMV.
+The differences are called out where they occur: **pre-norm** rather than post-norm, **quick-GELU**
+rather than GELU, a prepended class token, and a learned position table over patches.
+
+`qorvix image-embed <mmproj.gguf> --image f.png [--project]` produces 576 patch tokens, either as
+vision hidden states (1024-d) or projected into the language model's space (4096-d).
+
+**Image loading, from scratch.** A DEFLATE decoder (RFC 1951 — fixed and dynamic Huffman, stored
+blocks, the 32 KiB window) and a PNG reader on it, plus BMP and PPM. Verified **byte-exact against
+PIL**: 562,500 bytes, zero differences. The same inflate is the honest prerequisite for the PDF
+(FlateDecode) and DOCX (ZIP) loaders `rag/loaders.hpp` refuses — one decoder, three consumers.
+
+**Three things read off the real file rather than assumed**, each of which would have been silent:
+`ffn_down` is the EXPANSION and `ffn_up` the CONTRACTION (llama.cpp's CLIP converter inverts the
+usual naming); `clip.use_gelu = false` selects **quick-GELU**, a third variant not interchangeable
+with the two already in `ops`; and the normalization mean/std live in the file.
+
+**The gate: `qorvix vision-check`**, tiered like `embed-check` and diffed against transformers'
+`CLIPVisionModel` (fp32) via `scripts/capture_vision_reference.py`:
+
+| tier | result |
+|---|---|
+| preprocessing | max \|diff\| **1.20e-07** (5 pixel probes + mean/abs-mean) |
+| patch token row 0 | **cos 1.0000000**, max \|diff\| 6.93e-04 |
+| all 576 patch rows | **cos 0.9999996** |
+
+The residual 6.9e-04 is F16-vs-fp32 weight quantization, which is what it should be.
+
+The tiering earned itself immediately: **both bugs found were in preprocessing, not the
+transformer.** Pillow computes its resample window as `(int)(center ± support + 0.5)` *truncated*
+(floor/ceil pulls in an extra source pixel — invisible on gradients, 1.8e-1 wrong on a
+checkerboard), and Pillow clips to uint8 *between* the horizontal and vertical passes (a
+float-throughout pipeline drifts ~half a level per pass, 6e-3 on every pixel). With one aggregate
+verdict both would have read as "the transformer is slightly wrong".
+
+**Deferred, with the reason stated:** JPEG (named explicitly in the error, so a user knows it is a
+missing feature rather than a corrupt file), Adam7 interlacing, and wiring the projected features
+into the decoder for actual image chat — that needs `TextModel` to accept input embeddings rather
+than token ids.
+
+### Phase 11b-2 — Vision-language chat ⬜
+Splice the projected image tokens into the decoder's input embeddings and serve multimodal
+`/v1/chat/completions` with `image_url` content parts. The blocker is the seam: `IInferenceEngine`
+takes a token id per step, and image tokens have no id.
+
+### Phase 11b-3 — Audio / image generation ⬜
+Audio engine (Whisper: FFT + mel + encoder-decoder with cross-attention) and image generation
+(SDXL/Flux — not feasible on this CPU-only box; gated on GPU hardware). `audio/`, `image/` and
+`agents/` are still 0 files.
+
+### Phase 11c — GPU embedding + vision backends ⬜🖥️
+CUDA and Vulkan implementations of `IEmbeddingEngine` and the CLIP tower. `createEmbeddingEngine` reports honestly for
 now rather than silently falling back to CPU. Note `buildGpuModel`/`buildVulkanModel` are *not*
 reusable (they unconditionally read `L.ffnGate`); `detail::toGpuWeight`/`toVkWeight` are.
 
@@ -422,9 +472,10 @@ GPU-free on lavapipe, rel err 2.6e-06) — **and correct text embeddings behind 
 (bge-small F16 matches sentence-transformers at cosine 1.00000). Test suite green; the CPU-only,
 CUDA, and Vulkan builds all compile and link.
 
-**Three correctness gates, one per numerical path**, all CLI rather than CTest because each needs a
+**Four correctness gates, one per numerical path**, all CLI rather than CTest because each needs a
 GGUF the test image does not have: `gpu-check` (CUDA vs CPU logits), `vulkan-check` (Vulkan vs CPU
-logits), and `embed-check` (embeddings vs a captured sentence-transformers reference).
+logits), `embed-check` (embeddings vs a sentence-transformers reference), and `vision-check`
+(CLIP features vs a transformers reference).
 
 - **Unified backend ✅** — one `IInferenceEngine` seam, three implementations (CPU/CUDA/Vulkan), one
   `createEngine` factory, one generation loop. `generate` and `serve` reach any backend via
@@ -448,7 +499,10 @@ logits), and `embed-check` (embeddings vs a captured sentence-transformers refer
   and an embedding model in one process, and a RAG layer (chunking, `.qvx` vector store, BM25,
   RRF hybrid search). Gated by `embed-check` against a sentence-transformers reference:
   bge-small F16 min cos **1.00000**, all-MiniLM Q4_K_M **0.97598**, both with exact tokenizer parity.
-- **Not started (empty dirs, 0 files each)** — `vision/`, `image/`, `monitoring/`, `agents/`,
+- **Vision ✅** — CLIP ViT-L/14-336 tower + LLaVA projector from a `clip` mmproj GGUF, with a
+  from-scratch DEFLATE/PNG decoder and CLIP preprocessing. Gated by `vision-check` against
+  transformers at **cos 1.0000000** (preprocessing exact to 1.2e-07).
+- **Not started (empty dirs, 0 files each)** — `image/`, `monitoring/`, `agents/`,
   `audio/`, `ui/`, `cli/` — Phase 11b–12 placeholders, scaffolded only when their phase begins
   (see the status-annotated backlog above).
 
@@ -504,7 +558,7 @@ or verify (not possible in this CPU-only dev/CI environment) · ⬜ not started.
   · scheduler ✅ · sliding-window attn ⬜ · speculative decoding ⬜ · multi-GPU 🟡 (TP math done,
   NCCL 🖥️).
 - **Models:** GGUF F16/BF16/Q4_0..Q8_0/K-quants ✅ · more quant formats (IQ-quants) ⬜ · MoE ⬜ ·
-  vision ⬜ · text embeddings ✅ (BERT/WPM; bge-small + all-MiniLM verified) ·
+  vision ✅ (CLIP tower; VLM chat is 11b-2) · text embeddings ✅ (BERT/WPM; bge-small + all-MiniLM verified) ·
   vision/audio/cross-modal embeddings ⬜ · reranker ⬜.
 - **Serving:** OpenAI API ✅ (`/v1/models`, `/v1/chat/completions`, `/v1/completions`,
   `/v1/embeddings`) · two models in one process ✅ (`serve --embed-model`) · SSE streaming ✅ ·
