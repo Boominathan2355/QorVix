@@ -14,6 +14,8 @@
 #include <vector>
 
 #include "qorvix/api/http_server.hpp"
+#include "qorvix/api/json.hpp"
+#include "qorvix/api/multipart.hpp"
 #include "qorvix/api/openai.hpp"
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
@@ -31,6 +33,8 @@
 #include "qorvix/audio/audio_check.hpp"
 #include "qorvix/audio/audio_file.hpp"
 #include "qorvix/audio/mel.hpp"
+#include "qorvix/audio/whisper_check.hpp"
+#include "qorvix/audio/whisper_model.hpp"
 #include "qorvix/vision/clip_model.hpp"
 #include "qorvix/vision/image.hpp"
 #include "qorvix/vision/vision_check.hpp"
@@ -1052,6 +1056,52 @@ int cmdImageEmbed(const std::vector<std::string_view>& args) {
   }
 }
 
+// ---- audio: the shared front-end plumbing behind audio-mel, transcribe and
+// whisper-check ------------------------------------------------------------------------
+
+// Shared by audio-mel, transcribe and whisper-check. Resampling is REFUSED rather than guessed at:
+// an ungated resampler in front of the mel filters is exactly the silent-poisoning failure Phase
+// 11b-1 warned about — the transcript would come back fluent and slightly wrong with nothing to
+// indicate why. The fix is one command, so this reads as a missing feature, not a broken file.
+bool audioRateRefused(const std::string& path, int have, int want) {
+  if (have == want) return false;
+  std::cerr << "error: " << path << " is " << have << " Hz; Whisper's front end is " << want
+            << " Hz only.\n"
+            << "       Resampling is not implemented yet (it would need its own reference to be\n"
+            << "       trustworthy). Convert first:\n"
+            << "         ffmpeg -i " << path << " -ac 1 -ar " << want
+            << " -c:a pcm_s16le out.wav\n";
+  return true;
+}
+
+// WAV -> the [mels x frames] log-mel window Whisper consumes, with its own diagnostics printed.
+bool loadLogMel(const std::string& path, const qorvix::audio::MelConfig& cfg,
+                std::vector<float>& mel) {
+  namespace au = qorvix::audio;
+  std::string err;
+  au::AudioBuffer audio;
+  if (!au::loadAudio(path, audio, err)) {
+    std::cerr << "error: " << err << "\n";
+    return false;
+  }
+  if (audioRateRefused(path, audio.sampleRate, cfg.sampleRate)) return false;
+  // The window is exactly 30 s and the front end truncates past it, which is what the reference
+  // feature extractor does — but silently, and a caller who fed in ten minutes would otherwise read
+  // the first half-minute as the whole transcript. Long-form decoding (sliding windows carried by
+  // <|startofprev|>) is not implemented; over HTTP the same case is refused outright, because there
+  // is no one there to read a warning.
+  if (audio.seconds() > static_cast<double>(cfg.chunkSeconds) + 0.5) {
+    std::cerr << "note: " << path << " is " << static_cast<int>(audio.seconds()) << " s; Whisper's "
+              << "window is " << cfg.chunkSeconds << " s and long-form decoding is not implemented "
+              << "— using the first " << cfg.chunkSeconds << " s only.\n";
+  }
+  if (!au::logMelSpectrogram(audio.samples, cfg, mel, err)) {
+    std::cerr << "error: mel: " << err << "\n";
+    return false;
+  }
+  return true;
+}
+
 // Whisper's log-mel front end, on a file. The audio analogue of `image-embed`: it produces the
 // tensor the model consumes, so the preprocessing can be inspected and diffed before any Whisper
 // weight exists to consume it.
@@ -1076,19 +1126,7 @@ int cmdAudioMel(const std::vector<std::string_view>& args) {
   }
   const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
 
-  // Resampling is REFUSED rather than guessed at. An ungated resampler in front of the mel
-  // filters is exactly the silent-poisoning failure Phase 11b-1 warned about: the transcript
-  // would come back fluent and slightly wrong with nothing to indicate why. The fix is one
-  // command and is named here so this reads as a missing feature, not a broken file.
-  if (audio.sampleRate != cfg.sampleRate) {
-    std::cerr << "error: " << path << " is " << audio.sampleRate << " Hz; Whisper's front end is "
-              << cfg.sampleRate << " Hz only.\n"
-              << "       Resampling is not implemented yet (it would need its own reference to be\n"
-              << "       trustworthy). Convert first:\n"
-              << "         ffmpeg -i " << path << " -ac 1 -ar " << cfg.sampleRate
-              << " -c:a pcm_s16le out.wav\n";
-    return 1;
-  }
+  if (audioRateRefused(path, audio.sampleRate, cfg.sampleRate)) return 1;
 
   const auto tRun0 = clock::now();
   std::vector<float> mel;
@@ -1266,6 +1304,337 @@ int cmdAudioCheck(const std::vector<std::string_view>& args) {
   return pass ? 0 : 1;
 }
 
+// ---- whisper: encoder + decoder ---------------------------------------------------------------
+int cmdTranscribe(const std::vector<std::string_view>& args) {
+  namespace au = qorvix::audio;
+  const std::string modelPath = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string audioPath = flagValue(args, "--audio");
+  if (modelPath.empty() || audioPath.empty()) {
+    std::cerr << "usage: qorvix transcribe <whisper.gguf> --audio <file.wav>\n"
+                 "                         [--language en|auto] [--translate] [--timestamps]\n"
+                 "                         [--max-tokens N] [--json]\n";
+    return 1;
+  }
+  const bool json = hasFlag(args, "--json");
+  au::WhisperModel::TranscribeOptions opt;
+  opt.translate = hasFlag(args, "--translate");
+  opt.timestamps = hasFlag(args, "--timestamps");
+  // An absent --language (or "auto") means detection, which is Whisper's own default and its own
+  // procedure — one decoder step from <|startoftranscript|>, argmax over the language ids.
+  if (const std::string l = flagValue(args, "--language"); !l.empty() && l != "auto") {
+    opt.language = l;
+  }
+  if (const std::string m = flagValue(args, "--max-tokens"); !m.empty()) {
+    opt.maxTokens = std::stoi(m);
+  }
+
+  using clock = std::chrono::steady_clock;
+  std::string err;
+  const auto tLoad0 = clock::now();
+  auto model = au::WhisperModel::fromPath(modelPath, err);
+  if (!model) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+  const auto& cfg = model->config();
+
+  std::vector<float> mel;
+  if (!loadLogMel(audioPath, model->melConfig(), mel)) return 1;
+
+  // Encode and decode are timed separately because they scale differently: the encoder is a fixed
+  // cost per 30-second window regardless of how much speech is in it, the decoder is per token.
+  const auto tEnc0 = clock::now();
+  if (!model->encode(mel, err)) {
+    std::cerr << "error: encode: " << err << "\n";
+    return 1;
+  }
+  const double encSec = std::chrono::duration<double>(clock::now() - tEnc0).count();
+
+  const auto tDec0 = clock::now();
+  au::WhisperModel::TranscribeResult res;
+  if (!model->generate(opt, res, err)) {
+    std::cerr << "error: decode: " << err << "\n";
+    return 1;
+  }
+  const double decSec = std::chrono::duration<double>(clock::now() - tDec0).count();
+  const int generated = static_cast<int>(res.tokens.size()) -
+                        static_cast<int>(model->promptTokens(opt, err).size());
+  const double tokPerSec = decSec > 0.0 ? generated / decSec : 0.0;
+
+  if (json) {
+    namespace J = qorvix::api::json;
+    J::Value out = J::Value::object();
+    out["text"] = J::Value(res.text);
+    out["language"] = J::Value(res.language);
+    out["language_detected"] = J::Value(res.languageDetected);
+    out["tokens"] = J::Value(generated);
+    out["truncated"] = J::Value(res.hitTokenLimit);
+    J::Value timings = J::Value::object();
+    timings["load_s"] = J::Value(loadSec);
+    timings["encode_s"] = J::Value(encSec);
+    timings["decode_s"] = J::Value(decSec);
+    out["timings"] = timings;
+    if (!res.segments.empty()) {
+      J::Value segs = J::Value::array();
+      for (const auto& s : res.segments) {
+        J::Value seg = J::Value::object();
+        seg["start"] = J::Value(static_cast<double>(s.start));
+        seg["end"] = J::Value(static_cast<double>(s.end));
+        seg["text"] = J::Value(s.text);
+        segs.push(seg);
+      }
+      out["segments"] = segs;
+    }
+    std::cout << out.dump() << "\n";
+    return 0;
+  }
+
+  std::cout << "model:    " << cfg.name << "  (enc " << cfg.encLayers << "x" << cfg.encHeads
+            << ", dec " << cfg.decLayers << "x" << cfg.decHeads << ", d " << cfg.dModel << ", "
+            << cfg.melBins << " mels, vocab " << cfg.vocabSize << ")\n"
+            << "audio:    " << audioPath << "\n"
+            << "language: " << res.language
+            << (res.languageDetected ? " (detected)" : " (given)") << "\n"
+            << "task:     " << (opt.translate ? "translate" : "transcribe")
+            << (opt.timestamps ? ", timestamps" : ", no timestamps") << "\n\n";
+  if (!res.segments.empty()) {
+    std::cout << std::fixed << std::setprecision(2);
+    for (const auto& s : res.segments) {
+      std::cout << "[" << s.start << " -> " << s.end << "]" << s.text << "\n";
+    }
+    std::cout << std::defaultfloat << "\n";
+  } else {
+    std::cout << res.text << "\n\n";
+  }
+  if (res.hitTokenLimit) {
+    // Named rather than hidden: a transcript that ran into the bound is a different artifact from
+    // one the model chose to end, and only the caller can decide what to do about it.
+    std::cout << "note: stopped on the token limit, not on <|endoftext|> — the transcript may be "
+                 "cut short.\n";
+  }
+  std::cout << "[load " << loadSec << "s | encode " << encSec << "s | decode " << decSec << "s, "
+            << generated << " tokens, " << tokPerSec << " tok/s]\n";
+  return 0;
+}
+
+// The Phase 11b-3b gate. Tiered like every other *-check in this repo, and for the sharpest
+// version of the same reason: an encoder bug, a cross-attention bug and a missing suppression list
+// all present identically at the end — a transcript that is fluent and not what other Whisper
+// runtimes produce.
+int cmdWhisperCheck(const std::vector<std::string_view>& args) {
+  namespace au = qorvix::audio;
+  namespace ops = qorvix::runtime::ops;
+  const std::string modelPath = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string refPath = flagValue(args, "--ref");
+  std::string audioPath = flagValue(args, "--audio");
+  if (modelPath.empty() || refPath.empty()) {
+    std::cerr << "usage: qorvix whisper-check <whisper.gguf> --ref <fixture> [--audio <file.wav>]\n"
+                 "                            [--min-cos 0.9999] [--tol 0.05]\n";
+    return 1;
+  }
+  if (audioPath.empty()) audioPath = "tests/data/speech_probe.wav";
+  float minCos = 0.9999f;
+  if (const std::string v = flagValue(args, "--min-cos"); !v.empty()) minCos = std::stof(v);
+  double tol = 0.05;
+  if (const std::string v = flagValue(args, "--tol"); !v.empty()) tol = std::stod(v);
+
+  std::string err;
+  au::WhisperReference ref;
+  if (!ref.load(refPath, err)) {
+    std::cerr << "error: reference: " << err << "\n";
+    return 1;
+  }
+  auto model = au::WhisperModel::fromPath(modelPath, err);
+  if (!model) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const auto& cfg = model->config();
+
+  std::cout << "model:  " << modelPath << "  (" << cfg.name << ", enc " << cfg.encLayers << "x"
+            << cfg.encHeads << ", dec " << cfg.decLayers << "x" << cfg.decHeads << ", d "
+            << cfg.dModel << ")\n"
+            << "audio:  " << audioPath << "\n"
+            << "ref:    " << ref.model << "  (language " << ref.language << ", "
+            << ref.maxNewTokens << " max new tokens)\n"
+            << "gate:   cos >= " << minCos << ", |diff| <= " << tol << "\n\n";
+
+  // Wrong-pairing checks first, and before any compute: a fixture from another model must read as
+  // a mismatched pair, not as a numerical failure.
+  if (ref.dModel != static_cast<int>(cfg.dModel) || ref.encCtx != static_cast<int>(cfg.encCtx) ||
+      ref.vocab != static_cast<int>(cfg.vocabSize)) {
+    std::cout << "Reference is d " << ref.dModel << " / ctx " << ref.encCtx << " / vocab "
+              << ref.vocab << " but the model is d " << cfg.dModel << " / ctx " << cfg.encCtx
+              << " / vocab " << cfg.vocabSize << " — wrong pairing.\n\nRESULT: MISMATCH\n";
+    return 1;
+  }
+
+  bool pass = true;
+  auto cosine = [](const std::vector<float>& a, const float* b, std::size_t n) {
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      dot += static_cast<double>(a[i]) * b[i];
+      na += static_cast<double>(a[i]) * a[i];
+      nb += static_cast<double>(b[i]) * b[i];
+    }
+    const double denom = std::sqrt(na) * std::sqrt(nb);
+    return denom > 0.0 ? dot / denom : 0.0;
+  };
+  auto maxDiff = [](const std::vector<float>& a, const float* b, std::size_t n) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      worst = std::max(worst, std::abs(static_cast<double>(a[i]) - b[i]));
+    }
+    return worst;
+  };
+
+  // ---- tier 0: the forced prefix ----
+  // Cheapest and most consequential: every later tier decodes from this prefix, so a prefix that
+  // disagrees with the reference makes the rest of the comparison meaningless rather than failing.
+  au::WhisperModel::TranscribeOptions opt;
+  opt.language = ref.language;
+  opt.maxTokens = ref.maxNewTokens;
+  const std::vector<int> prompt = model->promptTokens(opt, err);
+  if (prompt.empty()) {
+    std::cerr << "error: prompt: " << err << "\n";
+    return 1;
+  }
+  const bool promptOk = prompt == ref.prompt;
+  std::cout << "Forced prefix:                   ";
+  for (std::size_t i = 0; i < prompt.size(); ++i) std::cout << (i ? " " : "") << prompt[i];
+  std::cout << (promptOk ? "   MATCHES reference\n" : "   != reference\n");
+  if (!promptOk) {
+    pass = false;
+    std::cout << "  reference:                     ";
+    for (std::size_t i = 0; i < ref.prompt.size(); ++i) std::cout << (i ? " " : "") << ref.prompt[i];
+    std::cout << "\n";
+  }
+
+  std::vector<float> mel;
+  if (!loadLogMel(audioPath, model->melConfig(), mel)) return 1;
+  if (!model->encode(mel, err)) {
+    std::cerr << "error: encode: " << err << "\n";
+    return 1;
+  }
+
+  std::cout << std::scientific << std::setprecision(2);
+
+  // ---- tier 1: the encoder ----
+  const std::vector<float>& states = model->encoderStates();
+  const std::size_t d = cfg.dModel;
+  const double frame0Diff = maxDiff(ref.encFrame0, states.data(), d);
+  const double frame0Cos = cosine(ref.encFrame0, states.data(), d);
+  std::cout << "Encoder position 0:              max |diff| " << frame0Diff << "  cos "
+            << std::fixed << std::setprecision(7) << frame0Cos << std::scientific
+            << std::setprecision(2) << "\n";
+  if (frame0Diff > tol || frame0Cos < minCos) pass = false;
+
+  if (!ref.encDimMeans.empty()) {
+    // Per-dimension means over all positions. This is the tier that catches a frame SHIFT, which
+    // leaves position 0 bit-identical and moves everything after it.
+    std::vector<float> means(d, 0.0f);
+    for (std::size_t t = 0; t < cfg.encCtx; ++t) {
+      for (std::size_t e = 0; e < d; ++e) means[e] += states[t * d + e];
+    }
+    for (float& v : means) v /= static_cast<float>(cfg.encCtx);
+    const double meanDiff = maxDiff(ref.encDimMeans, means.data(), d);
+    const double meanCos = cosine(ref.encDimMeans, means.data(), d);
+    std::cout << "Encoder per-dimension means:     max |diff| " << meanDiff << "  cos " << std::fixed
+              << std::setprecision(7) << meanCos << std::scientific << std::setprecision(2)
+              << "  (over " << cfg.encCtx << " positions)\n";
+    if (meanDiff > tol || meanCos < minCos) pass = false;
+  }
+
+  // ---- tier 2: one decoder step, raw ----
+  // No suppression: this compares the model's own distribution, so a suppression difference cannot
+  // hide here and a cross-attention difference cannot be blamed on the suppression lists.
+  model->resetDecoder();
+  for (std::size_t i = 0; i < prompt.size(); ++i) {
+    if (!model->step(prompt[i], static_cast<int>(i), err)) {
+      std::cerr << "error: decoder step: " << err << "\n";
+      return 1;
+    }
+  }
+  const std::vector<float>& logits = model->logits();
+  const int ourArgmax = ops::argmax(logits.data(), static_cast<int>(cfg.vocabSize));
+  std::cout << "Raw argmax after the prefix:     " << ourArgmax << " vs reference " << ref.argmax0
+            << (ourArgmax == ref.argmax0 ? "   MATCHES\n" : "   != reference\n");
+  if (ourArgmax != ref.argmax0) pass = false;
+
+  std::vector<int> order(cfg.vocabSize);
+  for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(i);
+  const std::size_t top = std::min<std::size_t>(ref.logitsTop.size(), order.size());
+  std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(top), order.end(),
+                    [&](int a, int b) { return logits[a] > logits[b]; });
+  bool topIdsOk = true;
+  double topDiff = 0.0;
+  for (std::size_t i = 0; i < top; ++i) {
+    if (order[i] != ref.logitsTop[i].id) topIdsOk = false;
+    topDiff = std::max(topDiff, std::abs(static_cast<double>(logits[ref.logitsTop[i].id]) -
+                                         ref.logitsTop[i].value));
+  }
+  std::cout << "Top-" << top << " logits:                    max |diff| " << topDiff << "  ids "
+            << (topIdsOk ? "identical" : "DIFFER") << "\n";
+  if (!topIdsOk || topDiff > tol) pass = false;
+
+  if (!ref.logitProbes.empty()) {
+    double probeDiff = 0.0;
+    for (const auto& p : ref.logitProbes) {
+      if (p.id < 0 || p.id >= static_cast<int>(cfg.vocabSize)) continue;
+      probeDiff = std::max(probeDiff, std::abs(static_cast<double>(logits[p.id]) - p.value));
+    }
+    std::cout << "Fixed logit probes:              max |diff| " << probeDiff << "  ("
+              << ref.logitProbes.size() << " ids)\n";
+    if (probeDiff > tol) pass = false;
+  }
+
+  // ---- tier 3: the greedy loop, with suppression ----
+  au::WhisperModel::TranscribeResult res;
+  if (!model->generate(opt, res, err)) {
+    std::cerr << "error: generate: " << err << "\n";
+    return 1;
+  }
+  std::vector<int> generated(res.tokens.begin() +
+                                 static_cast<std::ptrdiff_t>(std::min(prompt.size(),
+                                                                      res.tokens.size())),
+                             res.tokens.end());
+  // The reference stream may carry <|endoftext|>; ours stops before emitting it, so the comparison
+  // is over the text tokens both produced.
+  while (!generated.empty() && generated.back() >= cfg.textTokenEnd) generated.pop_back();
+  std::vector<int> refTokens = ref.tokens;
+  while (!refTokens.empty() && refTokens.back() >= cfg.textTokenEnd) refTokens.pop_back();
+
+  std::size_t diverge = 0;
+  while (diverge < generated.size() && diverge < refTokens.size() &&
+         generated[diverge] == refTokens[diverge]) {
+    ++diverge;
+  }
+  const bool tokensOk = generated == refTokens;
+  std::cout << "Greedy token stream:             " << generated.size() << " tokens vs "
+            << refTokens.size() << (tokensOk ? "   IDENTICAL\n" : "   DIVERGES\n");
+  if (!tokensOk) {
+    pass = false;
+    std::cout << "  first divergence at index " << diverge << ": "
+              << (diverge < generated.size() ? std::to_string(generated[diverge]) : "<end>")
+              << " vs " << (diverge < refTokens.size() ? std::to_string(refTokens[diverge]) : "<end>")
+              << "\n";
+  }
+  const bool textOk = res.text == ref.text;
+  std::cout << "Transcript:                      " << (textOk ? "IDENTICAL" : "DIFFERS") << "\n"
+            << "  ours:      \"" << res.text << "\"\n";
+  if (!textOk) {
+    pass = false;
+    std::cout << "  reference: \"" << ref.text << "\"\n";
+  }
+
+  std::cout << "\n"
+            << (pass ? "RESULT: PASS - encoder, decoder step and greedy transcript all match "
+                       "transformers.\n"
+                     : "RESULT: MISMATCH - the first failing tier above names the cause.\n");
+  return pass ? 0 : 1;
+}
+
 // The Phase 11b analogue of embed-check. Tiered the same way and for the same reason: the vision
 // path has two independently-wrong halves, and one aggregate verdict would not say which.
 int cmdVisionCheck(const std::vector<std::string_view>& args) {
@@ -1423,7 +1792,8 @@ int cmdVlmCheck(const std::vector<std::string_view>& args) {
   const std::string mmprojPath = flagValue(args, "--mmproj");
   const std::string imagePath = flagValue(args, "--image");
   if (path.empty()) {
-    std::cerr << "usage: qorvix vlm-check <model.gguf> [--mmproj <clip.gguf> --image <file.png>]\n";
+    std::cerr << "usage: qorvix vlm-check <model.gguf> [--mmproj <clip.gguf> --image <file.png>]\n"
+                 "                        [--gpu|--vulkan|--auto]   gate the seam on a device backend\n";
     return 1;
   }
 
@@ -1449,7 +1819,17 @@ int cmdVlmCheck(const std::vector<std::string_view>& args) {
       std::cerr << "error: tokenizer: " << err << "\n";
       return 1;
     }
-    auto engine = qorvix::createEngine(qorvix::Backend::Cpu, std::move(engineFile), 512, 2, err);
+    // Phase 11c: the gate follows --gpu/--vulkan rather than pinning the CPU. The identity it
+    // asserts — a token's own embedding row through forwardEmbedding reproduces its id through
+    // forward — is exactly what a device implementation of that seam has to preserve, and it is the
+    // only check that can catch an upload landing in the wrong buffer or a stale kernel head.
+    const qorvix::Backend vlmBackend = backendFromArgs(args);
+    if (!qorvix::backendAvailable(vlmBackend)) {
+      std::cerr << "error: " << qorvix::backendName(vlmBackend)
+                << " backend requested but unavailable (not built in, or no device)\n";
+      return 1;
+    }
+    auto engine = qorvix::createEngine(vlmBackend, std::move(engineFile), 512, 2, err);
     if (!engine) {
       std::cerr << "error: engine: " << err << "\n";
       return 1;
@@ -1752,7 +2132,8 @@ int cmdServe(const std::vector<std::string_view>& args) {
     std::cerr << "usage: qorvix serve <file.gguf> [--gpu|--vulkan|--auto] [--tp N|--devices 0,1] "
                  "[--port N] "
                  "[--max-concurrent N] [--ctx N] [--embed-model <file.gguf>] [--max-batch N]\n"
-                 "       [--mmproj <clip.gguf>]   (vision-language chat: image_url content parts)\n";
+                 "       [--mmproj <clip.gguf>]   (vision-language chat: image_url content parts)\n"
+                 "       [--whisper <whisper.gguf>]   (POST /v1/audio/transcriptions)\n";
     return 1;
   }
   const std::string mmprojPath = flagValue(args, "--mmproj");
@@ -1762,6 +2143,10 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // reserved for — but it needs a loaded-engine registry, name->engine dispatch, and an eviction
   // policy; --embed-model is the seam that grows into it.
   const std::string embedPath = flagValue(args, "--embed-model");
+  // Fourth modality, same process, same opt-in shape as --embed-model and --mmproj. Unlike
+  // --mmproj it needs no compatibility check against the chat engine: transcription is a whole
+  // pipeline of its own (audio in, text out) rather than a stage feeding the decoder.
+  const std::string whisperPath = flagValue(args, "--whisper");
   // Same backend selection as generate: --gpu / --vulkan / --auto / (default) CPU. serve reaches
   // every backend through the ONE createEngine() factory + the IInferenceEngine seam.
   const qorvix::Backend backend = backendFromArgs(args);
@@ -1873,6 +2258,18 @@ int cmdServe(const std::vector<std::string_view>& args) {
     }
   }
 
+  // Fourth engine, fourth modality. CPU only by construction — there is no device Whisper
+  // backend — so the flag deliberately does not follow the chat backend: `serve --gpu --whisper
+  // x` runs the transcription on the CPU rather than silently claiming a GPU one.
+  std::optional<qorvix::audio::WhisperModel> whisper;
+  if (!whisperPath.empty()) {
+    whisper = qorvix::audio::WhisperModel::fromPath(whisperPath, err);
+    if (!whisper) {
+      std::cerr << "error: whisper model: " << err << "\n";
+      return 1;
+    }
+  }
+
   const std::string modelId = engine->config().architecture + "/" + path;
   const std::string embedModelId =
       embedEngine ? embedEngine->config().architecture + "/" + embedPath : std::string();
@@ -1901,6 +2298,12 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // so encoding an image does not queue behind an in-flight generation — the encode is the long
   // pole of a multimodal request (tens of seconds on CPU), not something to serialize needlessly.
   std::mutex visionMutex;
+
+  // And a fourth, for the same reason and with the same shape: WhisperModel keeps the encoder
+  // scratch, the fixed cross-attention cache and the decoder KV cache in members, so two
+  // concurrent transcriptions would trample all three. Separate from schedMutex because a
+  // 30-second encode has no reason to queue behind an in-flight chat generation.
+  std::mutex whisperMutex;
 
   api::HttpServer server(port);
   if (!server.start(err)) {
@@ -1935,7 +2338,15 @@ int cmdServe(const std::vector<std::string_view>& args) {
   } else {
     std::cout << "  vision:     none (pass --mmproj <clip.gguf> to accept image_url content parts)\n";
   }
+  if (whisper) {
+    std::cout << "  audio:      " << whisperPath << " | " << whisper->config().name << " | "
+              << whisper->config().melBins << " mels, " << whisper->melConfig().chunkSeconds
+              << " s windows | cpu\n";
+  } else {
+    std::cout << "  audio:      none (pass --whisper <whisper.gguf> to enable /v1/audio/transcriptions)\n";
+  }
   std::cout << "  POST /v1/chat/completions   POST /v1/completions   POST /v1/embeddings\n"
+            << "  POST /v1/audio/transcriptions   POST /v1/audio/translations\n"
             << "  GET /v1/models\n"
             << "  (Ctrl-C to stop)\n";
 
@@ -1947,8 +2358,194 @@ int cmdServe(const std::vector<std::string_view>& args) {
     if (req.method == "GET" && req.target == "/v1/models") {
       std::vector<std::string> ids{modelId};
       if (embedEngine) ids.push_back(embedModelId);
+      if (whisper) ids.push_back("whisper/" + whisperPath);
       res.send(200, "application/json", api::modelsResponse(ids).dump());
       return;
+    }
+
+    // ---- POST /v1/audio/transcriptions (and /translations) ----
+    // The one OpenAI route that is not JSON: the audio arrives as a multipart/form-data upload,
+    // which is what every OpenAI SDK sends. Accepting base64-in-JSON instead would have been less
+    // code and compatible with none of them.
+    {
+      const bool isTranscription = req.target == "/v1/audio/transcriptions";
+      const bool isTranslation = req.target == "/v1/audio/translations";
+      if (isTranscription || isTranslation) {
+        if (req.method != "POST") {
+          res.send(405, "application/json",
+                   api::errorResponse("use POST for " + req.target, "invalid_request_error").dump());
+          return;
+        }
+        if (!whisper) {
+          // 501, not 404: the route exists, this process just has no audio model loaded.
+          res.send(501, "application/json",
+                   api::errorResponse(
+                       "no audio model loaded — restart with --whisper <whisper.gguf>",
+                       "not_implemented")
+                       .dump());
+          return;
+        }
+        if (!api::isMultipartFormData(req.contentType)) {
+          res.send(400, "application/json",
+                   api::errorResponse(
+                       "POST multipart/form-data with a `file` field (what the OpenAI SDKs send); "
+                       "this route does not take JSON",
+                       "invalid_request_error")
+                       .dump());
+          return;
+        }
+        std::vector<api::FormPart> parts;
+        std::string mperr;
+        if (!api::parseMultipart(req.contentType, req.body, parts, mperr)) {
+          res.send(400, "application/json",
+                   api::errorResponse("malformed multipart body: " + mperr,
+                                      "invalid_request_error")
+                       .dump());
+          return;
+        }
+        const api::FormPart* filePart = api::findPart(parts, "file");
+        if (!filePart || filePart->content.empty()) {
+          res.send(400, "application/json",
+                   api::errorResponse("multipart body has no non-empty `file` part",
+                                      "invalid_request_error")
+                       .dump());
+          return;
+        }
+        auto field = [&](const char* name) -> std::string {
+          const api::FormPart* p = api::findPart(parts, name);
+          return p ? p->content : std::string();
+        };
+        // `prompt` conditions the decoder on prior text through <|startofprev|>, which this build
+        // does not implement. Refused rather than ignored: silently dropping it would change the
+        // transcript a caller expected to influence and give no sign of it.
+        if (!field("prompt").empty()) {
+          res.send(400, "application/json",
+                   api::errorResponse("`prompt` conditioning is not implemented (it needs the "
+                                      "<|startofprev|> path); omit the field",
+                                      "invalid_request_error")
+                       .dump());
+          return;
+        }
+        // Same for a non-zero temperature: decoding here is greedy, and answering a sampled request
+        // with a deterministic transcript would misreport what was run.
+        if (const std::string t = field("temperature"); !t.empty()) {
+          double parsed = 0.0;
+          try {
+            parsed = std::stod(t);
+          } catch (const std::exception&) {
+            parsed = -1.0;
+          }
+          if (parsed != 0.0) {
+            res.send(400, "application/json",
+                     api::errorResponse("only temperature=0 is implemented (decoding is greedy; "
+                                        "the temperature-fallback loop is not)",
+                                        "invalid_request_error")
+                         .dump());
+            return;
+          }
+        }
+        const std::string format = field("response_format").empty() ? std::string("json")
+                                                                    : field("response_format");
+        if (format != "json" && format != "text" && format != "verbose_json") {
+          res.send(400, "application/json",
+                   api::errorResponse("response_format must be json, text or verbose_json",
+                                      "invalid_request_error")
+                       .dump());
+          return;
+        }
+
+        qorvix::audio::AudioBuffer audio;
+        std::string aerr;
+        if (!qorvix::audio::decodeAudio(
+                reinterpret_cast<const std::uint8_t*>(filePart->content.data()),
+                filePart->content.size(), audio, aerr)) {
+          res.send(400, "application/json",
+                   api::errorResponse(aerr, "invalid_request_error").dump());
+          return;
+        }
+        const qorvix::audio::MelConfig melCfg = whisper->melConfig();
+        if (audio.sampleRate != melCfg.sampleRate) {
+          res.send(400, "application/json",
+                   api::errorResponse(
+                       "audio is " + std::to_string(audio.sampleRate) + " Hz; this build takes " +
+                           std::to_string(melCfg.sampleRate) +
+                           " Hz only (resampling is not implemented — convert with `ffmpeg -i in "
+                           "-ac 1 -ar 16000 -c:a pcm_s16le out.wav`)",
+                       "invalid_request_error")
+                       .dump());
+          return;
+        }
+        // The encoder consumes exactly one 30-second window, and long-form decoding (sliding
+        // windows carried by <|startofprev|>) is not implemented. Over HTTP that is refused rather
+        // than truncated: the caller would otherwise receive the first 30 seconds of a long file as
+        // if it were the whole transcript, with nothing in the response to say so. The CLI prints a
+        // warning instead, because there a human sees it.
+        if (audio.seconds() > static_cast<double>(melCfg.chunkSeconds) + 0.5) {
+          res.send(400, "application/json",
+                   api::errorResponse(
+                       "audio is " + std::to_string(static_cast<int>(audio.seconds())) +
+                           " s; this build transcribes one " +
+                           std::to_string(melCfg.chunkSeconds) +
+                           "-second window (long-form decoding is not implemented) — split the "
+                           "file into chunks of at most that length",
+                       "invalid_request_error")
+                       .dump());
+          return;
+        }
+
+        qorvix::audio::WhisperModel::TranscribeOptions opt;
+        opt.language = field("language");  // empty => detect, Whisper's own default
+        opt.translate = isTranslation;
+        opt.timestamps = format == "verbose_json";
+        qorvix::audio::WhisperModel::TranscribeResult result;
+        std::string terr;
+        bool ok = false;
+        {
+          // Its own lock, like the vision tower's: WhisperModel keeps the encoder scratch, the
+          // cross-attention cache and the decoder KV cache in members, and the encode is the long
+          // pole of the request (tens of seconds on CPU) — serializing it behind generations would
+          // add that to every chat turn for nothing.
+          std::lock_guard<std::mutex> lk(whisperMutex);
+          std::vector<float> mel;
+          if (qorvix::audio::logMelSpectrogram(audio.samples, melCfg, mel, terr)) {
+            ok = whisper->transcribe(mel, opt, result, terr);
+          }
+        }
+        if (!ok) {
+          res.send(400, "application/json",
+                   api::errorResponse(terr, "invalid_request_error").dump());
+          return;
+        }
+
+        if (format == "text") {
+          res.send(200, "text/plain; charset=utf-8", result.text);
+          return;
+        }
+        api::json::Value out = api::json::Value::object();
+        out["text"] = api::json::Value(result.text);
+        if (format == "verbose_json") {
+          out["task"] = api::json::Value(isTranslation ? "translate" : "transcribe");
+          out["language"] = api::json::Value(result.language);
+          out["duration"] = api::json::Value(audio.seconds());
+          api::json::Value segs = api::json::Value::array();
+          int segId = 0;
+          for (const auto& s : result.segments) {
+            api::json::Value seg = api::json::Value::object();
+            seg["id"] = api::json::Value(segId++);
+            seg["start"] = api::json::Value(static_cast<double>(s.start));
+            seg["end"] = api::json::Value(static_cast<double>(s.end));
+            seg["text"] = api::json::Value(s.text);
+            // OpenAI's verbose segments also carry avg_logprob, compression_ratio and
+            // no_speech_prob. They are omitted rather than filled with plausible numbers: a client
+            // that thresholds on a fabricated confidence is worse off than one that sees the field
+            // is absent.
+            segs.push(seg);
+          }
+          out["segments"] = segs;
+        }
+        res.send(200, "application/json", out.dump());
+        return;
+      }
     }
 
     if (req.target == "/v1/embeddings") {
@@ -2794,6 +3391,9 @@ int printUsage() {
             << "                                  [--dims N] [--json]\n"
             << "  image-embed <mmproj.gguf> --image <f.png>   Encode an image with the CLIP tower\n"
             << "                      [--project] to project into the language model's space\n"
+            << "  transcribe <whisper.gguf> --audio <f.wav>   Transcribe speech (cpu only)\n"
+            << "                      [--language en|auto] [--translate] [--timestamps]\n"
+            << "                      [--max-tokens N] [--json]\n"
             << "  serve <file> [--gpu|--vulkan|--auto] [--port N] [--embed-model <f.gguf>]\n"
             << "               [--mmproj <clip.gguf>]   image_url content parts (cpu only)\n"
             << "                                  OpenAI-compatible HTTP server\n"
@@ -2815,6 +3415,8 @@ int printUsage() {
             << "  audio-mel <file.wav> [--mels N]   Whisper log-mel front end\n"
             << "  audio-check [<file.wav>] --ref F  Gate the log-mel front end\n"
             << "                      against a captured transformers reference\n"
+            << "  whisper-check <whisper.gguf> --ref F [--audio f.wav]   Gate the encoder,\n"
+            << "                      one decoder step and the greedy transcript\n"
             << "  vlm-check <file> [--mmproj <clip.gguf> --image <f.png>]   Gate the image/text\n"
             << "                      input-embedding splice (no reference capture needed)\n"
             << "  rag index <dir> --embed-model <f.gguf> --store <out.qvx>\n"
@@ -2852,6 +3454,8 @@ int main(int argc, char** argv) {
   if (command == "image-embed") return cmdImageEmbed(args);
   if (command == "audio-mel") return cmdAudioMel(args);
   if (command == "audio-check") return cmdAudioCheck(args);
+  if (command == "transcribe") return cmdTranscribe(args);
+  if (command == "whisper-check") return cmdWhisperCheck(args);
   if (command == "vision-check") return cmdVisionCheck(args);
   if (command == "vlm-check") return cmdVlmCheck(args);
   if (command == "rag") return cmdRag(args);

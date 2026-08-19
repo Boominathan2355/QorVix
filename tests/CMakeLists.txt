@@ -24,6 +24,7 @@ if(Catch2_FOUND)
     rag_test.cpp
     vision_test.cpp
     audio_test.cpp
+    whisper_test.cpp
     text_model_test.cpp
     tokenizer_test.cpp
     wordpiece_test.cpp
@@ -34,6 +35,7 @@ if(Catch2_FOUND)
     multimodal_test.cpp
     benchmark_test.cpp
     json_test.cpp
+    multipart_test.cpp
     openai_test.cpp
   )
   target_link_libraries(qorvix_tests PRIVATE

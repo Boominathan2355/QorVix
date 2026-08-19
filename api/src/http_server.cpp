@@ -103,6 +103,19 @@ ReadStatus readRequest(socket_t s, HttpRequest& req) {
   if (const std::size_t p = lower.find("content-length:"); p != std::string::npos) {
     contentLength = static_cast<std::size_t>(std::strtoull(lower.c_str() + p + 15, nullptr, 10));
   }
+  // Content-Type, taken from the ORIGINAL head rather than the lowercased copy: a multipart
+  // boundary is case-sensitive, and lowercasing it silently breaks every part lookup.
+  if (const std::size_t p = lower.find("content-type:"); p != std::string::npos) {
+    const std::size_t valueStart = p + 13;
+    const std::size_t eol = head.find("\r\n", valueStart);
+    const std::string value =
+        head.substr(valueStart, eol == std::string::npos ? std::string::npos
+                                                        : eol - valueStart);
+    const std::size_t first = value.find_first_not_of(" \t");
+    const std::size_t last = value.find_last_not_of(" \t");
+    if (first != std::string::npos) req.contentType = value.substr(first, last - first + 1);
+  }
+
   // Checked BEFORE reading, so an oversized declaration costs nothing to reject.
   if (contentLength > kMaxBodyBytes) return ReadStatus::TooLarge;
 

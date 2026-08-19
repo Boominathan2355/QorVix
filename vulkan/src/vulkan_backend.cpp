@@ -1647,6 +1647,20 @@ class VulkanModelImpl final : public VulkanModel {
         blogits_ = owned_.back().buf;
       }
     }
+    // Second exception, for the reverse direction: Phase 11c's forwardEmbedding takes a
+    // [d_model] vector from the host, and bx_ is device-local. One persistent host-visible buffer
+    // is mapped, memcpy'd into, and copied to bx_ by a vkCmdCopyBuffer recorded at the head of the
+    // SAME command buffer — no per-call allocation and no extra submit, which is what a staging
+    // helper would have cost on every image patch (576 of them per LLaVA turn).
+    {
+      Buffer b{};
+      if (!makeBuffer(c_, d * sizeof(float), b)) {
+        ok = false;
+      } else {
+        owned_.push_back(b);
+        bstage_ = owned_.back().buf;
+      }
+    }
     // Per-session KV cache: each session owns an independent K and V buffer (isolation without any
     // shader change — the kv_store/attention indexing stays (layer*maxSeq + pos)*kvDim within the
     // session's own buffer). reset/openSession zero a single session's pair.
@@ -1715,6 +1729,18 @@ class VulkanModelImpl final : public VulkanModel {
   void reset() override { resetSession(0); }
 
   const std::vector<float>& forward(int session, int token, int pos) override {
+    return run(session, token, pos, nullptr);
+  }
+
+  // Phase 11c: the same stack from a ready-made [d_model] vector instead of a token id. The ONLY
+  // difference is how bx_ is filled — everything after the embedding lookup is the identical
+  // recorded command buffer, so the two entry points cannot drift.
+  const std::vector<float>& forwardEmbedding(int session, const float* embedding, int pos) override {
+    if (!embedding) return logits_;
+    return run(session, 0, pos, embedding);
+  }
+
+  const std::vector<float>& run(int session, int token, int pos, const float* embedding) {
     if (!ready_ || session < 0 || session >= maxSessions_) return logits_;
     VkBuffer kcBuf = kc_[session].buf, vcBuf = vc_[session].buf;
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn, vocab = cfg_.vocab,
@@ -1745,10 +1771,27 @@ class VulkanModelImpl final : public VulkanModel {
       }
     };
 
-    struct {
-      std::uint32_t token, d;
-    } ePC{static_cast<std::uint32_t>(token), static_cast<std::uint32_t>(d)};
-    rec.op(pEmbed_, {bx_, bTok_}, &ePC, g256(d));
+    if (embedding) {
+      // The host vector goes into the mapped staging buffer, then a copy at the head of this
+      // command buffer lands it in bx_. Recorded rather than submitted separately so the ordering
+      // is the queue's, not the host's.
+      for (auto& b : owned_)
+        if (b.buf == bstage_) upload(b, embedding, d * sizeof(float));
+      VkBufferCopy region{};
+      region.size = static_cast<VkDeviceSize>(d) * sizeof(float);
+      vkCmdCopyBuffer(cmd_, bstage_, bx_, 1, &region);
+      VkMemoryBarrier mb{};
+      mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    } else {
+      struct {
+        std::uint32_t token, d;
+      } ePC{static_cast<std::uint32_t>(token), static_cast<std::uint32_t>(d)};
+      rec.op(pEmbed_, {bx_, bTok_}, &ePC, g256(d));
+    }
 
     for (int l = 0; l < L; ++l) {
       auto& lw = layers_[l];
@@ -1831,7 +1874,8 @@ class VulkanModelImpl final : public VulkanModel {
   VkBuffer bTok_ = VK_NULL_HANDLE, bOutNorm_ = VK_NULL_HANDLE, bx_ = VK_NULL_HANDLE,
            bxn_ = VK_NULL_HANDLE, bq_ = VK_NULL_HANDLE, bk_ = VK_NULL_HANDLE, bv_ = VK_NULL_HANDLE,
            battn_ = VK_NULL_HANDLE, btmp_ = VK_NULL_HANDLE, bg_ = VK_NULL_HANDLE,
-           bu_ = VK_NULL_HANDLE, bact_ = VK_NULL_HANDLE, blogits_ = VK_NULL_HANDLE;
+           bu_ = VK_NULL_HANDLE, bact_ = VK_NULL_HANDLE, blogits_ = VK_NULL_HANDLE,
+           bstage_ = VK_NULL_HANDLE;
   DevW output_;
   struct LayerW {
     VkBuffer attnNorm, ffnNorm;

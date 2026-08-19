@@ -572,10 +572,137 @@ then); GPU/Vulkan `forwardEmbedding`; multi-image *layout* variants (LLaVA-1.6 t
 features in the paged prefix cache — `sharePrefix` keys on token ids, which image positions do not
 have.
 
-### Phase 11b-3 — Audio / image generation ⬜
-Audio engine (Whisper: FFT + mel + encoder-decoder with cross-attention) and image generation
-(SDXL/Flux — not feasible on this CPU-only box; gated on GPU hardware). `audio/`, `image/` and
-`agents/` are still 0 files.
+### Phase 11b-3a — Whisper log-mel front end ✅
+
+**The front end alone (`audio` module).** WAV in, the `[80 x 3000]` log-mel tensor Whisper's
+convolutional stem consumes out — SPEC's "Audio → Mel Spectrogram" stage. No Whisper weights are
+loaded and none are needed.
+
+It is its own module with its own gate because Phase 11b-1 gated CLIP and found **both** of its
+bugs in preprocessing rather than the transformer. Audio has the same shape and worse odds: a
+symmetric Hann window instead of a periodic one, zero padding instead of reflect, magnitude instead
+of power, or the htk mel scale instead of slaney each moves every frame and errors on nothing. So
+this ships and is verified before 11b-3b writes a line.
+
+- `audio/fft.cpp` — recursive radix-2 with an odd-n direct fallback. Whisper's frame is
+  400 = 2⁴·25, so radix-2 alone cannot transform it at all, and zero-padding to 512 is not an
+  optimization but a *different transform*: bin spacing becomes 31.25 Hz instead of 40 Hz and every
+  mel filter then integrates the wrong frequencies.
+- `audio/audio_file.cpp` — RIFF/WAVE: PCM 8/16/24/32 and IEEE float 32/64, EXTENSIBLE subformats,
+  unknown-chunk skipping, channel averaging. Dispatches on magic bytes, not extension. Compressed
+  containers are refused **by name** with the ffmpeg fix, the courtesy `vision::decodeImage` extends
+  to JPEG.
+- `audio/mel.cpp` — pad to exactly 30 s, reflect-pad by `n_fft/2` (the head reflection is real
+  signal), periodic Hann, **power** spectrum, slaney scale with slaney area normalization, then
+  `log10` with Whisper's clip-relative `max - 8.0` floor and `(x + 4) / 4` affine.
+
+**The gate: `qorvix audio-check [<file.wav>] --ref <fixture>`**, tiered so each tier fails for a
+different cause — the filter bank (a pure function of the config, no audio in it), then the decoded
+waveform, then the finished frames. Ground truth is transformers' `WhisperFeatureExtractor`, which
+is independent of both this codebase and whisper.cpp, captured by
+`scripts/capture_audio_reference.py` and committed as `tests/data/audio_reference_whisper_tiny.txt`:
+
+| tier | isolates | measured (whisper-tiny, 2 s probe) |
+|---|---|---|
+| filter bank | mel scale, area normalization | max \|diff\| **1.86e-09** (8 probes + 80 column sums) |
+| waveform | the WAV reader, not the spectrogram | max \|diff\| **7.63e-09** (32,000 samples) |
+| log-mel frame 0 | window, padding, power-vs-magnitude, clamp | max \|diff\| **4.59e-06** (80 mel bins) |
+| log-mel per-bin means | the same, over every frame | max \|diff\| **1.72e-07** (3,000 frames) |
+
+**PASS** at the default `--tol 1e-4`. Alongside it, 13 Catch2 cases cover what needs no external
+reference: the FFT against a direct DFT at n = 400, a pure tone landing in the bin its frequency
+selects, filters that are triangular, area-normalized and march upward, silence sitting flat at the
+clamp floor, a short clip padded rather than rejected, and every WAV sample format and malformation.
+
+### Phase 11b-3b — Whisper encoder-decoder ✅
+
+**The first model this repo converts rather than downloads.** Whisper has no GGUF upstream:
+whisper.cpp never left its own container, and the files the Hub advertises as "whisper GGUF" are
+that container renamed — verified rather than assumed, by fetching the first four bytes of
+`vonjack/whisper-large-v3-gguf`: `6c 6d 67 67`, i.e. ggml's magic, not `GGUF`. The choice was a
+second container reader or a converter, and the reader loses: the whole weight path
+(`detail::tensorBytes`/`loadMat`/`loadVec`, the mmap borrow, every dequant kernel) is GGUF-only, so
+a parallel container would duplicate all of it. `scripts/convert_whisper_to_gguf.py` costs one
+script and no runtime code, and carries its own minimal GGUF **writer** — validated by this repo's
+strict reader the moment qorvix opens the output. A file with ggml's magic is named with its fix,
+not reported as "bad magic".
+
+**The model (`audio/whisper_{weights,model}.*`).** Conv stem (kernel 3, padding 1; stride 2 on the
+second, so 3000 mel frames become 1500 encoder positions), sinusoidal positions **read from the
+file** rather than regenerated, pre-norm bidirectional blocks, then a decoder whose blocks carry
+three sublayers instead of two. Two facts are structural and each was read off the checkpoint:
+
+- **Cross-attention, the first in this codebase**, and with it two caches whose lifetimes are
+  opposites: the cross K/V are computed once per clip and never grow, the self-attention K/V grow
+  one row per token. Conflating them (one cache, one length counter) does not crash — it truncates
+  what the decoder can hear.
+- **`k_proj` has no bias**, in self- and cross-attention alike, while q/v/out all do. The weight
+  struct has no `bk` field at all, so a loader cannot invent a zero one and hide the asymmetry.
+
+**Suppression travels with the weights.** Whisper's greedy decode is not argmax over the vocabulary:
+the release ships 88 suppressed ids plus two blocked at the first generated position, and the
+converter writes both into the GGUF. This is not cosmetic — on the gate's probe the raw argmax after
+the prefix is token 522, and the token every other Whisper runtime emits is 708. A reimplemented
+list on the C++ side would be a second copy that drifts on the first model whose list differs.
+
+**Protocol and language detection.** The prefix is `<|startoftranscript|>`, language, task,
+`<|notimestamps|>`, assembled by the model rather than the tokenizer (an English-only model has no
+language token, and `--translate` there is refused rather than silently transcribed). Ids are
+resolved **by name** from the file's own vocabulary, and the language range is derived from the
+sot/`<|translate|>` anchors, so the count of languages is whatever the file says. Detection is
+Whisper's own procedure: one step from sot alone, argmax restricted to the language ids — the
+unrestricted argmax at that position is a text token, because the model is also predicting the
+transcript.
+
+**Surfaces.**
+- `qorvix transcribe <whisper.gguf> --audio f.wav [--language en|auto] [--translate] [--timestamps]
+  [--max-tokens N] [--json]`.
+- `serve --whisper <whisper.gguf>` — `POST /v1/audio/transcriptions` and `/v1/audio/translations`,
+  behind their own mutex for the same reason the CLIP tower has one. This is the **one OpenAI route
+  that is not JSON**: the audio arrives as `multipart/form-data`, which is what every OpenAI SDK
+  sends, so the HTTP layer gained `Content-Type` (the boundary lives there and cannot be recovered
+  from the body) and `api/multipart.cpp` — strict by construction, since a form parser that accepts
+  a truncated upload transcribes noise and reports success. `response_format` json/text/verbose_json.
+- `prompt` conditioning and `temperature > 0` are **refused, not ignored**: answering a sampled
+  request with a greedy transcript misreports what was run.
+
+**The gate: `qorvix whisper-check <model.gguf> --ref <fixture>`**, four tiers against transformers'
+fp32 forward pass, ordered so each narrows the cause of the next — an encoder bug, a cross-attention
+bug and a missing suppression list otherwise all end the same way, in a transcript that is fluent
+and not what other runtimes produce.
+
+| tier | isolates | measured (whisper-tiny F32, 11 s speech probe) |
+|---|---|---|
+| forced prefix | the protocol, before any compute | `50258 50259 50359 50363` — **matches** |
+| encoder position 0 | stem, positions, blocks | max \|diff\| **1.91e-06**, cos **1.0000000** |
+| encoder per-dim means | a frame SHIFT, which leaves position 0 intact | max \|diff\| **4.77e-06**, cos **1.0000000** |
+| one raw decoder step | cross-attention, with no suppression to hide behind | argmax **400 == 400**, top-5 ids identical, max \|diff\| **4.77e-05** |
+| greedy loop | the suppression lists and the stop condition | **23/23 tokens identical**, transcript identical |
+
+The transcript is real: *" And so my fellow Americans ask not what your country can do for you ask
+what you can do for your country."* `tests/whisper_test.cpp` covers what needs no model — the stem's
+padding, stride and column order against a hand-written reference (with the blocks neutralised so
+there is something to compare against), the protocol, the two caches, and every refusal.
+`tests/multipart_test.cpp` covers the form parser, mostly through what it rejects.
+
+**Performance is honest and unoptimised** — see BENCHMARKS.md. The encoder's 1500-position
+bidirectional attention is a scalar triple loop parallelised only across heads; the projections and
+FFN use the same batched quantized GEMV as everything else. F16 is **bit-identical** to F32 for these
+checkpoints (OpenAI released Whisper in fp16, so the safetensors are an upcast) — half the file for
+no accuracy cost, and currently the slower one to decode with, because the F32 dot kernel is AVX2
+while the F16 path dequantizes per element.
+
+**Deferred, with the reason stated:** long-form audio (the sequential algorithm advances by the last
+emitted timestamp and carries context through `<|startofprev|>`; the CLI warns and does the first
+30 s window, the HTTP route refuses rather than returning a partial transcript as if it were whole),
+resampling (16 kHz only, with the ffmpeg command in the error), beam search and the
+temperature-fallback loop, word-level timestamps (they need the alignment heads), and a GPU
+Whisper backend.
+
+### Phase 11b-3c — Image generation ⬜🖥️
+SDXL/Flux. One 1024² sample is ~50 U-Net evaluations over a 2.6 B-parameter model, which this
+CPU-only box cannot run at any useful rate, so it is gated on GPU hardware rather than started and
+left unrunnable. `image/` and `agents/` are still 0 files.
 
 ### Phase 11c — GPU embedding + vision backends ⬜🖥️
 CUDA and Vulkan implementations of `IEmbeddingEngine` and the CLIP tower. `createEmbeddingEngine` reports honestly for

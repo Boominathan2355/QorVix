@@ -14,6 +14,10 @@ struct HttpRequest {
   std::string method;   // "GET", "POST", ...
   std::string target;   // path, e.g. "/v1/chat/completions"
   std::string body;     // request body (read via Content-Length)
+  // Content-Type, verbatim, including any parameters. Every route until Phase 11b-3b took JSON and
+  // could assume it; multipart/form-data cannot be parsed without the boundary that lives here,
+  // and guessing a boundary from the body is how a parser starts accepting malformed uploads.
+  std::string contentType;
 };
 
 // Passed to the handler to produce the response. Either send() one complete response, or

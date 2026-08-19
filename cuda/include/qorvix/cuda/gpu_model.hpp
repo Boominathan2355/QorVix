@@ -58,6 +58,12 @@ class GpuModel {
   // The returned reference is valid only until the next call (a single reused host buffer).
   virtual const std::vector<float>& forward(int session, int token, int pos) = 0;
 
+  // Phase 11c: the same step from a host [dModel] vector rather than a token id — what a vision
+  // tower's projected patches are. The embedding table lives in VRAM and is looked up on-device, so
+  // this is an upload path and a different kernel sequence, not a wrapper.
+  virtual const std::vector<float>& forwardEmbedding(int session, const float* embedding,
+                                                     int pos) = 0;
+
   // --- single-sequence convenience (session 0; used by gpu-check and generate --gpu) --------
   virtual const std::vector<float>& forward(int token, int pos) = 0;
   virtual void reset() = 0;  // clear session 0's KV cache

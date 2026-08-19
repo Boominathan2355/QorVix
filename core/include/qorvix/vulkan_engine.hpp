@@ -40,6 +40,17 @@ class VulkanEngine final : public runtime::IInferenceEngine {
     return model_->forward(toVk(session), token, pos);
   }
 
+  // Phase 11b-2 opened this seam and both device backends refused it until Phase 11c: they keep the
+  // embedding table in VRAM and look rows up on-device, so accepting a host vector needed an upload
+  // path and a different kernel head, not a wrapper. It exists now, so the multimodal surfaces stop
+  // refusing --gpu / --vulkan.
+  bool acceptsInputEmbeddings() const override { return true; }
+
+  const std::vector<float>& forwardEmbedding(memory::SessionId session, const float* embedding,
+                                             int pos) override {
+    return model_->forwardEmbedding(toVk(session), embedding, pos);
+  }
+
   std::uint32_t maxSeqLen() const override { return maxSeq_; }
   const runtime::ModelConfig& config() const override { return cfg_; }
   std::string backendName() const override { return "vulkan"; }

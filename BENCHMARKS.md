@@ -164,6 +164,53 @@ anything else is running, and confirm a suspected regression by building the pri
 than by reasoning about the diff.** The GPU numbers in this file come from a dedicated Colab
 runtime and do not have this problem; the CPU ones do.
 
+## Audio axis — Whisper (Phase 11b-3b)
+
+Like the vision tower, Whisper has no tuned throughput axis yet and `qorvix bench` does not dispatch
+to it. Recorded so the starting point is written down rather than rediscovered. Two numbers matter
+and they scale differently: the **encoder** is a fixed cost per 30-second window no matter how much
+speech is in it, the **decoder** is per token.
+
+Workload: `qorvix transcribe models/whisper-tiny-<type>.gguf --audio tests/data/speech_probe.wav
+--language en` — 11 s of speech padded to Whisper's 30 s window, 23 generated tokens. Five runs,
+**median**, with the full spread given because this box is noisy (4 hardware threads).
+
+| Date | Commit | Backend | Device | encode s / 30 s window | decode tok/s | Notes |
+|------|--------|---------|--------|-----------------------:|-------------:|-------|
+| 2026-08-19 | (11b-3b) | cpu | i7 (this box, AVX2, 4 threads) | **9.6** (8.2–11.1) | **36.7** (10.5–53.3) | whisper-tiny F32, 39M params |
+| 2026-08-19 | (11b-3b) | cpu | i7 (this box, AVX2, 4 threads) | **9.0** (7.1–12.8) | **13.8** (8.4–17.2) | whisper-tiny F16, same numbers bit-for-bit |
+
+**The spread is the honest part of this table.** 23 tokens is a small sample and four hardware
+threads leave no headroom, so single runs differ by 2–5x on the decode axis. What survives the noise
+is the direction: every F16 run decoded slower than the F32 median, and no F16 run reached it.
+
+### Why F16 decodes slower than F32, when the numbers are identical
+
+The two files are **bit-identical in value** — all 67 matmul tensors compare exactly after the
+round trip, because OpenAI released Whisper in fp16 and the HF safetensors are an upcast of that.
+So F16 halves the file for no accuracy cost, and `whisper-check` prints the same figures for both.
+It is still the slower one to decode with, and the reason is in `qmatmul`:
+
+- Every quantized weight is dequantized into a 256-element scratch buffer and fed to `vecDotF32`.
+  For F32 that batch is a copy; for F16 it is `fp16ToFloat` **per element**, scalar — no F16C
+  vector conversion is used.
+- A decode step is dominated by the LM head: `51865 x 384` = **19.9M elements per token**. At 4
+  threads that is ~23 ms/token via the copy path and ~61 ms/token via the scalar conversion, which
+  is the entire measured difference.
+
+So the first optimization on this axis is not the encoder: it is an F16C (`_mm256_cvtph_ps`)
+conversion in the dequant batch, or a fused F16 dot kernel that never materializes the floats. That
+would help every F16 model in the repo, not just Whisper.
+
+### Where the encoder time goes (unmeasured, stated as a hypothesis)
+
+~37 GFLOP per window (4 layers of 1500-position attention, projections and FFN, plus the conv stem)
+in ~9.6 s is ~4 GFLOP/s — well under what 4 AVX2 threads can do. The projections and FFN go through
+the same batched quantized GEMV as every other model here; the 1500x1500 bidirectional attention is
+a **scalar triple loop parallelised only across the 6 heads**, which is the obvious suspect and the
+obvious next thing to measure. It is recorded as a hypothesis rather than a breakdown because no
+per-stage timing was taken — the rule in the vision section applies here too.
+
 ## Optimization log
 
 Append one row per attempt: what changed, the before→after `decode_tok_per_sec` on the fixed

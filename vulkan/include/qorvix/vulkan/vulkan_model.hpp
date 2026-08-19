@@ -57,6 +57,13 @@ class VulkanModel {
   // returned reference is valid only until the next call (a single reused host buffer).
   virtual const std::vector<float>& forward(int session, int token, int pos) = 0;
 
+  // Phase 11c: the same step from a host [dModel] vector rather than a token id — what a vision
+  // tower's projected patches are. The embedding table lives in VRAM and is looked up on-device, so
+  // this is a new upload path and a different command-buffer head, not a wrapper. Default returns
+  // the untouched logits buffer so a backend that has not implemented it cannot silently run the
+  // stack on stale state.
+  virtual const std::vector<float>& forwardEmbedding(int session, const float* embedding, int pos) = 0;
+
   // --- single-sequence convenience (session 0) ---
   virtual const std::vector<float>& forward(int token, int pos) = 0;
   virtual void reset() = 0;  // clear session 0's KV cache

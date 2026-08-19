@@ -188,3 +188,99 @@ treatment applied to a full LLaVA forward) is the honest next step.
 Like `embed-check`, `gpu-check` and `vulkan-check`, this is a **CLI gate rather than a CTest case**:
 the Docker test image has no GGUFs, so a model-dependent test would fail the image build. The
 seam's mechanics are covered by `tests/multimodal_test.cpp`, which needs no model.
+
+
+## Validating speech transcription (Phase 11b-3b)
+
+**Whisper is the one model here that is not downloaded as GGUF, because no GGUF exists.**
+whisper.cpp never left its own container, and the Hub files advertised as "whisper GGUF" are that
+container renamed — checked rather than assumed:
+
+```sh
+curl -sL -r 0-3 https://huggingface.co/vonjack/whisper-large-v3-gguf/resolve/main/whisper-large-v3-f16.gguf | xxd
+# 00000000: 6c6d 6767    "lmgg" — ggml's magic 0x67676d6c, not "GGUF"
+```
+
+`qorvix transcribe` names that case with its fix rather than reporting "bad magic". Convert the
+HuggingFace checkpoint instead:
+
+```sh
+pip install transformers torch numpy
+python scripts/convert_whisper_to_gguf.py openai/whisper-tiny models/whisper-tiny-f32.gguf
+python scripts/convert_whisper_to_gguf.py openai/whisper-tiny models/whisper-tiny-f16.gguf --outtype f16
+```
+
+The converter carries the vocabulary (byte-level BPE, so the existing tokenizer reads it), the
+protocol token ids, and the model's **suppression lists** — the 88 ids whisper-tiny never emits as
+text plus the two blocked at the first generated position. Those are part of the decoding contract,
+not a runtime heuristic: without them the greedy argmax after the prefix is token 522, and every
+other Whisper implementation produces 708.
+
+| file | size | notes |
+|---|---|---|
+| `whisper-tiny-f32.gguf` | 153 MB | 167 tensors, 27 metadata keys |
+| `whisper-tiny-f16.gguf` | 79 MB | **bit-identical numbers** — see below |
+
+**F16 is lossless for these checkpoints, and slower.** All 67 matmul tensors compare byte-exact
+after the F32→F16 round trip, because OpenAI released Whisper in fp16 and the safetensors are an
+upcast of that — so the F16 file is half the size for no accuracy cost and `whisper-check` returns
+identical figures for both. It is nevertheless the slower file to decode with here (see
+BENCHMARKS.md): the F32 dot kernel is AVX2, the F16 path dequantizes per element, and the LM head
+is a 51,865 × 384 matmul on every token.
+
+```sh
+qorvix transcribe models/whisper-tiny-f32.gguf --audio tests/data/speech_probe.wav
+qorvix transcribe models/whisper-tiny-f32.gguf --audio clip.wav --language auto --timestamps
+qorvix serve models/tinyllama-1.1b-chat-q4km.gguf --whisper models/whisper-tiny-f32.gguf
+curl -X POST localhost:2005/v1/audio/transcriptions -F file=@tests/data/speech_probe.wav
+```
+
+### The gate
+
+```sh
+pip install transformers torch numpy
+python scripts/capture_whisper_reference.py openai/whisper-tiny tests/data/speech_probe.wav \
+  > tests/data/whisper_reference_tiny.txt
+
+qorvix whisper-check models/whisper-tiny-f32.gguf --ref tests/data/whisper_reference_tiny.txt
+```
+
+Like `embed-check`, `vision-check`, `gpu-check` and `vulkan-check`, this is a **CLI gate rather
+than a CTest case**: the Docker test image has no GGUFs. The model-free mechanics — the stem's
+padding and stride, the protocol prefix, the two caches' lifetimes, the refusals — are covered by
+`tests/whisper_test.cpp`.
+
+### Measured results
+
+```
+Forced prefix:                   50258 50259 50359 50363   MATCHES reference
+Encoder position 0:              max |diff| 1.91e-06  cos 1.0000000
+Encoder per-dimension means:     max |diff| 4.77e-06  cos 1.0000000  (over 1500 positions)
+Raw argmax after the prefix:     400 vs reference 400   MATCHES
+Top-5 logits:                    max |diff| 4.77e-05  ids identical
+Fixed logit probes:              max |diff| 4.48e-05  (5 ids)
+Greedy token stream:             23 tokens vs 23   IDENTICAL
+Transcript:                      IDENTICAL
+  ours:      " And so my fellow Americans ask not what your country can do for you ask what you can do for your country."
+
+RESULT: PASS - encoder, decoder step and greedy transcript all match transformers.
+```
+
+The tiers are ordered so each one narrows the cause of the next, because an encoder bug, a
+cross-attention bug and a missing suppression list all end the same way — a transcript that is
+fluent and not what other runtimes produce. Tier 2 compares **raw** logits (no suppression), so a
+suppression difference cannot hide inside it and a cross-attention difference cannot be blamed on
+it.
+
+### What is not implemented, and why it is refused rather than approximated
+
+- **Long-form audio.** The encoder consumes exactly one 30-second window. Whisper's sequential
+  algorithm advances by the last emitted timestamp and carries context through `<|startofprev|>`;
+  neither exists here. The CLI prints a warning and transcribes the first window; the HTTP route
+  refuses with a 400, because there is no one on that side to read a warning.
+- **Resampling.** 16 kHz only, with the `ffmpeg` command in the error. An ungated resampler in
+  front of the mel filters returns a transcript that is fluent and slightly wrong.
+- **`prompt` conditioning and `temperature > 0`** on `/v1/audio/transcriptions`: both refused, not
+  ignored — answering a sampled request with a greedy transcript misreports what was run.
+- **Beam search and the temperature-fallback loop.** Decoding is greedy, which is what the
+  reference capture compares against.

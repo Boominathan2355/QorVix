@@ -1389,16 +1389,38 @@ class GpuModelImpl final : public GpuModel {
     return forwardEager(session, token, pos);
   }
 
+  // Phase 11c: the same stack from a ready-made [dModel] vector instead of a token id.
+  //
+  // Always the EAGER path, never the graph. A captured graph bakes in the embedding lookup reading
+  // dParams_[0]; replaying it would overwrite dx_ with a table row and discard the vector that was
+  // just uploaded — silently, producing fluent text about nothing. Image prefill is a few hundred
+  // steps per turn against a decode loop of thousands, so the graph is worth keeping for tokens and
+  // not worth complicating for patches.
+  const std::vector<float>& forwardEmbedding(int session, const float* embedding, int pos) override {
+    if (!embedding) return hostLogits_;
+    if (session < 0 || session >= maxSessions_) session = 0;
+    return forwardEager(session, 0, pos, embedding);
+  }
+
   // Eager path: one host-issued launch per kernel on the default stream. Kept as the reference and
   // as the fallback when graph capture is unavailable.
-  const std::vector<float>& forwardEager(int session, int token, int pos) {
+  const std::vector<float>& forwardEager(int session, int token, int pos,
+                                        const float* embedding = nullptr) {
     const int d = cfg_.dModel, kvDim = cfg_.nKv * cfg_.headDim, ffn = cfg_.ffn;
     const int hd = cfg_.headDim, mx = cfg_.maxSeq;
     auto g = [](int n) { return (n + 255) / 256; };
     float* Kbase = dKc_ + static_cast<std::size_t>(session) * kvPerSession_;
     float* Vbase = dVc_ + static_cast<std::size_t>(session) * kvPerSession_;
 
-    embedRowKernel<<<g(d), 256>>>(dx_, dTokEmbd_, token, d);
+    if (embedding) {
+      // The one difference between the two entry points: dx_ is filled from host memory instead of
+      // from the VRAM-resident embedding table. Everything after this line is the identical stack,
+      // so the paths cannot drift.
+      cudaMemcpy(dx_, embedding, static_cast<std::size_t>(d) * sizeof(float),
+                 cudaMemcpyHostToDevice);
+    } else {
+      embedRowKernel<<<g(d), 256>>>(dx_, dTokEmbd_, token, d);
+    }
     for (int l = 0; l < cfg_.nLayers; ++l) {
       DevLayer& w = layers_[l];
       rmsnormKernel<<<1, 256>>>(dxn_, dx_, w.attnNorm, d, cfg_.normEps);
@@ -1714,6 +1736,19 @@ class ShardedGpuModel final : public GpuModel {
   const std::vector<float>& forward(int token, int pos) override { return forward(0, token, pos); }
 
   const std::vector<float>& forward(int session, int token, int pos) override {
+    return run(session, token, pos, nullptr);
+  }
+
+  // Phase 11c on the sharded path. The embedding step is the only thing that changes, and it
+  // changes in the way the sharding already expects: rank 0 carries the whole vector, every other
+  // rank contributes zeros, and the existing all-reduce sums them into the identical x on every
+  // rank. Broadcasting the vector to all ranks instead would multiply it by the world size.
+  const std::vector<float>& forwardEmbedding(int session, const float* embedding, int pos) override {
+    if (!embedding) return hostLogits_;
+    return run(session, 0, pos, embedding);
+  }
+
+  const std::vector<float>& run(int session, int token, int pos, const float* embedding) {
     if (session < 0 || session >= maxSessions_) session = 0;
     const int d = cfg_.dModel, hd = cfg_.headDim, mx = cfg_.maxSeq;
     const int world = worldSize();
@@ -1726,8 +1761,15 @@ class ShardedGpuModel final : public GpuModel {
       TpRank& R = ranks_[r];
       cudaSetDevice(R.device);
       cudaMemsetAsync(R.dx, 0, static_cast<std::size_t>(d) * sizeof(float), R.stream);
-      embedRowKernel<<<g(R.embCols.count), 256, 0, R.stream>>>(R.dx + R.embCols.begin, R.dTokEmbd,
-                                                               token, R.embCols.count);
+      if (embedding) {
+        if (r == 0) {
+          cudaMemcpyAsync(R.dx, embedding, static_cast<std::size_t>(d) * sizeof(float),
+                          cudaMemcpyHostToDevice, R.stream);
+        }
+      } else {
+        embedRowKernel<<<g(R.embCols.count), 256, 0, R.stream>>>(R.dx + R.embCols.begin, R.dTokEmbd,
+                                                                 token, R.embCols.count);
+      }
     }
     if (!allReduce(&TpRank::dx, d)) return hostLogits_;
 
