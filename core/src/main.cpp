@@ -28,6 +28,9 @@
 #include "qorvix/ports.hpp"
 #include "qorvix/embeddings/embed_benchmark.hpp"
 #include "qorvix/rag/pipeline.hpp"
+#include "qorvix/audio/audio_check.hpp"
+#include "qorvix/audio/audio_file.hpp"
+#include "qorvix/audio/mel.hpp"
 #include "qorvix/vision/clip_model.hpp"
 #include "qorvix/vision/image.hpp"
 #include "qorvix/vision/vision_check.hpp"
@@ -1047,6 +1050,220 @@ int cmdImageEmbed(const std::vector<std::string_view>& args) {
     std::cerr << "error: " << e.what() << "\n";
     return 1;
   }
+}
+
+// Whisper's log-mel front end, on a file. The audio analogue of `image-embed`: it produces the
+// tensor the model consumes, so the preprocessing can be inspected and diffed before any Whisper
+// weight exists to consume it.
+int cmdAudioMel(const std::vector<std::string_view>& args) {
+  namespace au = qorvix::audio;
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (path.empty()) {
+    std::cerr << "usage: qorvix audio-mel <file.wav> [--mels N] [--json]\n";
+    return 1;
+  }
+  const bool json = hasFlag(args, "--json");
+  au::MelConfig cfg;
+  if (const std::string m = flagValue(args, "--mels"); !m.empty()) cfg.nMels = std::stoi(m);
+
+  using clock = std::chrono::steady_clock;
+  std::string err;
+  au::AudioBuffer audio;
+  const auto tLoad0 = clock::now();
+  if (!au::loadAudio(path, audio, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+
+  // Resampling is REFUSED rather than guessed at. An ungated resampler in front of the mel
+  // filters is exactly the silent-poisoning failure Phase 11b-1 warned about: the transcript
+  // would come back fluent and slightly wrong with nothing to indicate why. The fix is one
+  // command and is named here so this reads as a missing feature, not a broken file.
+  if (audio.sampleRate != cfg.sampleRate) {
+    std::cerr << "error: " << path << " is " << audio.sampleRate << " Hz; Whisper's front end is "
+              << cfg.sampleRate << " Hz only.\n"
+              << "       Resampling is not implemented yet (it would need its own reference to be\n"
+              << "       trustworthy). Convert first:\n"
+              << "         ffmpeg -i " << path << " -ac 1 -ar " << cfg.sampleRate
+              << " -c:a pcm_s16le out.wav\n";
+    return 1;
+  }
+
+  const auto tRun0 = clock::now();
+  std::vector<float> mel;
+  if (!au::logMelSpectrogram(audio.samples, cfg, mel, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const double runSec = std::chrono::duration<double>(clock::now() - tRun0).count();
+
+  double lo = 1e30, hi = -1e30, sum = 0.0;
+  for (float v : mel) {
+    lo = std::min(lo, static_cast<double>(v));
+    hi = std::max(hi, static_cast<double>(v));
+    sum += v;
+  }
+  const double mean = sum / static_cast<double>(mel.size());
+
+  if (json) {
+    std::cout << std::fixed << std::setprecision(6) << "{\"n_mels\":" << cfg.nMels
+              << ",\"frames\":" << cfg.frames() << ",\"sample_rate\":" << cfg.sampleRate
+              << ",\"seconds\":" << audio.seconds() << ",\"min\":" << lo << ",\"max\":" << hi
+              << ",\"mean\":" << mean << "}\n";
+    return 0;
+  }
+
+  std::cout << std::fixed << std::setprecision(4) << "audio:    " << path << "  "
+            << audio.samples.size() << " samples, " << audio.seconds() << " s @ "
+            << audio.sampleRate << " Hz mono\n"
+            << "window:   n_fft " << cfg.nFft << ", hop " << cfg.hopLength << ", periodic hann, "
+            << "reflect padding\n"
+            << "features: " << cfg.nMels << " mels x " << cfg.frames() << " frames  ("
+            << cfg.chunkSeconds << " s, padded)\n"
+            << "range:    min " << lo << ", max " << hi << ", mean " << mean << "\n"
+            << "frame 0:  [";
+  for (int m = 0; m < 8 && m < cfg.nMels; ++m) {
+    if (m) std::cout << ", ";
+    std::cout << mel[static_cast<std::size_t>(m) * cfg.frames()];
+  }
+  std::cout << ", ...]\n"
+            << std::defaultfloat << "[load " << loadSec << "s | mel " << runSec << "s]\n";
+  return 0;
+}
+
+// The Phase 11b-3a gate. Tiered like vision-check and embed-check, and for a reason 11b-1 proved
+// rather than assumed: when CLIP was gated, BOTH bugs found were in preprocessing rather than the
+// transformer, and a single aggregate verdict would have read as "the model is slightly wrong".
+//
+// So the audio front end is verified on its own, before a Whisper weight exists, and its tiers
+// are ordered so that each one narrows the cause of the next:
+//
+//   1. filter bank   — a pure function of the config, no audio involved. Isolates the mel SCALE
+//                      (slaney vs htk) and the area normalization from everything else.
+//   2. waveform      — a checksum of the decoded samples. Separates "the WAV was read wrong" from
+//                      "the spectrogram was computed wrong"; they otherwise present identically.
+//   3. log-mel       — the finished features. Only meaningful once 1 and 2 agree, at which point
+//                      the suspects are the window, the reflect padding, power-vs-magnitude and
+//                      the dynamic-range clamp.
+int cmdAudioCheck(const std::vector<std::string_view>& args) {
+  namespace au = qorvix::audio;
+  const std::string refPath = flagValue(args, "--ref");
+  std::string audioPath = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (audioPath.rfind("--", 0) == 0) audioPath.clear();  // `audio-check --ref F` with no positional
+  if (refPath.empty()) {
+    std::cerr << "usage: qorvix audio-check [<file.wav>] --ref <fixture> [--tol 1e-4]\n";
+    return 1;
+  }
+  if (audioPath.empty()) audioPath = "tests/data/audio_probe.wav";
+  double tol = 1e-4;
+  if (const std::string t = flagValue(args, "--tol"); !t.empty()) tol = std::stod(t);
+
+  std::string err;
+  au::AudioReference ref;
+  if (!ref.load(refPath, err)) {
+    std::cerr << "error: reference: " << err << "\n";
+    return 1;
+  }
+  au::AudioBuffer audio;
+  if (!au::loadAudio(audioPath, audio, err)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+
+  // The fixture carries the config it was captured at, and the front end is run at exactly that
+  // config rather than at its defaults — otherwise a whisper-large fixture (128 mels) compared
+  // against an 80-mel run would fail as a numerical mismatch instead of the wrong-pairing it is.
+  au::MelConfig cfg;
+  cfg.sampleRate = ref.sampleRate > 0 ? ref.sampleRate : cfg.sampleRate;
+  cfg.nFft = ref.nFft > 0 ? ref.nFft : cfg.nFft;
+  cfg.hopLength = ref.hopLength > 0 ? ref.hopLength : cfg.hopLength;
+  cfg.nMels = ref.nMels;
+
+  std::cout << "audio:  " << audioPath << "  " << audio.samples.size() << " samples @ "
+            << audio.sampleRate << " Hz\n"
+            << "ref:    " << ref.model << "  (" << ref.nMels << " mels, n_fft " << cfg.nFft
+            << ", hop " << cfg.hopLength << ")\n"
+            << "tol:    " << tol << "\n\n";
+
+  if (audio.sampleRate != cfg.sampleRate) {
+    std::cout << "Probe is " << audio.sampleRate << " Hz but the fixture was captured at "
+              << cfg.sampleRate << " Hz — wrong pairing.\n\nRESULT: MISMATCH\n";
+    return 1;
+  }
+  if (cfg.frames() != ref.frames) {
+    std::cout << "Frame count " << cfg.frames() << " != fixture's " << ref.frames
+              << " — the chunk length or hop disagrees.\n\nRESULT: MISMATCH\n";
+    return 1;
+  }
+
+  bool pass = true;
+  std::cout << std::scientific << std::setprecision(2);
+
+  // ---- tier 1: the mel filter bank, with no audio in the picture ----
+  const std::vector<float> bank = au::melFilterBank(cfg);
+  const int bins = cfg.bins();
+  double worstFilter = 0.0;
+  for (const auto& p : ref.filterProbes) {
+    if (p.bin < 0 || p.bin >= bins || p.mel < 0 || p.mel >= cfg.nMels) continue;
+    const float got = bank[static_cast<std::size_t>(p.bin) * cfg.nMels + p.mel];
+    worstFilter = std::max(worstFilter, static_cast<double>(std::abs(got - p.value)));
+  }
+  // Column sums catch a wrong normalization even where every probe happens to land on a zero.
+  for (int m = 0; m < static_cast<int>(ref.filterColumnSums.size()); ++m) {
+    double sum = 0.0;
+    for (int b = 0; b < bins; ++b) sum += bank[static_cast<std::size_t>(b) * cfg.nMels + m];
+    worstFilter = std::max(worstFilter, std::abs(sum - ref.filterColumnSums[static_cast<std::size_t>(m)]));
+  }
+  std::cout << "Filter bank vs reference:        max |diff| " << worstFilter << "  ("
+            << ref.filterProbes.size() << " probes + " << ref.filterColumnSums.size()
+            << " column sums)\n";
+  if (worstFilter > tol) pass = false;
+
+  // ---- tier 2: the decoded waveform ----
+  double mean = 0.0, absMean = 0.0;
+  for (float v : audio.samples) {
+    mean += v;
+    absMean += std::abs(v);
+  }
+  if (!audio.samples.empty()) {
+    mean /= static_cast<double>(audio.samples.size());
+    absMean /= static_cast<double>(audio.samples.size());
+  }
+  double worstWave = std::max(std::abs(mean - ref.waveformMean), std::abs(absMean - ref.waveformAbsMean));
+  const bool countOk = ref.waveformSamples == 0 ||
+                       ref.waveformSamples == static_cast<int>(audio.samples.size());
+  std::cout << "Waveform vs reference:           max |diff| " << worstWave << "  ("
+            << audio.samples.size() << " samples"
+            << (countOk ? "" : ", COUNT MISMATCH") << ")\n";
+  if (worstWave > tol || !countOk) pass = false;
+
+  // ---- tier 3: the log-mel features ----
+  std::vector<float> mel;
+  if (!au::logMelSpectrogram(audio.samples, cfg, mel, err)) {
+    std::cerr << "error: mel: " << err << "\n";
+    return 1;
+  }
+  const int frames = cfg.frames();
+  double worstFrame0 = 0.0, worstMeans = 0.0;
+  for (int m = 0; m < cfg.nMels; ++m) {
+    const float got0 = mel[static_cast<std::size_t>(m) * frames];
+    worstFrame0 = std::max(worstFrame0, static_cast<double>(std::abs(got0 - ref.frame0[static_cast<std::size_t>(m)])));
+    double sum = 0.0;
+    for (int t = 0; t < frames; ++t) sum += mel[static_cast<std::size_t>(m) * frames + t];
+    worstMeans = std::max(worstMeans,
+                          std::abs(sum / frames - ref.melMeans[static_cast<std::size_t>(m)]));
+  }
+  std::cout << "Log-mel frame 0 vs reference:    max |diff| " << worstFrame0 << "  (" << cfg.nMels
+            << " mel bins)\n"
+            << "Log-mel per-bin means:           max |diff| " << worstMeans << "  (over " << frames
+            << " frames)\n";
+  if (worstFrame0 > tol || worstMeans > tol) pass = false;
+
+  std::cout << "\n"
+            << (pass ? "RESULT: PASS - the log-mel front end matches WhisperFeatureExtractor.\n"
+                     : "RESULT: MISMATCH - the first failing tier above names the cause.\n");
+  return pass ? 0 : 1;
 }
 
 // The Phase 11b analogue of embed-check. Tiered the same way and for the same reason: the vision
@@ -2595,6 +2812,8 @@ int printUsage() {
             << "  embed-check <file> [--ref F] [--min-cos C]   Gate embeddings against a\n"
             << "                      captured sentence-transformers reference\n"
             << "  vision-check <mmproj.gguf> --ref F [--image f.png]   Gate the CLIP tower\n"
+            << "  audio-mel <file.wav> [--mels N]   Whisper log-mel front end\n"
+            << "  audio-check [<file.wav>] --ref F  Gate the log-mel front end\n"
             << "                      against a captured transformers reference\n"
             << "  vlm-check <file> [--mmproj <clip.gguf> --image <f.png>]   Gate the image/text\n"
             << "                      input-embedding splice (no reference capture needed)\n"
@@ -2631,6 +2850,8 @@ int main(int argc, char** argv) {
   if (command == "embed") return cmdEmbed(args);
   if (command == "embed-check") return cmdEmbedCheck(args);
   if (command == "image-embed") return cmdImageEmbed(args);
+  if (command == "audio-mel") return cmdAudioMel(args);
+  if (command == "audio-check") return cmdAudioCheck(args);
   if (command == "vision-check") return cmdVisionCheck(args);
   if (command == "vlm-check") return cmdVlmCheck(args);
   if (command == "rag") return cmdRag(args);
