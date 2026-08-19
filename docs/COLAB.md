@@ -39,6 +39,29 @@ moves the validated forward pass onto the GPU). So this confirms the CUDA **back
 cuBLAS, device/memory management) executes correctly; it is not yet an end-to-end GPU generation
 benchmark.
 
+## Tensor parallelism on ONE GPU (Phase 10b)
+
+```python
+!curl -fsSL https://raw.githubusercontent.com/Boominathan2355/QorVix/main/scripts/colab_tp_check.sh | bash
+```
+
+A rank in Qorvix is a **(device, weight-shard) pair**, and nothing requires two ranks to name
+different devices. Ranks that share a device reduce through the host-staged collective instead of
+NCCL; every other line of the sharded model is identical. So a single T4 executes the real TP=2 and
+TP=4 code paths — same shards, same per-rank KV caches, same two all-reduces per layer, same
+column-parallel LM head. That is what makes tensor parallelism verifiable on hardware this project
+can actually get at.
+
+The script runs `qorvix tp-check` at TP=2 and TP=4 against TinyLlama and compares the sharded logits
+to the **unsharded GPU** logits: argmax must agree at every position and the relative error must
+stay under 1e-3 (a tensor-parallel matmul reassociates the dot product, so it is never bit-exact —
+but both sides run the same kernels here, so anything larger is a real bug, not float noise). It
+also asserts that TP=8 is **refused**: TinyLlama has 4 KV heads and a rank must own whole ones.
+
+What this does NOT cover, and needs ≥2 GPUs: NCCL's own transport, and NVLink/PCIe P2P behaviour.
+`qorvix gpu` reports whether NCCL was built in, and the peer-access matrix when there is more than
+one device.
+
 ## Full unit-test suite on GPU (optional)
 
 `ctest` needs Catch2 v3 (not on Colab by default). The full suite already runs green in the

@@ -208,19 +208,121 @@ TEST_CASE("column shards refuse to cut a quantization block in half", "[tp]") {
   REQUIRE(shardCols(full, Slice{0, kQKK}, sh, err));              // aligned is fine
 }
 
-TEST_CASE("single-rank collective is the identity", "[tp]") {
-  auto c = makeSingleRankCollective();
-  REQUIRE(c != nullptr);
-  REQUIRE(c->worldSize() == 1);
-  REQUIRE(c->rank() == 0);
-  REQUIRE(c->barrier());
+// ---- collective groups (Part b) --------------------------------------------------------------
+// The transport half of tensor parallelism. Only the host-memory implementations are exercised
+// here — they are CUDA-free by design (see tensor_parallel.cpp), so the CONTRACT is pinned in a
+// build with no toolkit, and the device transports in cuda_backend.cu implement the same one.
+
+TEST_CASE("single-rank group is the identity", "[tp]") {
+  auto g = makeSingleRankGroup(0);
+  REQUIRE(g != nullptr);
+  REQUIRE(g->worldSize() == 1);
+  REQUIRE(g->deviceOf(0) == 0);
+  REQUIRE(g->stream(0) == nullptr);
+  REQUIRE(g->barrier());
   // With one rank the partial IS the total, so the buffer must come back untouched.
   std::vector<float> buf{1.5f, -2.0f, 3.25f};
   const auto before = buf;
-  REQUIRE(c->allReduceSum(buf.data(), buf.size()));
+  float* bufs[1] = {buf.data()};
+  REQUIRE(g->allReduceSum(bufs, buf.size()));
   REQUIRE(buf == before);
 }
 
+TEST_CASE("host collective group leaves the total on EVERY rank", "[tp]") {
+  constexpr int kWorld = 4;
+  auto g = makeHostCollectiveGroup(kWorld);
+  REQUIRE(g != nullptr);
+  REQUIRE(g->worldSize() == kWorld);
+  REQUIRE(g->deviceOf(0) == -1);  // host memory, no device
+
+  // Rank r holds (r+1)*(i+1), so the total at i is (i+1) * world*(world+1)/2 — closed form, so a
+  // transport that dropped a rank cannot pass by accident.
+  constexpr std::size_t kN = 8;
+  std::vector<std::vector<float>> owned(kWorld, std::vector<float>(kN));
+  std::vector<float*> bufs(kWorld);
+  for (int r = 0; r < kWorld; ++r) {
+    for (std::size_t i = 0; i < kN; ++i)
+      owned[r][i] = static_cast<float>((r + 1) * (i + 1));
+    bufs[r] = owned[r].data();
+  }
+  REQUIRE(g->allReduceSum(bufs.data(), kN));
+
+  const float scale = 0.5f * kWorld * (kWorld + 1);  // 1+2+3+4 = 10
+  for (int r = 0; r < kWorld; ++r)
+    for (std::size_t i = 0; i < kN; ++i)
+      REQUIRE(owned[r][i] == scale * static_cast<float>(i + 1));
+}
+
+TEST_CASE("host collective group is reusable and rejects bad arguments", "[tp]") {
+  auto g = makeHostCollectiveGroup(2);
+  REQUIRE(g != nullptr);
+  std::vector<float> a{1.0f}, b{2.0f};
+  std::vector<float*> bufs{a.data(), b.data()};
+
+  // The decode loop calls this twice per layer, so a second call must behave like the first.
+  REQUIRE(g->allReduceSum(bufs.data(), 1));
+  REQUIRE(a[0] == 3.0f);
+  REQUIRE(b[0] == 3.0f);
+  REQUIRE(g->allReduceSum(bufs.data(), 1));
+  REQUIRE(a[0] == 6.0f);
+  REQUIRE(b[0] == 6.0f);
+
+  REQUIRE_FALSE(g->allReduceSum(bufs.data(), 0));   // zero elements is a caller bug, not a no-op
+  REQUIRE_FALSE(g->allReduceSum(nullptr, 1));
+  std::vector<float*> holed{a.data(), nullptr};     // a rank that forgot to allocate
+  REQUIRE_FALSE(g->allReduceSum(holed.data(), 1));
+
+  REQUIRE(makeHostCollectiveGroup(0) == nullptr);
+  REQUIRE(makeHostCollectiveGroup(1)->worldSize() == 1);  // degenerates to the single-rank group
+}
+
+TEST_CASE("NCCL reports honestly and never silently substitutes", "[tp]") {
+  // builtWithNccl() is a compile-time fact; the factory must agree with it rather than returning
+  // some other transport under NCCL's name, or `qorvix gpu` would report a link it isn't using.
+  std::string err;
+  auto g = makeNcclCollectiveGroup({0, 1}, err);
+  if (!builtWithNccl()) {
+    REQUIRE(g == nullptr);
+    REQUIRE_FALSE(err.empty());
+  } else if (g) {
+    REQUIRE(g->backendName() == "nccl");
+    REQUIRE(g->worldSize() == 2);
+  }
+}
+
+TEST_CASE("collective group selection is defined without a device", "[tp]") {
+  std::string err;
+  // One rank needs no transport at all, so this must succeed in every build.
+  auto one = makeCollectiveGroup({0}, err);
+  REQUIRE(one != nullptr);
+  REQUIRE(one->worldSize() == 1);
+  REQUIRE(one->backendName() == "single-rank");
+
+  REQUIRE(makeCollectiveGroup({}, err) == nullptr);
+  REQUIRE_FALSE(err.empty());
+
+  // A multi-rank group needs a device transport; with no CUDA there is none, and the failure has
+  // to say so rather than handing back a group that quietly computes the wrong answer.
+  err.clear();
+  auto many = makeCollectiveGroup({0, 0}, err);
+  if (!builtWithCuda() || deviceCount() == 0) {
+    REQUIRE(many == nullptr);
+    REQUIRE_FALSE(err.empty());
+  } else {
+    REQUIRE(many != nullptr);
+    REQUIRE(many->worldSize() == 2);
+  }
+}
+
+TEST_CASE("collective self-test passes on a device or reports skipped", "[tp]") {
+  const auto c = collectiveSelfTest();
+  if (deviceCount() > 0 && builtWithCuda()) {
+    REQUIRE(c.ran);
+    REQUIRE(c.passed);
+  } else {
+    REQUIRE_FALSE(c.ran);  // skipped, not failed
+  }
+}
 TEST_CASE("topology is callable and self-consistent in any build", "[tp]") {
   const auto topo = queryTopology();
   REQUIRE(topo.deviceCount >= 0);

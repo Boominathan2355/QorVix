@@ -5,6 +5,12 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+// NCCL is optional and compile-gated exactly like CUDA itself: without it the collective seam
+// still has a working (host-staged) transport, so nothing above this module needs an #ifdef.
+#ifdef QORVIX_WITH_NCCL
+#include <nccl.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -1553,6 +1559,394 @@ std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig& cfg, const float*
   return m;
 }
 
+// ---- tensor-parallel GPU model (Phase 10b) ---------------------------------------------------
+//
+// The plan of Part a, executed. Everything below implements the plain GpuModel interface, so the
+// engine above it cannot tell a 4-rank world from a single GPU except by its VRAM footprint.
+//
+// Shape of one decode step (d = dModel, and every rank runs all of it):
+//   embed        each rank fills ITS columns of a zeroed x -> all-reduce -> full x everywhere
+//   per layer    rmsnorm (replicated, identical on every rank)
+//                wq/wk/wv       column-parallel: rank owns whole q and kv HEADS
+//                rope, kv-store, attention   entirely local — a rank never reads a peer's KV
+//                wo             row-parallel -> partial x_out -> ALL-REDUCE #1 -> residual add
+//                rmsnorm (replicated)
+//                ffnGate/ffnUp  column-parallel -> swiglu on the local ffn slice
+//                ffnDown        row-parallel -> partial -> ALL-REDUCE #2 -> residual add
+//   lm head      column-parallel; each rank copies ITS logit slice into the shared host buffer
+//
+// Two all-reduces per layer plus one for the embedding. The LM head deliberately needs none: the
+// logits go to the host anyway, so each rank's device-to-host copy lands at its own offset and the
+// concatenation is free. That keeps allReduceSum the ONLY collective in the whole model, which is
+// what makes the transport seam small enough to have three honest implementations.
+//
+// The replicated rmsnorms are duplicated work, not a mistake: normalizing d floats on every rank
+// is far cheaper than the collective that broadcasting the result would cost.
+
+namespace {
+
+// Even split of `total` into `world` parts, remainder to the first ranks. Same rule as the plan's
+// internal split (tensor_parallel.cpp), applied here to the two axes the plan does not cover: the
+// LM-head vocabulary and the embedding table's columns.
+Slice splitEven(int total, int world, int rank) {
+  const int base = total / world, extra = total % world;
+  return Slice{rank * base + (rank < extra ? rank : extra), base + (rank < extra ? 1 : 0)};
+}
+
+struct TpLayer {
+  float* attnNorm = nullptr;  // replicated [dModel]
+  float* ffnNorm = nullptr;   // replicated [dModel]
+  DevWeight wq, wk, wv, wo, ffnGate, ffnUp, ffnDown;
+};
+
+// One rank: its device, the stream it launches on (owned by the collective group, so the
+// all-reduce is ordered against these kernels for free), its shard of every weight, its slice of
+// the KV cache, and scratch sized to its LOCAL dimensions rather than the model's.
+struct TpRank {
+  int device = 0;
+  cudaStream_t stream = nullptr;
+  TensorParallelPlan plan;
+  Slice vocab;   // rows of the LM head this rank computes
+  Slice embCols; // columns of the F32 embedding table this rank holds
+  int nHeads = 0, nKv = 0, ffn = 0, kvDim = 0;
+
+  float* dTokEmbd = nullptr;  // [vocab, embCols.count], F32 column shard
+  float* dOutNorm = nullptr;
+  DevWeight output;
+  std::vector<TpLayer> layers;
+
+  float *dKc = nullptr, *dVc = nullptr;
+  std::size_t kvPerSession = 0;
+  float *dx = nullptr, *dxn = nullptr, *dq = nullptr, *dk = nullptr, *dv = nullptr;
+  float *dattn = nullptr, *dtmp = nullptr, *dg = nullptr, *du = nullptr, *dact = nullptr;
+  float* dlogits = nullptr;
+};
+
+class ShardedGpuModel final : public GpuModel {
+ public:
+  ~ShardedGpuModel() override {
+    for (auto& R : ranks_) {
+      cudaSetDevice(R.device);
+      auto f = [](void* p) { if (p) cudaFree(p); };
+      f(R.dTokEmbd);
+      f(R.dOutNorm);
+      f(R.output.d);
+      for (auto& L : R.layers) {
+        f(L.attnNorm);
+        f(L.ffnNorm);
+        for (DevWeight* w : {&L.wq, &L.wk, &L.wv, &L.wo, &L.ffnGate, &L.ffnUp, &L.ffnDown})
+          f(w->d);
+      }
+      for (void* p : {R.dKc, R.dVc, R.dx, R.dxn, R.dq, R.dk, R.dv, R.dattn, R.dtmp, R.dg, R.du,
+                      R.dact, R.dlogits})
+        f(p);
+    }
+    if (!ranks_.empty()) cudaSetDevice(ranks_[0].device);
+  }
+
+  bool init(const GpuModelConfig& cfg, const float* tokenEmbdF32, const float* outputNorm,
+            const GpuWeight& output, const std::vector<GpuLayer>& layers,
+            const std::vector<int>& devices, int maxSessions, std::string& err) {
+    cfg_ = cfg;
+    maxSessions_ = maxSessions < 1 ? 1 : maxSessions;
+    const int world = static_cast<int>(devices.size());
+    if (world < 1) { err = "no devices given"; return false; }
+    if (cfg.nLayers <= 0 || cfg.dModel <= 0 || cfg.vocab <= 0) {
+      err = "invalid model config (nLayers/dModel/vocab must be > 0)";
+      return false;
+    }
+    if (layers.size() < static_cast<std::size_t>(cfg.nLayers)) {
+      err = "layer list shorter than nLayers";
+      return false;
+    }
+
+    group_ = makeCollectiveGroup(devices, err);
+    if (!group_) return false;
+    bufs_.assign(world, nullptr);
+
+    // The plan is built from layer 0's row-parallel weight types. Every layer of a GGUF model uses
+    // the same quantization for the same tensor, and if one did not, the shard byte offsets would
+    // differ per layer — so this is checked per layer below rather than assumed.
+    ranks_.resize(world);
+    for (int r = 0; r < world; ++r) {
+      TpRank& R = ranks_[r];
+      R.device = devices[r];
+      R.stream = static_cast<cudaStream_t>(group_->stream(r));
+      if (!planTensorParallel(cfg, world, r, layers[0].wo.ggmlType, layers[0].ffnDown.ggmlType,
+                              R.plan, err))
+        return false;
+      R.nHeads = R.plan.localHeads();
+      R.nKv = R.plan.localKvHeads();
+      R.ffn = R.plan.localFfn();
+      R.kvDim = R.nKv * cfg.headDim;
+      R.vocab = splitEven(cfg.vocab, world, r);
+      R.embCols = splitEven(cfg.dModel, world, r);
+      // A rank with an empty slice would launch a zero-block grid and silently contribute
+      // nothing, so reject the world size instead of shipping a rank that does no work.
+      if (R.vocab.count <= 0 || R.embCols.count <= 0) {
+        err = "world size " + std::to_string(world) + " leaves a rank with an empty slice (vocab " +
+              std::to_string(cfg.vocab) + ", dModel " + std::to_string(cfg.dModel) + ")";
+        return false;
+      }
+    }
+
+    for (int r = 0; r < world; ++r)
+      if (!initRank(ranks_[r], tokenEmbdF32, outputNorm, output, layers, err)) return false;
+
+    hostLogits_.assign(cfg.vocab, 0.0f);
+    sessionUsed_.assign(maxSessions_, false);
+    cudaSetDevice(ranks_[0].device);
+    return true;
+  }
+
+  void reset() override { resetSession(0); }
+  void resetSession(int) override {}  // KV slots are overwritten per position; see GpuModelImpl
+
+  int openSession() override {
+    for (int i = 0; i < maxSessions_; ++i)
+      if (!sessionUsed_[i]) { sessionUsed_[i] = true; return i; }
+    return kNoGpuSession;
+  }
+  void closeSession(int session) override {
+    if (session >= 0 && session < maxSessions_) sessionUsed_[session] = false;
+  }
+
+  const std::vector<float>& forward(int token, int pos) override { return forward(0, token, pos); }
+
+  const std::vector<float>& forward(int session, int token, int pos) override {
+    if (session < 0 || session >= maxSessions_) session = 0;
+    const int d = cfg_.dModel, hd = cfg_.headDim, mx = cfg_.maxSeq;
+    const int world = worldSize();
+    auto g = [](int n) { return (n + 255) / 256; };
+
+    // --- embedding: rank r writes only ITS columns of a zeroed x; the all-reduce over disjoint
+    // contributions is exactly a concatenation, so this is bit-exact, and no rank has to carry the
+    // whole (dequantized, F32, and therefore large) token table.
+    for (int r = 0; r < world; ++r) {
+      TpRank& R = ranks_[r];
+      cudaSetDevice(R.device);
+      cudaMemsetAsync(R.dx, 0, static_cast<std::size_t>(d) * sizeof(float), R.stream);
+      embedRowKernel<<<g(R.embCols.count), 256, 0, R.stream>>>(R.dx + R.embCols.begin, R.dTokEmbd,
+                                                               token, R.embCols.count);
+    }
+    if (!allReduce(&TpRank::dx, d)) return hostLogits_;
+
+    for (int l = 0; l < cfg_.nLayers; ++l) {
+      for (int r = 0; r < world; ++r) {
+        TpRank& R = ranks_[r];
+        TpLayer& W = R.layers[l];
+        cudaSetDevice(R.device);
+        rmsnormKernel<<<1, 256, 0, R.stream>>>(R.dxn, R.dx, W.attnNorm, d, cfg_.normEps);
+        matmul(R, R.dq, W.wq, R.dxn);
+        matmul(R, R.dk, W.wk, R.dxn);
+        matmul(R, R.dv, W.wv, R.dxn);
+        // RoPE's angle depends on the position and the offset WITHIN a head, never on which head,
+        // so rotating a rank's own head range needs no global head index.
+        ropeNeoxKernel<<<g(R.nHeads * hd / 2), 256, 0, R.stream>>>(R.dq, R.nHeads, hd, pos,
+                                                                   cfg_.ropeFreqBase);
+        ropeNeoxKernel<<<g(R.nKv * hd / 2), 256, 0, R.stream>>>(R.dk, R.nKv, hd, pos,
+                                                                cfg_.ropeFreqBase);
+        float* Kb = R.dKc + static_cast<std::size_t>(session) * R.kvPerSession;
+        float* Vb = R.dVc + static_cast<std::size_t>(session) * R.kvPerSession;
+        kvStoreKernel<<<g(R.kvDim), 256, 0, R.stream>>>(Kb, R.dk, l, pos, mx, R.kvDim);
+        kvStoreKernel<<<g(R.kvDim), 256, 0, R.stream>>>(Vb, R.dv, l, pos, mx, R.kvDim);
+        float* Kl = Kb + static_cast<std::size_t>(l) * mx * R.kvDim;
+        float* Vl = Vb + static_cast<std::size_t>(l) * mx * R.kvDim;
+        const std::size_t sh = (static_cast<std::size_t>(pos + 1) + hd) * sizeof(float);
+        attentionDecodeKernel<<<R.nHeads, hd, sh, R.stream>>>(R.dattn, R.dq, Kl, Vl, R.nHeads,
+                                                             R.nKv, hd, pos + 1, R.kvDim);
+        matmul(R, R.dtmp, W.wo, R.dattn);  // row-parallel: dtmp is a PARTIAL sum over all of d
+      }
+      if (!allReduce(&TpRank::dtmp, d)) return hostLogits_;
+
+      for (int r = 0; r < world; ++r) {
+        TpRank& R = ranks_[r];
+        TpLayer& W = R.layers[l];
+        cudaSetDevice(R.device);
+        addKernel<<<g(d), 256, 0, R.stream>>>(R.dx, R.dtmp, d);
+        rmsnormKernel<<<1, 256, 0, R.stream>>>(R.dxn, R.dx, W.ffnNorm, d, cfg_.normEps);
+        matmul(R, R.dg, W.ffnGate, R.dxn);
+        matmul(R, R.du, W.ffnUp, R.dxn);
+        swigluKernel<<<g(R.ffn), 256, 0, R.stream>>>(R.dact, R.dg, R.du, R.ffn);
+        matmul(R, R.dtmp, W.ffnDown, R.dact);  // row-parallel again
+      }
+      if (!allReduce(&TpRank::dtmp, d)) return hostLogits_;
+
+      for (int r = 0; r < world; ++r) {
+        TpRank& R = ranks_[r];
+        cudaSetDevice(R.device);
+        addKernel<<<g(d), 256, 0, R.stream>>>(R.dx, R.dtmp, d);
+      }
+    }
+
+    // --- output: column-parallel LM head. Each rank owns a row range of the head, so it produces
+    // that range of the logits and copies it straight into its own offset of the shared host
+    // buffer. The logits are host-bound regardless, which makes the gather cost nothing.
+    for (int r = 0; r < world; ++r) {
+      TpRank& R = ranks_[r];
+      cudaSetDevice(R.device);
+      rmsnormKernel<<<1, 256, 0, R.stream>>>(R.dxn, R.dx, R.dOutNorm, d, cfg_.normEps);
+      matmul(R, R.dlogits, R.output, R.dxn);
+      cudaMemcpyAsync(hostLogits_.data() + R.vocab.begin, R.dlogits,
+                      static_cast<std::size_t>(R.vocab.count) * sizeof(float),
+                      cudaMemcpyDeviceToHost, R.stream);
+    }
+    for (int r = 0; r < world; ++r) {
+      cudaSetDevice(ranks_[r].device);
+      cudaStreamSynchronize(ranks_[r].stream);
+    }
+    return hostLogits_;
+  }
+
+ private:
+  int worldSize() const { return static_cast<int>(ranks_.size()); }
+
+  // Gathers the ranks' pointers to the same member and reduces them. Taking a member pointer keeps
+  // the two call sites (x and tmp) from duplicating the gather loop.
+  bool allReduce(float* TpRank::*member, int n) {
+    const int world = worldSize();
+    for (int r = 0; r < world; ++r) bufs_[r] = ranks_[r].*member;
+    return group_->allReduceSum(bufs_.data(), static_cast<std::size_t>(n));
+  }
+
+  void matmul(TpRank& R, float* out, const DevWeight& w, const float* x) {
+    const int grid = (w.rows + kWarpsPerBlock - 1) / kWarpsPerBlock, threads = kWarpsPerBlock * 32;
+    switch (w.type) {
+      case 12:
+        qmatmulQ4_KKernel<<<grid, threads, 0, R.stream>>>(
+            out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols);
+        break;
+      case 14:
+        qmatmulQ6_KKernel<<<grid, threads, 0, R.stream>>>(
+            out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols);
+        break;
+      case 8:
+        qmatmulQ8_0Kernel<<<grid, threads, 0, R.stream>>>(
+            out, static_cast<const std::uint8_t*>(w.d), x, w.rows, w.cols);
+        break;
+      default:
+        matmulF32Kernel<<<w.rows, 256, 0, R.stream>>>(out, static_cast<const float*>(w.d), x,
+                                                      w.rows, w.cols);
+        break;
+    }
+  }
+
+  bool initRank(TpRank& R, const float* tokenEmbdF32, const float* outputNorm,
+                const GpuWeight& output, const std::vector<GpuLayer>& layers, std::string& err) {
+    if (cudaSetDevice(R.device) != cudaSuccess) {
+      err = "cudaSetDevice(" + std::to_string(R.device) + ") failed";
+      return false;
+    }
+    const int d = cfg_.dModel;
+
+    auto upF32 = [](const float* h, std::size_t n) {
+      float* p = nullptr;
+      if (cudaMalloc(&p, n * sizeof(float)) != cudaSuccess) return static_cast<float*>(nullptr);
+      cudaMemcpy(p, h, n * sizeof(float), cudaMemcpyHostToDevice);
+      return p;
+    };
+    auto upShard = [&](const WeightShard& s, DevWeight& out) -> bool {
+      if (cudaMalloc(&out.d, s.bytes()) != cudaSuccess) {
+        err = "cudaMalloc for a weight shard failed on device " + std::to_string(R.device);
+        return false;
+      }
+      cudaMemcpy(out.d, s.data(), s.bytes(), cudaMemcpyHostToDevice);
+      out.type = s.ggmlType();
+      out.rows = s.rows();
+      out.cols = s.cols();
+      return true;
+    };
+
+    // The embedding table is F32, so shardCols' quant-block rule degenerates to "any column
+    // boundary" and the generic slicer handles it — no separate float path.
+    WeightShard sh;
+    const GpuWeight embAll{tokenEmbdF32, 0u, cfg_.vocab, d};
+    if (!shardCols(embAll, R.embCols, sh, err)) return false;
+    R.dTokEmbd = upF32(static_cast<const float*>(sh.data()),
+                       static_cast<std::size_t>(cfg_.vocab) * R.embCols.count);
+    R.dOutNorm = upF32(outputNorm, d);
+    if (!R.dTokEmbd || !R.dOutNorm) {
+      err = "cudaMalloc embedding/norm failed on device " + std::to_string(R.device);
+      return false;
+    }
+    if (!shardRows(output, R.vocab, sh, err)) return false;
+    if (!upShard(sh, R.output)) return false;
+
+    R.layers.resize(cfg_.nLayers);
+    for (int l = 0; l < cfg_.nLayers; ++l) {
+      const GpuLayer& S = layers[l];
+      TpLayer& T = R.layers[l];
+      // A layer whose row-parallel weights are quantized differently from layer 0 would need a
+      // different split point, so reject it rather than slicing at the wrong offsets.
+      if (S.wo.ggmlType != layers[0].wo.ggmlType ||
+          S.ffnDown.ggmlType != layers[0].ffnDown.ggmlType) {
+        err = "layer " + std::to_string(l) +
+              " quantizes wo/ffnDown differently from layer 0; the tensor-parallel split point is "
+              "per-type and cannot vary per layer";
+        return false;
+      }
+      T.attnNorm = upF32(S.attnNorm, d);
+      T.ffnNorm = upF32(S.ffnNorm, d);
+      if (!T.attnNorm || !T.ffnNorm) { err = "cudaMalloc layer norm failed"; return false; }
+
+      // Column-parallel (rows = output dim): the rank owns whole heads / a block-aligned FFN run.
+      if (!shardRows(S.wq, R.plan.qRows, sh, err) || !upShard(sh, T.wq)) return false;
+      if (!shardRows(S.wk, R.plan.kvRows, sh, err) || !upShard(sh, T.wk)) return false;
+      if (!shardRows(S.wv, R.plan.kvRows, sh, err) || !upShard(sh, T.wv)) return false;
+      if (!shardRows(S.ffnGate, R.plan.ffnRows, sh, err) || !upShard(sh, T.ffnGate)) return false;
+      if (!shardRows(S.ffnUp, R.plan.ffnRows, sh, err) || !upShard(sh, T.ffnUp)) return false;
+      // Row-parallel (cols = input dim): consumes exactly what this rank just produced.
+      if (!shardCols(S.wo, R.plan.woCols, sh, err) || !upShard(sh, T.wo)) return false;
+      if (!shardCols(S.ffnDown, R.plan.ffnDownCols, sh, err) || !upShard(sh, T.ffnDown)) return false;
+    }
+
+    auto alloc = [](float*& p, std::size_t n) {
+      return cudaMalloc(&p, n * sizeof(float)) == cudaSuccess;
+    };
+    R.kvPerSession = static_cast<std::size_t>(cfg_.nLayers) * cfg_.maxSeq * R.kvDim;
+    const std::size_t kvAll = R.kvPerSession * maxSessions_;
+    const int qDim = R.nHeads * cfg_.headDim;
+    if (!alloc(R.dx, d) || !alloc(R.dxn, d) || !alloc(R.dq, qDim) || !alloc(R.dk, R.kvDim) ||
+        !alloc(R.dv, R.kvDim) || !alloc(R.dattn, qDim) || !alloc(R.dtmp, d) ||
+        !alloc(R.dg, R.ffn) || !alloc(R.du, R.ffn) || !alloc(R.dact, R.ffn) ||
+        !alloc(R.dlogits, R.vocab.count) || !alloc(R.dKc, kvAll) || !alloc(R.dVc, kvAll)) {
+      err = "cudaMalloc scratch/KV failed on device " + std::to_string(R.device);
+      return false;
+    }
+    return true;
+  }
+
+  GpuModelConfig cfg_;
+  std::unique_ptr<ICollectiveGroup> group_;
+  std::vector<TpRank> ranks_;
+  std::vector<float*> bufs_;  // reused gather buffer for allReduce
+  std::vector<float> hostLogits_;
+  int maxSessions_ = 1;
+  std::vector<bool> sessionUsed_;
+};
+
+}  // namespace
+
+std::unique_ptr<GpuModel> createShardedGpuModel(const GpuModelConfig& cfg,
+                                                const float* tokenEmbdF32, const float* outputNorm,
+                                                const GpuWeight& output,
+                                                const std::vector<GpuLayer>& layers,
+                                                const std::vector<int>& devices, std::string& error,
+                                                int maxSessions) {
+  if (deviceCount() <= 0) {
+    error = "no CUDA device present";
+    return nullptr;
+  }
+  if (devices.empty()) {
+    error = "createShardedGpuModel: no devices given (one index per rank)";
+    return nullptr;
+  }
+  auto m = std::make_unique<ShardedGpuModel>();
+  if (!m->init(cfg, tokenEmbdF32, outputNorm, output, layers, devices, maxSessions, error))
+    return nullptr;
+  return m;
+}
+
 // ---- memory integration --------------------------------------------------------------------
 
 namespace {
@@ -1626,6 +2020,288 @@ DeviceTopology queryTopology() {
   }
   cudaSetDevice(0);
   return t;
+}
+
+// ---- collective transports ------------------------------------------------------------------
+//
+// Two device-side implementations of ICollectiveGroup. Both are real transports, not test doubles:
+// the host-staged one is the correct fallback when the devices have no P2P path (PeerLink::None),
+// and NCCL is the fast path that uses NVLink/PCIe bandwidth directly.
+
+namespace {
+
+// Sums the ranks' buffers by staging through host memory: D2H every rank, add on the CPU, H2D the
+// total back to every rank. Slower than NCCL by roughly the PCIe round trip, and used for two
+// reasons rather than one:
+//   * it is the only correct option when cudaDeviceCanAccessPeer says the devices cannot reach
+//     each other, which is common on consumer boards and inside VMs; and
+//   * it does not care whether two ranks name the SAME device, which NCCL flatly rejects — that
+//     is what lets the sharded model run a 2- or 4-rank world on one GPU and be execution-verified
+//     on hardware this project can actually get at (a single Colab T4).
+// The copies are blocking on purpose: the rank's stream is synchronized first, so the partial is
+// complete before it is read, and the total is fully written before the call returns, which means
+// the rank's next kernel on that stream sees it without any further ordering.
+class HostStagedDeviceGroup final : public ICollectiveGroup {
+ public:
+  ~HostStagedDeviceGroup() override {
+    for (int r = 0; r < static_cast<int>(devices_.size()); ++r)
+      if (streams_[r]) {
+        cudaSetDevice(devices_[r]);
+        cudaStreamDestroy(streams_[r]);
+      }
+    if (!devices_.empty()) cudaSetDevice(devices_[0]);
+  }
+
+  bool init(const std::vector<int>& devices, std::string& err) {
+    const int n = deviceCount();
+    for (int d : devices)
+      if (d < 0 || d >= n) {
+        err = "device index " + std::to_string(d) + " out of range (" + std::to_string(n) +
+              " device(s) present)";
+        return false;
+      }
+    devices_ = devices;
+    streams_.assign(devices.size(), nullptr);
+    for (std::size_t r = 0; r < devices.size(); ++r) {
+      if (cudaSetDevice(devices_[r]) != cudaSuccess ||
+          cudaStreamCreate(&streams_[r]) != cudaSuccess) {
+        err = "failed to create a stream on device " + std::to_string(devices_[r]);
+        return false;
+      }
+    }
+    cudaSetDevice(devices_[0]);
+    return true;
+  }
+
+  int worldSize() const override { return static_cast<int>(devices_.size()); }
+  int deviceOf(int rank) const override {
+    return (rank >= 0 && rank < worldSize()) ? devices_[rank] : -1;
+  }
+  void* stream(int rank) const override {
+    return (rank >= 0 && rank < worldSize()) ? static_cast<void*>(streams_[rank]) : nullptr;
+  }
+
+  bool allReduceSum(float* const* bufs, std::size_t n) override {
+    if (!bufs || n == 0) return false;
+    const int world = worldSize();
+    staging_.assign(static_cast<std::size_t>(world) * n, 0.0f);
+    for (int r = 0; r < world; ++r) {
+      if (!bufs[r]) return false;
+      if (cudaSetDevice(devices_[r]) != cudaSuccess) return false;
+      if (cudaStreamSynchronize(streams_[r]) != cudaSuccess) return false;
+      if (cudaMemcpy(staging_.data() + static_cast<std::size_t>(r) * n, bufs[r],
+                     n * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+    }
+    for (int r = 1; r < world; ++r)
+      for (std::size_t i = 0; i < n; ++i)
+        staging_[i] += staging_[static_cast<std::size_t>(r) * n + i];
+    for (int r = 0; r < world; ++r) {
+      if (cudaSetDevice(devices_[r]) != cudaSuccess) return false;
+      if (cudaMemcpy(bufs[r], staging_.data(), n * sizeof(float), cudaMemcpyHostToDevice) !=
+          cudaSuccess)
+        return false;
+    }
+    return true;
+  }
+
+  bool barrier() override {
+    bool ok = true;
+    for (int r = 0; r < worldSize(); ++r) {
+      cudaSetDevice(devices_[r]);
+      ok = ok && cudaStreamSynchronize(streams_[r]) == cudaSuccess;
+    }
+    return ok;
+  }
+
+  std::string backendName() const override { return "host-staged"; }
+
+ private:
+  std::vector<int> devices_;
+  std::vector<cudaStream_t> streams_;
+  std::vector<float> staging_;  // [world][n]; rank 0's slice accumulates the total
+};
+
+#ifdef QORVIX_WITH_NCCL
+// NCCL, single process, one rank per device: ncclCommInitAll builds the whole communicator in one
+// call, so there is no rendezvous file, no MPI, and no unique-id exchange to get wrong. The
+// per-rank ncclAllReduce calls MUST sit inside ncclGroupStart/ncclGroupEnd — issued from one
+// thread without the group they would deadlock, each waiting for peers that thread has not reached
+// yet. That requirement is exactly why ICollectiveGroup takes every rank's buffer at once.
+class NcclCollectiveGroup final : public ICollectiveGroup {
+ public:
+  ~NcclCollectiveGroup() override {
+    for (std::size_t r = 0; r < comms_.size(); ++r)
+      if (comms_[r]) ncclCommDestroy(comms_[r]);
+    for (std::size_t r = 0; r < streams_.size(); ++r)
+      if (streams_[r]) {
+        cudaSetDevice(devices_[r]);
+        cudaStreamDestroy(streams_[r]);
+      }
+    if (!devices_.empty()) cudaSetDevice(devices_[0]);
+  }
+
+  bool init(const std::vector<int>& devices, std::string& err) {
+    devices_ = devices;
+    comms_.assign(devices.size(), nullptr);
+    streams_.assign(devices.size(), nullptr);
+    for (std::size_t r = 0; r < devices.size(); ++r) {
+      if (cudaSetDevice(devices_[r]) != cudaSuccess ||
+          cudaStreamCreate(&streams_[r]) != cudaSuccess) {
+        err = "failed to create a stream on device " + std::to_string(devices_[r]);
+        return false;
+      }
+    }
+    const ncclResult_t rc =
+        ncclCommInitAll(comms_.data(), static_cast<int>(devices.size()), devices_.data());
+    if (rc != ncclSuccess) {
+      err = std::string("ncclCommInitAll: ") + ncclGetErrorString(rc);
+      comms_.assign(devices.size(), nullptr);
+      return false;
+    }
+    cudaSetDevice(devices_[0]);
+    return true;
+  }
+
+  int worldSize() const override { return static_cast<int>(devices_.size()); }
+  int deviceOf(int rank) const override {
+    return (rank >= 0 && rank < worldSize()) ? devices_[rank] : -1;
+  }
+  void* stream(int rank) const override {
+    return (rank >= 0 && rank < worldSize()) ? static_cast<void*>(streams_[rank]) : nullptr;
+  }
+
+  bool allReduceSum(float* const* bufs, std::size_t n) override {
+    if (!bufs || n == 0) return false;
+    if (ncclGroupStart() != ncclSuccess) return false;
+    for (int r = 0; r < worldSize(); ++r) {
+      if (!bufs[r]) return false;
+      if (cudaSetDevice(devices_[r]) != cudaSuccess) return false;
+      // In place: NCCL allows sendbuff == recvbuff, and the partial is dead once reduced.
+      if (ncclAllReduce(bufs[r], bufs[r], n, ncclFloat32, ncclSum, comms_[r], streams_[r]) !=
+          ncclSuccess)
+        return false;
+    }
+    return ncclGroupEnd() == ncclSuccess;
+  }
+
+  bool barrier() override {
+    bool ok = true;
+    for (int r = 0; r < worldSize(); ++r) {
+      cudaSetDevice(devices_[r]);
+      ok = ok && cudaStreamSynchronize(streams_[r]) == cudaSuccess;
+    }
+    return ok;
+  }
+
+  std::string backendName() const override { return "nccl"; }
+
+ private:
+  std::vector<int> devices_;
+  std::vector<ncclComm_t> comms_;
+  std::vector<cudaStream_t> streams_;
+};
+#endif  // QORVIX_WITH_NCCL
+
+}  // namespace
+
+std::unique_ptr<ICollectiveGroup> makeHostStagedDeviceGroup(const std::vector<int>& devices,
+                                                            std::string& err) {
+  if (devices.empty()) { err = "no devices given"; return nullptr; }
+  if (deviceCount() <= 0) { err = "no CUDA device present"; return nullptr; }
+  auto g = std::make_unique<HostStagedDeviceGroup>();
+  if (!g->init(devices, err)) return nullptr;
+  return g;
+}
+
+#ifdef QORVIX_WITH_NCCL
+bool builtWithNccl() noexcept { return true; }
+
+std::unique_ptr<ICollectiveGroup> makeNcclCollectiveGroup(const std::vector<int>& devices,
+                                                          std::string& err) {
+  if (devices.size() < 2) { err = "NCCL needs at least 2 ranks"; return nullptr; }
+  if (deviceCount() < static_cast<int>(devices.size())) {
+    err = "NCCL needs one device per rank; this host has " + std::to_string(deviceCount());
+    return nullptr;
+  }
+  auto g = std::make_unique<NcclCollectiveGroup>();
+  if (!g->init(devices, err)) return nullptr;
+  return g;
+}
+#endif
+
+// Verifies the collective TRANSPORT (the sharding math is tensorParallelSelfTest's job). Rank r is
+// filled with (r+1)*(i+1), so the expected total at index i is (i+1) * world*(world+1)/2 — known in
+// closed form, which means a transport that silently dropped a rank, or left the answer only on
+// rank 0, cannot pass. EVERY rank's buffer is checked, because "the total lands on all of them" is
+// the half of the contract a model would otherwise discover as garbage on ranks 1..N-1.
+SelfTestResult collectiveSelfTest() {
+  if (deviceCount() <= 0) return {false, false, "no CUDA device present"};
+
+  auto runOne = [](const std::vector<int>& devices, std::string& detail) -> bool {
+    std::string err;
+    auto group = makeCollectiveGroup(devices, err);
+    if (!group) { detail = "group init failed: " + err; return false; }
+    const int world = group->worldSize();
+    const std::size_t n = 4096;
+
+    std::vector<float*> bufs(world, nullptr);
+    std::vector<float> host(n);
+    bool ok = true;
+    for (int r = 0; r < world && ok; ++r) {
+      cudaSetDevice(group->deviceOf(r));
+      if (cudaMalloc(&bufs[r], n * sizeof(float)) != cudaSuccess) { ok = false; break; }
+      for (std::size_t i = 0; i < n; ++i) host[i] = static_cast<float>((r + 1) * (i + 1));
+      ok = cudaMemcpy(bufs[r], host.data(), n * sizeof(float), cudaMemcpyHostToDevice) ==
+           cudaSuccess;
+    }
+    if (ok) ok = group->allReduceSum(bufs.data(), n);
+    if (ok) ok = group->barrier();
+
+    const double expectScale = 0.5 * world * (world + 1);
+    double worst = 0.0;
+    for (int r = 0; r < world && ok; ++r) {
+      cudaSetDevice(group->deviceOf(r));
+      if (cudaMemcpy(host.data(), bufs[r], n * sizeof(float), cudaMemcpyDeviceToHost) !=
+          cudaSuccess) {
+        ok = false;
+        break;
+      }
+      for (std::size_t i = 0; i < n; ++i) {
+        const double want = expectScale * static_cast<double>(i + 1);
+        worst = std::max(worst, std::fabs(host[i] - want) / std::max(1.0, want));
+      }
+    }
+    for (int r = 0; r < world; ++r)
+      if (bufs[r]) {
+        cudaSetDevice(group->deviceOf(r));
+        cudaFree(bufs[r]);
+      }
+    cudaSetDevice(0);
+
+    if (!ok) { detail = "transport error (" + group->backendName() + ")"; return false; }
+    if (worst > 1e-6) {
+      detail = group->backendName() + " all-reduce wrong by rel " + std::to_string(worst);
+      return false;
+    }
+    detail = group->backendName() + " x" + std::to_string(world);
+    return true;
+  };
+
+  // Always: a 2-rank world pinned to device 0. That is the configuration the single-GPU
+  // tensor-parallel gate uses, so it is the one that must never silently break.
+  std::string oneGpu;
+  if (!runOne({0, 0}, oneGpu)) return {true, false, "2 ranks on one device: " + oneGpu};
+
+  // Additionally, when the host really has several GPUs, the cross-device path (NCCL if built in,
+  // host-staged otherwise) over as many of them as there are.
+  std::string multi = "skipped (1 device)";
+  if (deviceCount() > 1) {
+    std::vector<int> devs;
+    for (int d = 0; d < deviceCount(); ++d) devs.push_back(d);
+    if (!runOne(devs, multi)) return {true, false, "cross-device: " + multi};
+  }
+  return {true, true, "all-reduce verified: " + oneGpu + "; cross-device: " + multi};
 }
 
 // Verifies the tensor-parallel sharding math on ONE device by simulating the ranks.

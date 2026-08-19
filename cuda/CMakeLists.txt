@@ -26,6 +26,29 @@ if(QORVIX_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
     set_target_properties(qorvix_cuda PROPERTIES CUDA_ARCHITECTURES "75;80;86;89;90")
   endif()
   message(STATUS "qorvix_cuda: building the real CUDA backend (nvcc).")
+
+  # NCCL: optional inside the CUDA build. It is the transport that actually uses NVLink/PCIe P2P
+  # bandwidth for the all-reduce; when it is absent the seam falls back to staging through host
+  # memory, which is correct everywhere (and is also what lets several ranks share one GPU for
+  # verification). So a missing NCCL costs speed on multi-GPU hosts, not capability — which is why
+  # this is a warning and not an error.
+  if(QORVIX_ENABLE_NCCL)
+    find_path(NCCL_INCLUDE_DIR nccl.h HINTS ${CUDAToolkit_INCLUDE_DIRS} ENV NCCL_ROOT
+              PATH_SUFFIXES include)
+    find_library(NCCL_LIBRARY NAMES nccl HINTS ${CUDAToolkit_LIBRARY_DIR} ENV NCCL_ROOT
+                 PATH_SUFFIXES lib lib64)
+    if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+      target_include_directories(qorvix_cuda PRIVATE ${NCCL_INCLUDE_DIR})
+      target_link_libraries(qorvix_cuda PUBLIC ${NCCL_LIBRARY})
+      # PRIVATE, but it reaches every source in this target - including tensor_parallel.cpp, whose
+      # #ifndef QORVIX_WITH_NCCL fallback must disappear when the real one is compiled in.
+      target_compile_definitions(qorvix_cuda PRIVATE QORVIX_WITH_NCCL=1)
+      message(STATUS "qorvix_cuda: NCCL found (${NCCL_LIBRARY}) - building the NCCL collective.")
+    else()
+      message(WARNING "QORVIX_ENABLE_NCCL is ON but nccl.h / libnccl were not found; "
+                      "multi-GPU will use the host-staged collective instead.")
+    endif()
+  endif()
 else()
   target_sources(qorvix_cuda PRIVATE src/cuda_backend_stub.cpp)
   message(STATUS "qorvix_cuda: building the CPU stub (no CUDA toolkit / QORVIX_ENABLE_CUDA=OFF).")

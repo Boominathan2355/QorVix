@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -284,6 +285,71 @@ qorvix::Backend backendFromArgs(const std::vector<std::string_view>& args) {
   return qorvix::Backend::Cpu;  // explicit --cpu or no flag
 }
 
+// Resolves `--tp N` / `--devices a,b,c` into ONE CUDA DEVICE INDEX PER RANK, which is the only
+// form the sharded model takes (its world size is the list's length). Empty means "not sharded".
+//
+// `--devices` is explicit and wins. `--tp N` round-robins N ranks over whatever devices exist, so
+// on a 4-GPU host `--tp 4` is one rank per GPU and on a 1-GPU host it is 4 ranks sharing that GPU.
+// The second case is not a fallback papering over a problem: it is the identical sharded code path
+// with the host-staged collective instead of NCCL, and it is what makes tensor parallelism
+// verifiable on the single-GPU machines this project actually has. It buys no speed, and says so.
+std::vector<int> resolveTpDevices(const std::vector<std::string_view>& args, std::string& err) {
+  if (const std::string devs = flagValue(args, "--devices"); !devs.empty()) {
+    std::vector<int> out;
+    std::stringstream ss(devs);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+      if (tok.empty()) continue;
+      try {
+        out.push_back(std::stoi(tok));
+      } catch (const std::exception&) {
+        err = "--devices: '" + tok + "' is not a device index";
+        return {};
+      }
+    }
+    if (out.empty()) err = "--devices needs at least one index (e.g. --devices 0,1)";
+    return out;
+  }
+  const std::string tp = flagValue(args, "--tp");
+  if (tp.empty()) return {};
+  int world = 0;
+  try {
+    world = std::stoi(tp);
+  } catch (const std::exception&) {
+    err = "--tp: '" + tp + "' is not a number";
+    return {};
+  }
+  if (world < 1) {
+    err = "--tp must be >= 1";
+    return {};
+  }
+  const int have = qorvix::cuda::deviceCount();
+  if (have <= 0) {
+    err = "--tp needs a CUDA device (none present, or CUDA is not built in)";
+    return {};
+  }
+  std::vector<int> out(static_cast<std::size_t>(world));
+  for (int r = 0; r < world; ++r) out[r] = r % have;
+  return out;
+}
+
+// Says what the world actually is, because "--tp 4" on one GPU and on four GPUs are very different
+// runs and only one of them is faster. Silence would let a verification run read as a benchmark.
+void announceTp(const std::vector<int>& devices) {
+  if (devices.size() < 2) return;
+  std::vector<int> uniq = devices;
+  std::sort(uniq.begin(), uniq.end());
+  uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+  std::cout << "Tensor parallel: " << devices.size() << " ranks on device";
+  if (uniq.size() > 1) std::cout << "s";
+  std::cout << " ";
+  for (std::size_t i = 0; i < uniq.size(); ++i) std::cout << (i ? "," : "") << uniq[i];
+  if (uniq.size() < devices.size())
+    std::cout << " - ranks SHARE a device, so this verifies the sharded path, it does not speed it "
+                 "up";
+  std::cout << "\n";
+}
+
 // THE generation loop — backend-agnostic. Drives any IInferenceEngine through the seam
 // (openSession -> forward -> sample -> decode), so CPU/CUDA/Vulkan run byte-identical host code and
 // the only difference is which engine createEngine() handed back. Splits per-token wall time into
@@ -391,7 +457,8 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
   const std::vector<std::string> imagePaths = flagValues(args, "--image");
   if (path.empty() || prompt.empty()) {
     std::cerr << "usage: qorvix generate <file.gguf> --prompt \"...\" "
-                 "[--gpu|--vulkan] [--max N] [--temp T] [--top-k K] [--top-p P] [--seed S]\n"
+                 "[--gpu|--vulkan] [--tp N|--devices 0,1] [--max N] [--temp T] [--top-k K] "
+                 "[--top-p P] [--seed S]\n"
                  "       [--mmproj <clip.gguf> --image <file.png> ...]   (vision-language chat)\n";
     return 1;
   }
@@ -473,8 +540,17 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
     }
 
     const int maxSeq = mm.size() + cfg.maxNewTokens + 4;
+    // Tensor parallelism is a CUDA-only property of how the model is laid out, so it rides through
+    // the same factory as a device list rather than as a fourth Backend enumerator.
+    std::string tpErr;
+    const std::vector<int> tpDevices = resolveTpDevices(args, tpErr);
+    if (!tpErr.empty()) {
+      std::cerr << "error: " << tpErr << "\n";
+      return 1;
+    }
+    announceTp(tpDevices);
     auto engine = qorvix::createEngine(backend, std::move(file), static_cast<std::uint32_t>(maxSeq),
-                                       1, err);
+                                       1, err, tpDevices);
     if (!engine) {
       std::cerr << "error: " << qorvix::backendName(backend) << " engine: " << err << "\n";
       return 1;
@@ -1456,7 +1532,8 @@ int cmdServe(const std::vector<std::string_view>& args) {
   namespace api = qorvix::api;
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   if (path.empty()) {
-    std::cerr << "usage: qorvix serve <file.gguf> [--gpu|--vulkan|--auto] [--port N] "
+    std::cerr << "usage: qorvix serve <file.gguf> [--gpu|--vulkan|--auto] [--tp N|--devices 0,1] "
+                 "[--port N] "
                  "[--max-concurrent N] [--ctx N] [--embed-model <file.gguf>] [--max-batch N]\n"
                  "       [--mmproj <clip.gguf>]   (vision-language chat: image_url content parts)\n";
     return 1;
@@ -1500,8 +1577,15 @@ int cmdServe(const std::vector<std::string_view>& args) {
     chatTemplate = file.getString("tokenizer.chat_template").value_or("");
     // One KV slot per concurrent request (device engines size their cache to maxConcurrent). For
     // maxConcurrent applies to every backend now (CPU, CUDA, and multi-session Vulkan).
+    std::string tpErr;
+    const std::vector<int> tpDevices = resolveTpDevices(args, tpErr);
+    if (!tpErr.empty()) {
+      std::cerr << "error: " << tpErr << "\n";
+      return 1;
+    }
+    announceTp(tpDevices);
     engine = qorvix::createEngine(backend, std::move(file), static_cast<std::uint32_t>(ctx),
-                                  static_cast<std::uint32_t>(maxConcurrent), err);
+                                  static_cast<std::uint32_t>(maxConcurrent), err, tpDevices);
     if (!engine) {
       std::cerr << "error: " << qorvix::backendName(backend) << " engine: " << err << "\n";
       return 1;
@@ -1947,6 +2031,126 @@ int cmdGpuCheck(const std::string& path) {
   }
 }
 
+// The Phase 10b gate: does the TENSOR-PARALLEL forward agree with the unsharded GPU forward, on a
+// real model? `gpu-check` proves the GPU matches the CPU runtime; this proves sharding preserves
+// that, which is a different claim and the one all of Phase 10 rests on.
+//
+// It runs at a world size the host may have no GPUs for, because a rank is a (device, shard) pair
+// and several ranks may name the SAME device — see resolveTpDevices. That is deliberate: the
+// Vulkan bring-up showed that self-consistent self-tests miss real bugs and that comparing against
+// a reference on a REAL model is what catches them, so this gate had to be runnable on one GPU or
+// it would never run at all.
+//
+// The two models are built one at a time. Holding both would need the unsharded weights and a full
+// set of shards in VRAM at once, which is exactly the memory the sharding exists to avoid.
+//
+// Exactness: a tensor-parallel matmul reassociates the dot product, so the sharded logits equal the
+// unsharded ones only to within float rounding, never bit-for-bit. The gate is therefore relative
+// error plus argmax agreement — the same shape as gpu-check gating the GPU against the CPU.
+int cmdTpCheck(const std::vector<std::string_view>& args) {
+  namespace rt = qorvix::runtime;
+  namespace cu = qorvix::cuda;
+  const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
+  if (path.empty()) {
+    std::cerr << "usage: qorvix tp-check <file.gguf> [--tp N | --devices 0,1]\n";
+    return 1;
+  }
+  if (!cu::builtWithCuda()) {
+    std::cout << "CUDA not built in - rebuild with -DQORVIX_ENABLE_CUDA=ON (needs a GPU host).\n";
+    return 0;
+  }
+  if (cu::deviceCount() <= 0) {
+    std::cout << "No CUDA device present.\n";
+    return 0;
+  }
+
+  std::string err;
+  std::vector<int> devices = resolveTpDevices(args, err);
+  if (!err.empty()) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  if (devices.empty()) devices = {0, 0};  // default: a 2-rank world, wherever it fits
+  if (devices.size() < 2) {
+    std::cerr << "error: tp-check needs at least 2 ranks (--tp 2 or more); a 1-rank world is just "
+                 "gpu-check\n";
+    return 1;
+  }
+
+  try {
+    auto file = qorvix::gguf::GgufFile::open(path);
+    auto tok = qorvix::tokenizer::Tokenizer::fromGguf(file, err);
+    if (!tok) { std::cerr << "tokenizer: " << err << "\n"; return 1; }
+    const auto cfg = rt::configFromGguf(file, err);
+    if (!cfg.valid()) { std::cerr << "config: " << err << "\n"; return 1; }
+    auto weights = rt::loadWeights(file, cfg, err);
+    if (!weights) { std::cerr << "weights: " << err << "\n"; return 1; }
+
+    const int vocab = static_cast<int>(cfg.vocabSize);
+    const int maxSeq = 64;
+    const auto ids = tok->encode("The capital of France is", true);
+    const int steps = std::min<int>(static_cast<int>(ids.size()), maxSeq);
+
+    // The world size a GGUF permits is a property of its GQA head count, so report the cap rather
+    // than letting planTensorParallel fail with a message nobody asked for.
+    auto gc = qorvix::detail::makeConfig<cu::GpuModelConfig, cu::GpuWeight, cu::GpuLayer, int>(
+        cfg, maxSeq);
+    const int cap = cu::maxTensorParallelWorld(gc);
+    announceTp(devices);
+    std::cout << "Max tensor-parallel world for this model: " << cap << " (bounded by "
+              << gc.nKv << " KV heads)\n";
+    if (static_cast<int>(devices.size()) > cap) {
+      std::cerr << "error: this model cannot be sharded " << devices.size()
+                << " ways; the cap is " << cap << "\n";
+      return 1;
+    }
+
+    // --- reference: the unsharded GPU model, kept only long enough to record its logits ---------
+    std::vector<float> ref(static_cast<std::size_t>(steps) * vocab);
+    std::vector<int> refArgmax(steps);
+    {
+      std::cout << "Building the unsharded GPU model...\n";
+      auto gpu = qorvix::buildGpuModel(cfg, *weights, maxSeq, err);
+      if (!gpu) { std::cerr << "GPU model: " << err << "\n"; return 1; }
+      for (int pos = 0; pos < steps; ++pos) {
+        const auto& l = gpu->forward(ids[pos], pos);
+        std::copy(l.begin(), l.begin() + vocab, ref.begin() + static_cast<std::size_t>(pos) * vocab);
+        refArgmax[pos] = argmaxOf(l);
+      }
+    }  // freed here, so the shards get a clean device
+
+    std::cout << "Building the sharded model across " << devices.size() << " ranks...\n";
+    auto tp = qorvix::buildShardedGpuModel(cfg, *weights, maxSeq, devices, err);
+    if (!tp) { std::cerr << "sharded model: " << err << "\n"; return 1; }
+
+    float maxErr = 0.0f, maxRef = 1e-6f;
+    bool argmaxMatch = true;
+    for (int pos = 0; pos < steps; ++pos) {
+      const auto& tl = tp->forward(ids[pos], pos);
+      const float* rl = ref.data() + static_cast<std::size_t>(pos) * vocab;
+      for (int i = 0; i < vocab; ++i) {
+        maxErr = std::max(maxErr, std::fabs(rl[i] - tl[i]));
+        maxRef = std::max(maxRef, std::fabs(rl[i]));
+      }
+      if (refArgmax[pos] != argmaxOf(tl)) argmaxMatch = false;
+    }
+    const float relErr = maxErr / maxRef;
+    // Tighter than gpu-check's 5e-2: both sides ran the SAME kernels in the same precision here,
+    // so the only difference is the reassociation of the sums. A larger gap means a real bug (a
+    // shard offset, a head landing on the wrong rank), not accumulated float noise.
+    const bool pass = argmaxMatch && relErr < 1e-3f;
+    std::cout << "\nSharded vs unsharded logits over " << steps << " positions:\n"
+              << "  max abs err " << maxErr << ", rel err " << relErr << "\n"
+              << "  argmax agrees at every position: " << (argmaxMatch ? "yes" : "NO") << "\n"
+              << (pass ? "RESULT: PASS - tensor-parallel forward matches the unsharded GPU model.\n"
+                       : "RESULT: MISMATCH - see errors above.\n");
+    return pass ? 0 : 1;
+  } catch (const qorvix::gguf::GgufParseError& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+
 // Vulkan twin of gpu-check: builds the CPU model and the Vulkan model from the same GGUF, runs both
 // over a short prompt, and checks argmax parity. Works on any Vulkan device — including Mesa's
 // software device (lavapipe) — so it is meaningful without a discrete GPU.
@@ -2057,6 +2261,9 @@ int cmdGpu() {
   const auto tp = qorvix::cuda::tensorParallelSelfTest();
   std::cout << "Self-test (tensor-par):   " << (tp.passed ? "PASS" : (tp.ran ? "FAIL" : "skip"))
             << " - " << tp.message << "\n";
+  const auto coll = qorvix::cuda::collectiveSelfTest();
+  std::cout << "Self-test (collective):   " << (coll.passed ? "PASS" : (coll.ran ? "FAIL" : "skip"))
+            << " - " << coll.message << "\n";
 
   // Multi-GPU topology (Phase 10). With one device this reports a world size of 1, which is the
   // honest answer — tensor parallelism needs >= 2 devices to do anything, but the sharding math
@@ -2083,7 +2290,8 @@ int cmdGpu() {
 
   return (self.ran && !self.passed) || (gemm.ran && !gemm.passed) || (qmm.ran && !qmm.passed) ||
                  (q4k.ran && !q4k.passed) || (q6k.ran && !q6k.passed) || (ops.ran && !ops.passed) ||
-                 (attn.ran && !attn.passed) || (fwd.ran && !fwd.passed) || (tp.ran && !tp.passed)
+                 (attn.ran && !attn.passed) || (fwd.ran && !fwd.passed) ||
+                 (tp.ran && !tp.passed) || (coll.ran && !coll.passed)
              ? 1
              : 0;
 }
@@ -2278,7 +2486,14 @@ int cmdBench(const std::vector<std::string_view>& args) {
     auto file = qorvix::gguf::GgufFile::open(path);
     std::string err;
     const std::uint32_t maxSeq = static_cast<std::uint32_t>(bc.promptTokens + bc.genTokens + 4);
-    auto engine = qorvix::createEngine(backend, std::move(file), maxSeq, 1, err);
+    std::string tpErr;
+    const std::vector<int> tpDevices = resolveTpDevices(args, tpErr);
+    if (!tpErr.empty()) {
+      std::cerr << "error: " << tpErr << "\n";
+      return 1;
+    }
+    announceTp(tpDevices);
+    auto engine = qorvix::createEngine(backend, std::move(file), maxSeq, 1, err, tpDevices);
     if (!engine) {
       std::cerr << "error: " << qorvix::backendName(backend) << " engine: " << err << "\n";
       return 1;
@@ -2354,7 +2569,7 @@ int printUsage() {
             << "  list [dir]          List discovered models (default: models)\n"
             << "  gguf-info <file>    Parse a GGUF file and print its header, metadata, tensors\n"
             << "  model-info <file>   Derive and print the model config from a GGUF file\n"
-            << "  generate <file> --prompt \"...\" [--gpu|--vulkan|--auto]  Generate text\n"
+            << "  generate <file> --prompt \"...\" [--gpu|--vulkan|--auto] [--tp N]  Generate text\n"
             << "                      [--mmproj <clip.gguf> --image <f.png> ...]  chat about an\n"
             << "                      image; put <image> in the prompt to place it (cpu only)\n"
             << "  embed <file> --text \"...\"       Embed text with an encoder model (bert)\n"
@@ -2376,6 +2591,7 @@ int printUsage() {
             << "  vulkan              Show Vulkan devices and run compute-backend self-tests\n"
             << "  gpu-check <file>    Compare GPU vs CPU forward-pass logits for a GGUF model\n"
             << "  vulkan-check <file> Compare Vulkan vs CPU forward-pass logits for a GGUF model\n"
+            << "  tp-check <file> [--tp N]  Compare tensor-parallel vs unsharded GPU logits\n"
             << "  embed-check <file> [--ref F] [--min-cos C]   Gate embeddings against a\n"
             << "                      captured sentence-transformers reference\n"
             << "  vision-check <mmproj.gguf> --ref F [--image f.png]   Gate the CLIP tower\n"
@@ -2425,6 +2641,7 @@ int main(int argc, char** argv) {
   if (command == "cpuinfo") return cmdCpuInfo();
   if (command == "bench") return cmdBench(args);
   if (command == "gpu-check") return cmdGpuCheck(arg1);
+  if (command == "tp-check") return cmdTpCheck(args);
   if (command == "vulkan-check") return cmdVulkanCheck(arg1);
   if (command == "plugins") return cmdPlugins(arg1.empty() ? "plugins" : arg1);
 

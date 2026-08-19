@@ -2,11 +2,12 @@
 //
 // Deliberately free of any CUDA dependency so it compiles into BOTH the real backend and the CPU
 // stub: the split logic is where the bugs are, and it can be exercised on a machine with no GPU.
-// The device-side pieces (topology probing, the simulated multi-rank self-test) live in
-// cuda_backend.cu / cuda_backend_stub.cpp.
+// The device-side pieces (topology probing, the host-staged and NCCL collective groups, and the
+// self-tests that need a device) live in cuda_backend.cu / cuda_backend_stub.cpp.
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "qorvix/cuda/multi_gpu.hpp"
 
@@ -208,44 +209,116 @@ bool shardCols(const GpuWeight& w, const Slice& cols, WeightShard& out, std::str
   return true;
 }
 
-// ---- single-rank collective ------------------------------------------------------------------
+// ---- toolkit-free collective groups ------------------------------------------------------------
+//
+// Two of the four transports need no CUDA at all, so they live here with the sharding math and are
+// exercised by the unit tests in every build: the degenerate world=1 group, and a host-memory group
+// that pins down what "all-reduce" means before any device is involved. The device transports
+// (host-staged and NCCL) are in cuda_backend.cu / cuda_backend_stub.cpp.
 
 namespace {
+
 // world=1: every "partial" is already the total, so allReduceSum is a no-op. Real, not a
-// placeholder — it is the correct implementation of summing across one rank.
-class SingleRankCollective final : public ICollective {
+// placeholder — it is the correct implementation of summing across one rank, and it is what the
+// unsharded path uses.
+class SingleRankGroup final : public ICollectiveGroup {
  public:
+  explicit SingleRankGroup(int device) : device_(device) {}
   int worldSize() const override { return 1; }
-  int rank() const override { return 0; }
-  bool allReduceSum(float*, std::size_t) override { return true; }
+  int deviceOf(int) const override { return device_; }
+  void* stream(int) const override { return nullptr; }
+  bool allReduceSum(float* const*, std::size_t) override { return true; }
   bool barrier() override { return true; }
   std::string backendName() const override { return "single-rank"; }
+
+ private:
+  int device_ = 0;
 };
 
-class SimulatedMultiRankCollective final : public ICollective {
+// Host-memory group. The reference definition of the contract: sum the ranks elementwise, then
+// write the total back to EVERY rank — a reduce that left the answer only on rank 0 would pass a
+// naive test and then produce garbage on ranks 1..N-1 in the model, so the write-back is the part
+// worth pinning.
+class HostCollectiveGroup final : public ICollectiveGroup {
  public:
-  SimulatedMultiRankCollective(int worldSize, int rank) : worldSize_(worldSize), rank_(rank) {}
+  explicit HostCollectiveGroup(int worldSize) : worldSize_(worldSize) {}
   int worldSize() const override { return worldSize_; }
-  int rank() const override { return rank_; }
-  bool allReduceSum(float*, std::size_t) override { return true; }
+  int deviceOf(int) const override { return -1; }  // host memory, no device
+  void* stream(int) const override { return nullptr; }
+
+  bool allReduceSum(float* const* bufs, std::size_t n) override {
+    if (!bufs || n == 0) return false;
+    for (int r = 0; r < worldSize_; ++r)
+      if (!bufs[r]) return false;
+    acc_.assign(n, 0.0f);
+    for (int r = 0; r < worldSize_; ++r)
+      for (std::size_t i = 0; i < n; ++i) acc_[i] += bufs[r][i];
+    for (int r = 0; r < worldSize_; ++r)
+      std::memcpy(bufs[r], acc_.data(), n * sizeof(float));
+    return true;
+  }
+
   bool barrier() override { return true; }
-  std::string backendName() const override { return "simulated-multirank"; }
+  std::string backendName() const override { return "host"; }
+
  private:
   int worldSize_ = 1;
-  int rank_ = 0;
+  std::vector<float> acc_;  // reused across calls; the decode loop runs this twice per layer
 };
+
 }  // namespace
 
-std::unique_ptr<ICollective> makeSingleRankCollective() {
-  return std::make_unique<SingleRankCollective>();
+std::unique_ptr<ICollectiveGroup> makeSingleRankGroup(int device) {
+  return std::make_unique<SingleRankGroup>(device);
 }
 
-std::unique_ptr<ICollective> makeSimulatedCollective(int worldSize, int rank) {
-  return std::make_unique<SimulatedMultiRankCollective>(worldSize, rank);
+std::unique_ptr<ICollectiveGroup> makeHostCollectiveGroup(int worldSize) {
+  if (worldSize < 1) return nullptr;
+  if (worldSize == 1) return std::make_unique<SingleRankGroup>(-1);
+  return std::make_unique<HostCollectiveGroup>(worldSize);
+}
+
+// THE transport selection point. It lives here, in the CUDA-free file, so there is exactly ONE
+// policy shared by the real and the stub build rather than one per configuration — the same
+// reason the sharding math is here. Every caller asks for "a group over these ranks" and never
+// learns which transport it got except through backendName().
+std::unique_ptr<ICollectiveGroup> makeCollectiveGroup(const std::vector<int>& devices,
+                                                      std::string& err) {
+  const int world = static_cast<int>(devices.size());
+  if (world < 1) {
+    err = "makeCollectiveGroup: no devices given (need one device index per rank)";
+    return nullptr;
+  }
+  if (world == 1) return makeSingleRankGroup(devices[0]);
+
+  // NCCL cannot place two ranks on one device, and two ranks on one device is precisely the
+  // single-GPU verification configuration — so the distinctness check is a routing decision, not
+  // an error. A repeated index means "simulate this world on fewer GPUs", which host-staged does.
+  bool distinct = true;
+  for (int i = 0; i < world && distinct; ++i)
+    for (int j = i + 1; j < world; ++j)
+      if (devices[i] == devices[j]) { distinct = false; break; }
+
+  std::string why;
+  if (distinct) {
+    std::string nerr;
+    if (auto g = makeNcclCollectiveGroup(devices, nerr)) return g;
+    why = "NCCL unavailable (" + nerr + "); fell back to host staging: ";
+  }
+  std::string herr;
+  if (auto g = makeHostStagedDeviceGroup(devices, herr)) return g;
+  err = why + herr;
+  return nullptr;
 }
 
 #ifndef QORVIX_WITH_NCCL
 bool builtWithNccl() noexcept { return false; }
+
+std::unique_ptr<ICollectiveGroup> makeNcclCollectiveGroup(const std::vector<int>&,
+                                                          std::string& err) {
+  err = "NCCL not built in (rebuild with -DQORVIX_ENABLE_NCCL=ON on a host with the NCCL library)";
+  return nullptr;
+}
 #endif
 
 }  // namespace qorvix::cuda

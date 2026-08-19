@@ -8,6 +8,7 @@
 
 #include "qorvix/cuda/backend.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
+#include "qorvix/cuda/multi_gpu.hpp"
 #include "qorvix/embeddings/bert_model.hpp"
 #include "qorvix/embeddings/embedding_engine.hpp"
 #include "qorvix/gguf/gguf_file.hpp"
@@ -125,6 +126,38 @@ inline std::unique_ptr<cuda::GpuModel> buildGpuModel(const runtime::ModelConfig&
   return cuda::createGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, err, maxSessions);
 }
 
+// The tensor-parallel twin of buildGpuModel. Same GGUF bridge, same descriptors, same maxSeq — the
+// only difference is that the cuda module slices the weights across `devices` and returns a model
+// whose VRAM footprint per device is roughly 1/world of the whole. Deliberately NOT a separate
+// engine type: the result is a cuda::GpuModel, so GpuEngine and everything above it are untouched.
+inline std::unique_ptr<cuda::GpuModel> buildShardedGpuModel(const runtime::ModelConfig& cfg,
+                                                            const runtime::Weights& w, int maxSeq,
+                                                            const std::vector<int>& devices,
+                                                            std::string& err,
+                                                            int maxSessions = 1) {
+  namespace rt = qorvix::runtime;
+  const int d = static_cast<int>(cfg.embeddingLength), vocab = static_cast<int>(cfg.vocabSize);
+  std::vector<float> embF32(static_cast<std::size_t>(vocab) * d);
+  if (!rt::dequantize(w.tokenEmbd.type, w.tokenEmbd.quant, embF32.data(),
+                      static_cast<std::size_t>(vocab) * d)) {
+    err = "failed to dequantize token_embd";
+    return nullptr;
+  }
+  auto gc = detail::makeConfig<cuda::GpuModelConfig, cuda::GpuWeight, cuda::GpuLayer, int>(cfg, maxSeq);
+  cuda::GpuWeight output =
+      w.output.valid() ? detail::toGpuWeight(w.output) : detail::toGpuWeight(w.tokenEmbd);
+  std::vector<cuda::GpuLayer> gl(cfg.blockCount);
+  for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+    const auto& L = w.layers[l];
+    gl[l] = {L.attnNorm.data(), L.ffnNorm.data(), detail::toGpuWeight(L.wq),
+             detail::toGpuWeight(L.wk), detail::toGpuWeight(L.wv), detail::toGpuWeight(L.wo),
+             detail::toGpuWeight(L.ffnGate), detail::toGpuWeight(L.ffnUp),
+             detail::toGpuWeight(L.ffnDown)};
+  }
+  return cuda::createShardedGpuModel(gc, embF32.data(), w.outputNorm.data(), output, gl, devices,
+                                     err, maxSessions);
+}
+
 // The Vulkan twin of buildGpuModel — same bridge, cross-vendor backend.
 inline std::unique_ptr<vulkan::VulkanModel> buildVulkanModel(const runtime::ModelConfig& cfg,
                                                              const runtime::Weights& w, int maxSeq,
@@ -161,7 +194,8 @@ inline std::unique_ptr<vulkan::VulkanModel> buildVulkanModel(const runtime::Mode
 inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, gguf::GgufFile file,
                                                                std::uint32_t maxSeq,
                                                                std::uint32_t maxSessions,
-                                                               std::string& err) {
+                                                               std::string& err,
+                                                               const std::vector<int>& tpDevices = {}) {
   namespace rt = qorvix::runtime;
   if (!backendAvailable(backend)) {
     err = std::string(backendName(backend)) + " backend unavailable (not built in, or no device)";
@@ -191,6 +225,16 @@ inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, 
   if (!weights) return nullptr;
 
   if (backend == Backend::Cuda) {
+    // Tensor parallelism is a property of the MODEL, not of a different engine: when a device list
+    // is given the weights are sharded across it and the same GpuEngine drives the result, so no
+    // caller above this line learns that the world size changed.
+    if (tpDevices.size() > 1) {
+      auto gm = buildShardedGpuModel(cfg, *weights, static_cast<int>(maxSeq), tpDevices, err,
+                                     static_cast<int>(maxSessions));
+      if (!gm) return nullptr;
+      return std::make_unique<GpuEngine>(std::move(gm), cfg, maxSeq,
+                                         "cuda-tp" + std::to_string(tpDevices.size()));
+    }
     auto gm = buildGpuModel(cfg, *weights, static_cast<int>(maxSeq), err,
                             static_cast<int>(maxSessions));
     if (!gm) return nullptr;

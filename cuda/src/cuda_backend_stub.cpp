@@ -16,6 +16,13 @@ std::unique_ptr<GpuModel> createGpuModel(const GpuModelConfig&, const float*, co
   return nullptr;
 }
 
+std::unique_ptr<GpuModel> createShardedGpuModel(const GpuModelConfig&, const float*, const float*,
+                                                const GpuWeight&, const std::vector<GpuLayer>&,
+                                                const std::vector<int>&, std::string& error, int) {
+  error = "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)";
+  return nullptr;
+}
+
 bool builtWithCuda() noexcept { return false; }
 int deviceCount() { return 0; }
 std::vector<DeviceInfo> enumerateDevices() { return {}; }
@@ -48,6 +55,19 @@ SelfTestResult gpuForwardSelfTest() {
 }
 SelfTestResult tensorParallelSelfTest() {
   return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
+}
+
+SelfTestResult collectiveSelfTest() {
+  return {false, false, "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)"};
+}
+
+// No device memory to stage between, so the device transports are unavailable here. The
+// host-memory group (makeHostCollectiveGroup) IS available in this build — it needs no toolkit,
+// which is what lets the collective contract be unit-tested with no GPU at all.
+std::unique_ptr<ICollectiveGroup> makeHostStagedDeviceGroup(const std::vector<int>&,
+                                                            std::string& err) {
+  err = "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)";
+  return nullptr;
 }
 
 // No devices to probe. The sharding math itself (planTensorParallel / shardRows / shardCols in

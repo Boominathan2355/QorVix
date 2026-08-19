@@ -169,32 +169,103 @@ bool shardCols(const GpuWeight& w, const Slice& cols, WeightShard& out, std::str
 // ---- collectives ---------------------------------------------------------------------------
 
 // The communication seam tensor parallelism needs. A row-parallel matmul leaves each rank with a
-// partial sum; allReduceSum turns the ranks' partials into the true result on every rank. That is
-// the ONLY collective a tensor-parallel decode step requires (twice per layer: after the
+// partial sum; the all-reduce turns the ranks' partials into the true result on every rank. That
+// is the ONLY collective a tensor-parallel decode step requires (twice per layer: after the
 // o-projection and after the FFN down-projection).
 //
-// Implementations: a single-rank no-op (today's path), a local simulator that sums ranks'
-// buffers on one device (the verification vehicle — see tensorParallelSelfTest), and NCCL.
-class ICollective {
+// WHY THE SEAM IS GROUP-SCOPED AND NOT ONE OBJECT PER RANK (revised in Part b, when the transport
+// was actually built): Qorvix is single-process by design, so the natural driver is ONE host
+// thread that launches every rank's kernels on that rank's own stream. The launches are
+// asynchronous, so the ranks still execute concurrently on their devices — the only place they
+// synchronize is the all-reduce itself. With a per-rank `allReduceSum(buf)`, rank 0's call would
+// have to block until rank 1 had been driven, which a single thread cannot do without deadlocking;
+// NCCL's own answer to exactly this is ncclGroupStart/ncclGroupEnd, i.e. reducing at GROUP
+// granularity. Putting the group in the type instead of in a comment makes the deadlock
+// unrepresentable, and every implementation below maps onto it directly.
+class ICollectiveGroup {
  public:
-  virtual ~ICollective() = default;
+  virtual ~ICollectiveGroup() = default;
+
   virtual int worldSize() const = 0;
-  virtual int rank() const = 0;
-  // Sums `n` floats across all ranks in place, leaving the total on every rank.
-  virtual bool allReduceSum(float* buf, std::size_t n) = 0;
+  // CUDA device rank `r` runs on. -1 for the host-memory group (tests / CPU-only builds).
+  // Ranks MAY share a device — that is how the sharded model is verified on a single GPU.
+  virtual int deviceOf(int rank) const = 0;
+  // The stream rank `r`'s kernels must be launched on, as a cudaStream_t (void* so this header
+  // stays toolkit-free). The all-reduce is enqueued on these same streams, so ordering against
+  // the rank's own kernels is automatic and no explicit sync is needed mid-layer. nullptr means
+  // "no stream" (host group, or the degenerate world=1 group) — use the default stream.
+  virtual void* stream(int rank) const = 0;
+
+  // Sums `n` floats elementwise across all ranks. `bufs[r]` is rank r's buffer, in the memory
+  // that rank lives in (device memory on deviceOf(r), or host memory when deviceOf is -1). On
+  // success EVERY buffer holds the total. Taking all ranks at once is what makes the single-thread
+  // driver safe: there is no half-completed state a caller could read.
+  virtual bool allReduceSum(float* const* bufs, std::size_t n) = 0;
+
+  // Waits until every rank's queued work has completed.
   virtual bool barrier() = 0;
   virtual std::string backendName() const = 0;
 };
 
-// world=1 no-op: allReduceSum leaves the buffer untouched (the sum of one partial IS the total).
-// Always available, including in CPU-only builds.
-std::unique_ptr<ICollective> makeSingleRankCollective();
+// world=1: the single partial IS the total, so allReduceSum is a no-op. Not a placeholder — it is
+// the correct reduction over one rank, and it is what the unsharded path uses. Always available.
+std::unique_ptr<ICollectiveGroup> makeSingleRankGroup(int device = 0);
 
-// Simulated multi-rank collective for multi-rank testing without hardware.
-std::unique_ptr<ICollective> makeSimulatedCollective(int worldSize, int rank);
+// Host-memory group: `bufs` point at ordinary host allocations and the sum is done on the CPU.
+// CUDA-free (it lives in tensor_parallel.cpp), so the seam's contract is unit-testable in a build
+// with no toolkit at all — which is the same reason the sharding math lives there.
+std::unique_ptr<ICollectiveGroup> makeHostCollectiveGroup(int worldSize);
+
+// Device group staging through host memory: copies each rank's buffer D2H, sums on the host, and
+// copies the total back to every rank. Two jobs, both real: it is the correct fallback when the
+// devices have no P2P path between them (see PeerLink::None), and — because it does not care
+// whether two ranks name the same device — it is what lets the sharded model run N ranks on ONE
+// GPU, which is how tensor parallelism gets execution-verified without multi-GPU hardware.
+// `devices` gives one device index per rank and may repeat. Null with `err` set on failure.
+std::unique_ptr<ICollectiveGroup> makeHostStagedDeviceGroup(const std::vector<int>& devices,
+                                                            std::string& err);
+
+// NCCL group: one rank per device in a single process (ncclCommInitAll — no MPI, no network
+// bootstrap). The fast path, and the only one that uses NVLink/PCIe P2P bandwidth. Requires
+// DISTINCT device indices (NCCL rejects two ranks on one device) and a build with NCCL. Null with
+// `err` set otherwise.
+std::unique_ptr<ICollectiveGroup> makeNcclCollectiveGroup(const std::vector<int>& devices,
+                                                          std::string& err);
+
+// THE selection point — one place decides which transport a rank set gets, so no call site ever
+// branches on it: NCCL when it is built in and the devices are distinct, otherwise the host-staged
+// device group, and the world=1 no-op for a single rank. `err` is set only when nothing works.
+std::unique_ptr<ICollectiveGroup> makeCollectiveGroup(const std::vector<int>& devices,
+                                                      std::string& err);
 
 // True iff this binary was built against NCCL.
 bool builtWithNccl() noexcept;
+
+// ---- sharded model -------------------------------------------------------------------------
+
+// Builds a TENSOR-PARALLEL GpuModel: the plan of Part a, actually executed.
+//
+// The return type is the plain GpuModel interface, which is the whole point — GpuEngine, the
+// scheduler, `serve` and every HTTP path already drive that seam, so multi-GPU arrives without a
+// single line changing above this call. There is no "multi-GPU code path" in the runtime; there is
+// one model interface with two implementations behind it.
+//
+// `devices` gives one CUDA device index per rank, so its size IS the world size. REPEATING an
+// index is legal and deliberate: it places several ranks on one GPU (via the host-staged
+// collective, which NCCL cannot do) and runs the identical sharded code, which is how the sharded
+// path is execution-verified on a machine with a single GPU. On distinct devices with NCCL built
+// in, the same call is the real thing.
+//
+// The weights are the UNSHARDED model, exactly as createGpuModel takes them; this function does
+// the slicing, so callers never build per-rank weight lists. Fails with `error` set when the
+// config cannot be sharded at this world size (see planTensorParallel / maxTensorParallelWorld),
+// when a device is missing, or when a rank runs out of VRAM.
+std::unique_ptr<GpuModel> createShardedGpuModel(const GpuModelConfig& cfg,
+                                                const float* tokenEmbdF32, const float* outputNorm,
+                                                const GpuWeight& output,
+                                                const std::vector<GpuLayer>& layers,
+                                                const std::vector<int>& devices, std::string& error,
+                                                int maxSessions = 1);
 
 // ---- self-tests ----------------------------------------------------------------------------
 
@@ -204,5 +275,12 @@ bool builtWithNccl() noexcept;
 // split axes, the GQA head grouping, or the block alignment are wrong — which is what would
 // actually break on real multi-GPU. Covers N = 2 and 4.
 SelfTestResult tensorParallelSelfTest();
+
+// Verifies the collective TRANSPORT rather than the sharding math: gives each rank a buffer whose
+// contents make the expected sum knowable in closed form, all-reduces, and checks every rank's
+// buffer — the contract being that the total lands on all of them, not just one. Runs whichever
+// transport makeCollectiveGroup() selected, so on a multi-GPU host with NCCL built in this is the
+// NCCL path being exercised, and on a single GPU it is the host-staged one.
+SelfTestResult collectiveSelfTest();
 
 }  // namespace qorvix::cuda

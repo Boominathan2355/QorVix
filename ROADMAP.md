@@ -312,9 +312,76 @@ and *moving bytes between devices* (NCCL). Splitting them means the first is ver
   only to within float rounding (~1e-7 relative here), not bit-identical. Column-parallel row
   splits, being a pure partition, remain bit-exact.
 
-**Remaining:** Part b — NCCL transport behind `ICollective` (compile-gated like the CUDA stub/real
-split; needs ≥2 GPUs to execution-verify) and a sharded `GpuModel` that runs the plan. Part c —
-pipeline parallelism, expert parallelism, load balancing.
+**Part b 🚧 — the transport, and a sharded `GpuModel` that actually runs the plan.**
+
+*b-1, collectives.* Part a shipped an `ICollective` seam whose `makeSimulatedCollective()`
+`allReduceSum` was **a no-op** — it called itself the verification vehicle and summed nothing (the
+Part-a self-test added the partials inline, so the seam itself was never once exercised). Part b
+replaced it with one that has three real implementations and no test doubles.
+- **The seam is group-scoped now** (`ICollectiveGroup::allReduceSum(float* const* bufs, n)`), not
+  per-rank. Qorvix is single-process by design, so the driver is ONE host thread launching each
+  rank’s kernels on that rank’s stream — the launches are asynchronous, so the ranks still execute
+  concurrently and the all-reduce is the only place they meet. A per-rank `allReduceSum(buf)` would
+  make rank 0 block for a rank the thread has not driven yet; NCCL’s own answer to that is
+  `ncclGroupStart/ncclGroupEnd`, i.e. reducing at GROUP granularity. Taking every rank’s buffer at
+  once puts that fact in the type instead of a comment, and makes the deadlock unrepresentable.
+- **Three transports behind one selection point** (`makeCollectiveGroup`): the world=1 no-op;
+  **host-staged** (D2H each rank, sum on the CPU, H2D the total back); and **NCCL**
+  (`ncclCommInitAll`, single process, one rank per device), compile-gated by `QORVIX_ENABLE_NCCL`
+  → `QORVIX_WITH_NCCL` exactly like the CUDA stub/real split. Host-staged is not a mock: it is the
+  correct path when `cudaDeviceCanAccessPeer` reports no P2P route between two devices.
+- And it is the answer to *how do you verify multi-GPU without multi-GPU*: host-staged does not care
+  whether two ranks name the SAME device (NCCL rejects that outright), so **a rank is a
+  (device, shard) pair and TP=4 runs on a single T4** — real shards, real per-rank KV caches, real
+  all-reduces. Only bandwidth is missing, not coverage.
+- `collectiveSelfTest()` (surfaced in `qorvix gpu`) checks the transport against a closed-form
+  expected sum and inspects **every** rank’s buffer, because “the total lands on all of them” is the
+  half of the contract a model would otherwise discover as garbage on ranks 1..N-1.
+
+*b-2, the sharded model.* `createShardedGpuModel()` returns a plain `GpuModel`, so `GpuEngine`, the
+scheduler, `serve` and the entire HTTP layer drive tensor parallelism with **zero** changes above the
+seam. There is no “multi-GPU code path”; there is one model interface with two implementations.
+- Per rank: wq/wk/wv and ffnGate/ffnUp sharded by rows, wo/ffnDown by columns, its own KV cache
+  sized to its KV heads, scratch at its local dimensions. Norms are replicated — recomputing an
+  RMSNorm on every rank is far cheaper than the collective a broadcast would cost.
+- **Two all-reduces per layer** (after the o-projection, after the FFN down-projection), plus one
+  for the embedding.
+- The **embedding table is column-sharded, not replicated**: rank r fills only its columns of a
+  zeroed x, and an all-reduce over disjoint contributions IS the concatenation (bit-exact, and it
+  reuses the one collective already there). Replicating it would have cost 262 MB of F32 per rank on
+  TinyLlama — more than a Q4_K_M copy of the entire model — so tensor parallelism would have saved
+  no memory at all.
+- The **LM head is column-parallel and needs no collective**: the logits are host-bound anyway, so
+  each rank’s device-to-host copy lands at its own offset and the gather is free. `allReduceSum`
+  therefore remains the ONLY collective in the whole model, which is what keeps the transport seam
+  small enough to have three honest implementations.
+- RoPE, the KV store and attention are entirely local: a rank never reads a peer’s KV. RoPE’s angle
+  depends only on the position and the offset *within* a head, so rotating a rank’s own head range
+  needs no global head index.
+
+*b-3, the gate.* `qorvix tp-check <gguf> --tp N` compares the sharded logits against the
+**unsharded GPU** logits on the same real model. The Vulkan bring-up established that
+self-consistent self-tests miss real bugs and that only an argmax-vs-reference comparison on a real
+model catches them, so that is the shape this takes. It gates on argmax parity plus relative error
+< 1e-3 — tighter than `gpu-check`’s 5e-2, because both sides run the identical kernels here and the
+only difference is the reassociation of the sums, so a larger gap is a bug rather than float noise.
+The two models are built one at a time (holding both would need exactly the VRAM the sharding
+exists to avoid). `--tp N` / `--devices a,b,c` also reach `generate`, `serve` and `bench`, and
+announce when ranks share a device so a verification run cannot be misread as a benchmark.
+`scripts/colab_tp_check.sh` runs the gate at TP=2 and TP=4 on one T4, including the expected
+**refusal** at TP=8 (TinyLlama’s 4 KV heads cap it).
+
+**Status:** both configurations build clean and the suite is green in each — CUDA 12.6 + NCCL 2.22
+(242 cases / 5745 assertions) and the CPU-only stub (242 / 5752); the `[tp]` tag is 17 cases /
+~2520 assertions, up from Part a’s 12. The collective contract is pinned in the CPU-only build
+because the host-memory group is toolkit-free, exactly like the sharding math.
+
+**Not yet executed on real hardware.** `scripts/colab_tp_check.sh` is the T4 gate and has not been
+run, so the sharded forward pass is compile-verified only — the same state Part a was in before
+`tensorParallelSelfTest` ran on a device. NCCL’s own transport and NVLink/PCIe P2P behaviour need
+≥2 GPUs and stay untested until then.
+
+**Remaining:** Part c — pipeline parallelism, expert parallelism, load balancing.
 
 ## Phase 11 — Multimodal Expansion
 
@@ -543,10 +610,10 @@ GPU-free on lavapipe, rel err 2.6e-06) — **and correct text embeddings behind 
 (bge-small F16 matches sentence-transformers at cosine 1.00000). Test suite green; the CPU-only,
 CUDA, and Vulkan builds all compile and link.
 
-**Four correctness gates, one per numerical path**, all CLI rather than CTest because each needs a
+**Five correctness gates, one per numerical path**, all CLI rather than CTest because each needs a
 GGUF the test image does not have: `gpu-check` (CUDA vs CPU logits), `vulkan-check` (Vulkan vs CPU
-logits), `embed-check` (embeddings vs a sentence-transformers reference), and `vision-check`
-(CLIP features vs a transformers reference).
+logits), `tp-check` (tensor-parallel vs unsharded GPU logits), `embed-check` (embeddings vs a
+sentence-transformers reference), and `vision-check` (CLIP features vs a transformers reference).
 
 - **Unified backend ✅** — one `IInferenceEngine` seam, three implementations (CPU/CUDA/Vulkan), one
   `createEngine` factory, one generation loop. `generate` and `serve` reach any backend via
@@ -560,7 +627,10 @@ logits), `embed-check` (embeddings vs a sentence-transformers reference), and `v
 - **Vulkan path ✅ correct, 🚧 fast** — full forward verified on lavapipe; single-session and
   correctness-first (throughput pass — device-local buffers, command-buffer reuse, subgroups — is
   future work).
-- **Multi-GPU 🚧** — tensor-parallel sharding math verified without hardware (Phase 10a); NCCL to come.
+- **Multi-GPU 🚧** — sharding math verified without hardware (10a); the collective transport
+  (host-staged + NCCL, compile-gated) and a sharded `GpuModel` behind the same `GpuModel` interface
+  (10b) compile but have not yet run on a device. Because a rank is a (device, shard) pair, ranks may
+  share one GPU — so `qorvix tp-check --tp 4` executes the real TP path on a single T4.
 - **Plugins ✅** — `IPlugin` + `PluginRegistry` (hot-load/unload), example plugin, `qorvix plugins`
   (Phase 1, tested). `plugins/` is real, not a placeholder.
 - **Measurement ✅** — `qorvix bench` (backend-agnostic, median-of-runs, JSON), BENCHMARKS.md as the

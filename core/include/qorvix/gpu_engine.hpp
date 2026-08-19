@@ -21,8 +21,12 @@ namespace qorvix {
 
 class GpuEngine final : public runtime::IInferenceEngine {
  public:
-  GpuEngine(std::unique_ptr<cuda::GpuModel> model, runtime::ModelConfig cfg, std::uint32_t maxSeq)
-      : model_(std::move(model)), cfg_(std::move(cfg)), maxSeq_(maxSeq) {}
+  // `name` is what backendName() reports. It exists so a tensor-parallel model can say so in the
+  // logs ("cuda-tp4") without the engine growing a second implementation — the parallelism lives
+  // entirely inside the GpuModel, and the name is the only part of it the seam can observe.
+  GpuEngine(std::unique_ptr<cuda::GpuModel> model, runtime::ModelConfig cfg, std::uint32_t maxSeq,
+            std::string name = "cuda")
+      : model_(std::move(model)), cfg_(std::move(cfg)), maxSeq_(maxSeq), name_(std::move(name)) {}
 
   // SessionId 0 is memory::kInvalidSession (the "no session" sentinel), but GPU session 0 is a
   // perfectly valid slot — so the two spaces are offset by one rather than passed through.
@@ -44,7 +48,7 @@ class GpuEngine final : public runtime::IInferenceEngine {
 
   std::uint32_t maxSeqLen() const override { return maxSeq_; }
   const runtime::ModelConfig& config() const override { return cfg_; }
-  std::string backendName() const override { return "cuda"; }
+  std::string backendName() const override { return name_; }
 
  private:
   static int toGpu(memory::SessionId s) { return static_cast<int>(s) - 1; }
@@ -52,6 +56,7 @@ class GpuEngine final : public runtime::IInferenceEngine {
   std::unique_ptr<cuda::GpuModel> model_;
   runtime::ModelConfig cfg_;
   std::uint32_t maxSeq_ = 0;
+  std::string name_ = "cuda";
 };
 
 }  // namespace qorvix

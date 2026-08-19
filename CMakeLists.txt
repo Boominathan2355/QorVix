@@ -11,6 +11,10 @@ endif()
 
 option(QORVIX_ENABLE_CUDA "Build the CUDA backend (requires CUDA 12+ toolkit)" OFF)
 option(QORVIX_ENABLE_VULKAN "Build the Vulkan compute backend (runs on any vendor; needs the Vulkan loader + glslang)" OFF)
+# NCCL is the fast multi-GPU collective transport. Optional even inside a CUDA build: without it
+# the host-staged transport still works (correctly, just slower), so this changes throughput on
+# multi-GPU hosts, never whether tensor parallelism runs. Needs QORVIX_ENABLE_CUDA.
+option(QORVIX_ENABLE_NCCL "Build the NCCL collective transport for multi-GPU (requires CUDA + NCCL)" OFF)
 option(QORVIX_BUILD_TESTS "Build unit tests" ON)
 
 if(QORVIX_ENABLE_CUDA)
@@ -24,6 +28,13 @@ if(QORVIX_ENABLE_CUDA)
     message(WARNING "QORVIX_ENABLE_CUDA is ON but no CUDA compiler was found; building without CUDA.")
     set(QORVIX_ENABLE_CUDA OFF)
   endif()
+endif()
+
+# NCCL lives inside the CUDA build (it needs cudaStream_t and a device per rank), so asking for it
+# without CUDA is a configuration mistake worth saying out loud rather than silently ignoring.
+if(QORVIX_ENABLE_NCCL AND NOT QORVIX_ENABLE_CUDA)
+  message(WARNING "QORVIX_ENABLE_NCCL needs QORVIX_ENABLE_CUDA; turning it off.")
+  set(QORVIX_ENABLE_NCCL OFF)
 endif()
 
 add_subdirectory(gguf)
