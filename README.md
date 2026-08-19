@@ -6,20 +6,6 @@ vision, audio, image generation, embeddings, RAG, and multi-agent workflows from
 - Mission and full requirements: [docs/SPEC.md](docs/SPEC.md)
 - Build plan and current status: [ROADMAP.md](ROADMAP.md)
 
-**Status:** Phase 4 code-complete — runtime skeleton (plugin framework, model discovery/watcher,
-CLI), full GGUF v1/v2/v3 parser (`qorvix gguf-info`), unified memory manager (paged tiered
-allocation, refcounted registry, LRU offload eviction), and a CUDA backend (`qorvix gpu`: device
-management, GpuVram memory tier, scale-kernel + cuBLAS GEMM self-tests). The CUDA path builds as a
-CPU stub by default; the nvcc build is being compile-checked in Docker and is not yet run on a
-GPU.
-
-Phase 5 (text runtime) runs end-to-end on CPU: transformer ops, GGUF dequantization (Q4_0…Q6_K),
-model-config extraction, weight loader, Llama-style forward pass (GQA + KV cache), SPM/BPE
-tokenizer, sampling (temperature/top-k/top-p/min-p + penalties), and a streaming generation loop.
-`qorvix generate <file.gguf> --prompt "..."` loads a GGUF and streams text — **validated on
-TinyLlama 1.1B** ("The capital of France is" → "the city of Paris, which is a"). The CPU forward
-pass is a correctness reference (~13 s/token, unoptimized); GPU acceleration of this same path is
-Phase 6/8.
 
 ## License
 
