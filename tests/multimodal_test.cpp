@@ -11,6 +11,7 @@
 #include "qorvix/tokenizer/tokenizer.hpp"
 
 using namespace qorvix::runtime;
+using qorvix::memory::SessionId;  // qorvix::memory is not pulled in by the runtime using-directive
 using qorvix::tokenizer::SpecialTokens;
 using qorvix::tokenizer::Tokenizer;
 using qorvix::tokenizer::TokenizerModel;
@@ -138,10 +139,10 @@ TEST_CASE("an engine that does not accept input embeddings refuses loudly", "[mu
   // The default seam implementation. A silent zero vector here would generate fluent text about
   // an image the decoder never received, which is precisely the failure worth being loud about.
   struct TextOnly final : IInferenceEngine {
-    memory::SessionId openSession() override { return 1; }
-    void closeSession(memory::SessionId) override {}
-    void resetSession(memory::SessionId) override {}
-    const std::vector<float>& forward(memory::SessionId, int, int) override { return buf_; }
+    SessionId openSession() override { return 1; }
+    void closeSession(SessionId) override {}
+    void resetSession(SessionId) override {}
+    const std::vector<float>& forward(SessionId, int, int) override { return buf_; }
     std::uint32_t maxSeqLen() const override { return 8; }
     const ModelConfig& config() const override { return cfg_; }
     std::string backendName() const override { return "text-only"; }
@@ -297,10 +298,10 @@ TEST_CASE("scheduler prefills an image request through the embedding seam", "[mu
 TEST_CASE("scheduler refuses images on an engine that cannot take embeddings", "[multimodal]") {
   using namespace qorvix::scheduler;
   struct TextOnly final : IInferenceEngine {
-    memory::SessionId openSession() override { return 1; }
-    void closeSession(memory::SessionId) override {}
-    void resetSession(memory::SessionId) override {}
-    const std::vector<float>& forward(memory::SessionId, int, int) override { return buf_; }
+    SessionId openSession() override { return 1; }
+    void closeSession(SessionId) override {}
+    void resetSession(SessionId) override {}
+    const std::vector<float>& forward(SessionId, int, int) override { return buf_; }
     std::uint32_t maxSeqLen() const override { return 8; }
     const ModelConfig& config() const override { return cfg_; }
     std::string backendName() const override { return "device"; }
