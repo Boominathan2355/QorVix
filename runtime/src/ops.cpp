@@ -55,6 +55,31 @@ void matmul(float* out, const float* weight, const float* x, int rows, int cols)
   }
 }
 
+void matmulN(float* out, const float* weight, const float* X, int nVec, int rows, int cols) {
+  if (nVec <= 0) return;
+  // Parallel over rows, exactly like matmul, so the weight row a thread is streaming stays in its
+  // cache across every vector. The inner dot is character-for-character the one above — that is
+  // what makes this bit-identical rather than merely equivalent.
+#pragma omp parallel for schedule(static)
+  for (int r = 0; r < rows; ++r) {
+    const float* row = weight + static_cast<std::size_t>(r) * cols;
+    for (int v = 0; v < nVec; ++v) {
+      const float* x = X + static_cast<std::size_t>(v) * cols;
+      float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+      int c = 0;
+      for (; c + 4 <= cols; c += 4) {
+        a0 += row[c] * x[c];
+        a1 += row[c + 1] * x[c + 1];
+        a2 += row[c + 2] * x[c + 2];
+        a3 += row[c + 3] * x[c + 3];
+      }
+      float acc = a0 + a1 + a2 + a3;
+      for (; c < cols; ++c) acc += row[c] * x[c];
+      out[static_cast<std::size_t>(v) * rows + r] = acc;
+    }
+  }
+}
+
 void softmax(float* x, int n) {
   if (n <= 0) return;
   float maxV = x[0];

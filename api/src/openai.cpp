@@ -421,9 +421,25 @@ bool decodeDataUrl(std::string_view url, std::vector<std::uint8_t>& out, std::st
   return true;
 }
 
-std::string embeddingsBase64(const std::vector<float>& v) {
+std::string encodeBase64(const std::uint8_t* data, std::size_t size) {
   static const char* kAlphabet =
       "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((size + 2) / 3) * 4);
+  for (std::size_t i = 0; i < size; i += 3) {
+    const std::uint32_t b0 = data[i];
+    const std::uint32_t b1 = i + 1 < size ? data[i + 1] : 0;
+    const std::uint32_t b2 = i + 2 < size ? data[i + 2] : 0;
+    const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
+    out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
+    out.push_back(i + 1 < size ? kAlphabet[(triple >> 6) & 0x3F] : '=');
+    out.push_back(i + 2 < size ? kAlphabet[triple & 0x3F] : '=');
+  }
+  return out;
+}
+
+std::string embeddingsBase64(const std::vector<float>& v) {
   // OpenAI's base64 form is the raw little-endian float32 buffer. Serialize explicitly rather
   // than memcpy'ing the vector, so the output is byte-identical on a big-endian host.
   std::string raw;
@@ -436,19 +452,92 @@ std::string embeddingsBase64(const std::vector<float>& v) {
     raw.push_back(static_cast<char>((bits >> 16) & 0xFF));
     raw.push_back(static_cast<char>((bits >> 24) & 0xFF));
   }
+  return encodeBase64(reinterpret_cast<const std::uint8_t*>(raw.data()), raw.size());
+}
 
-  std::string out;
-  out.reserve(((raw.size() + 2) / 3) * 4);
-  for (std::size_t i = 0; i < raw.size(); i += 3) {
-    const std::uint32_t b0 = static_cast<unsigned char>(raw[i]);
-    const std::uint32_t b1 = i + 1 < raw.size() ? static_cast<unsigned char>(raw[i + 1]) : 0;
-    const std::uint32_t b2 = i + 2 < raw.size() ? static_cast<unsigned char>(raw[i + 2]) : 0;
-    const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
-    out.push_back(kAlphabet[(triple >> 18) & 0x3F]);
-    out.push_back(kAlphabet[(triple >> 12) & 0x3F]);
-    out.push_back(i + 1 < raw.size() ? kAlphabet[(triple >> 6) & 0x3F] : '=');
-    out.push_back(i + 2 < raw.size() ? kAlphabet[triple & 0x3F] : '=');
+ImagesRequest parseImagesRequest(const json::Value& body, std::string& error) {
+  ImagesRequest req;
+  if (!body.isObject()) {
+    error = "request body must be a JSON object";
+    return req;
   }
+  const auto* prompt = body.get("prompt");
+  if (!prompt || !prompt->isString() || prompt->asString().empty()) {
+    error = "'prompt' is required and must be a non-empty string";
+    return req;
+  }
+  req.prompt = prompt->asString();
+  if (const auto* v = body.get("model")) req.model = v->asString();
+  if (const auto* v = body.get("negative_prompt")) req.negativePrompt = v->asString();
+  if (const auto* v = body.get("n")) {
+    req.n = v->asInt(1);
+    if (req.n < 1) {
+      error = "'n' must be at least 1";
+      return req;
+    }
+  }
+  if (const auto* v = body.get("response_format")) {
+    const std::string fmt = v->asString();
+    if (fmt == "url") {
+      // Refused rather than faked. A URL means this process serves the bytes from somewhere it
+      // owns for some length of time — an object store and an expiry policy — and answering with
+      // a data: URI under the name "url" would be a different contract wearing the same label.
+      error = "'response_format' \"url\" is not supported — this server returns the image inline; "
+              "use \"b64_json\"";
+      return req;
+    }
+    if (fmt != "b64_json") {
+      error = "'response_format' must be \"b64_json\"";
+      return req;
+    }
+    req.responseFormat = fmt;
+  }
+  if (const auto* v = body.get("size")) {
+    const std::string size = v->asString();
+    // "auto" is OpenAI's "you decide", which here means the size the checkpoint was trained at.
+    if (size != "auto" && !size.empty()) {
+      const std::size_t x = size.find('x');
+      if (x == std::string::npos) {
+        error = "'size' must be \"WxH\" (e.g. \"512x512\") or \"auto\"";
+        return req;
+      }
+      try {
+        req.width = std::stoi(size.substr(0, x));
+        req.height = std::stoi(size.substr(x + 1));
+      } catch (const std::exception&) {
+        error = "'size' must be \"WxH\" (e.g. \"512x512\") or \"auto\"";
+        return req;
+      }
+      if (req.width <= 0 || req.height <= 0) {
+        error = "'size' must have positive dimensions";
+        return req;
+      }
+    }
+  }
+  if (const auto* v = body.get("steps")) req.steps = v->asInt(0);
+  if (const auto* v = body.get("guidance_scale")) {
+    req.guidance = static_cast<float>(v->asNumber(-1.0));
+  }
+  if (const auto* v = body.get("clip_skip")) req.clipSkip = v->asInt(0);
+  if (const auto* v = body.get("sampler")) req.sampler = v->asString();
+  if (const auto* v = body.get("seed")) {
+    req.seed = static_cast<unsigned long long>(v->asNumber(0.0));
+    req.hasSeed = true;
+  }
+  req.valid = true;
+  return req;
+}
+
+json::Value imagesResponse(const std::vector<std::string>& images, long long created) {
+  json::Value out = json::Value::object();
+  out["created"] = json::Value(static_cast<double>(created));
+  json::Value data = json::Value::array();
+  for (const auto& b64 : images) {
+    json::Value entry = json::Value::object();
+    entry["b64_json"] = json::Value(b64);
+    data.push(entry);
+  }
+  out["data"] = data;
   return out;
 }
 

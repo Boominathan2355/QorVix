@@ -35,6 +35,8 @@
 #include "qorvix/audio/mel.hpp"
 #include "qorvix/audio/whisper_check.hpp"
 #include "qorvix/audio/whisper_model.hpp"
+#include "qorvix/image/diffusion.hpp"
+#include "qorvix/image/sd_check.hpp"
 #include "qorvix/vision/clip_model.hpp"
 #include "qorvix/vision/image.hpp"
 #include "qorvix/vision/vision_check.hpp"
@@ -1966,6 +1968,401 @@ int cmdVlmCheck(const std::vector<std::string_view>& args) {
   }
 }
 
+// ---- image generation: text -> latent diffusion -> png --------------------------------------
+namespace {
+
+// "512x384" or "512". Returns false on anything else rather than silently generating at the
+// model's default size, which would answer a mistyped flag with a picture.
+bool parseSize(const std::string& text, int& width, int& height) {
+  if (text.empty()) return false;
+  const std::size_t x = text.find_first_of("xX");
+  try {
+    if (x == std::string::npos) {
+      width = height = std::stoi(text);
+    } else {
+      width = std::stoi(text.substr(0, x));
+      height = std::stoi(text.substr(x + 1));
+    }
+  } catch (const std::exception&) {
+    return false;
+  }
+  return width > 0 && height > 0;
+}
+
+}  // namespace
+
+int cmdDraw(const std::vector<std::string_view>& args) {
+  namespace img = qorvix::image;
+  const std::string modelPath = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string prompt = flagValue(args, "--prompt");
+  if (modelPath.empty() || prompt.empty()) {
+    std::cerr << "usage: qorvix draw <sd.gguf> --prompt \"...\" [--out image.png]\n"
+                 "                   [--negative \"...\"] [--steps N] [--guidance G]\n"
+                 "                   [--size WxH] [--seed N] [--sampler euler|euler-a|ddim]\n"
+                 "                   [--clip-skip N] [--json]\n";
+    return 1;
+  }
+  const bool json = hasFlag(args, "--json");
+  img::StableDiffusion::Options opt;
+  opt.prompt = prompt;
+  opt.negativePrompt = flagValue(args, "--negative");
+  if (const std::string v = flagValue(args, "--steps"); !v.empty()) opt.steps = std::stoi(v);
+  if (const std::string v = flagValue(args, "--guidance"); !v.empty()) opt.guidance = std::stof(v);
+  if (const std::string v = flagValue(args, "--seed"); !v.empty()) {
+    opt.seed = static_cast<std::uint64_t>(std::stoull(v));
+  }
+  if (const std::string v = flagValue(args, "--clip-skip"); !v.empty()) opt.clipSkip = std::stoi(v);
+  if (const std::string v = flagValue(args, "--size"); !v.empty()) {
+    if (!parseSize(v, opt.width, opt.height)) {
+      std::cerr << "error: --size takes WxH or a single edge, e.g. 512x384 or 512\n";
+      return 1;
+    }
+  }
+  if (const std::string v = flagValue(args, "--sampler"); !v.empty()) {
+    const auto kind = img::samplerFromName(v);
+    if (!kind) {
+      std::cerr << "error: unknown sampler '" << v << "' (euler, euler-a, ddim)\n";
+      return 1;
+    }
+    opt.sampler = *kind;
+  }
+  std::string outPath = flagValue(args, "--out");
+  if (outPath.empty()) outPath = "image.png";
+
+  using clock = std::chrono::steady_clock;
+  std::string err;
+  const auto tLoad0 = clock::now();
+  auto model = img::StableDiffusion::fromPath(modelPath, err);
+  if (!model) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const double loadSec = std::chrono::duration<double>(clock::now() - tLoad0).count();
+  const auto& cfg = model->config();
+
+  if (!json) {
+    std::cout << "model:    " << modelPath << "  (" << cfg.name << ")\n"
+              << "          text " << cfg.text.layers << "x" << cfg.text.heads << " d "
+              << cfg.text.dModel << " | unet";
+    for (std::size_t i = 0; i < cfg.unet.channels.size(); ++i) {
+      std::cout << (i ? "/" : " ") << cfg.unet.channels[i];
+    }
+    std::cout << " | vae x" << cfg.vaeScale << " | " << cfg.scheduler.predictionType << "\n"
+              << "prompt:   " << opt.prompt << "\n";
+    if (!opt.negativePrompt.empty()) std::cout << "negative: " << opt.negativePrompt << "\n";
+    std::cout << "sampler:  " << img::samplerName(opt.sampler) << ", " << opt.steps
+              << " steps, guidance " << opt.guidance << ", seed " << opt.seed << "\n\n";
+  }
+
+  // A sample is minutes long on this hardware, so a silent run is indistinguishable from a hang.
+  // Progress goes to stderr so `--json` on stdout stays machine-readable either way.
+  auto onStep = [&](int done, int total) {
+    std::cerr << "\r  step " << done << "/" << total << std::flush;
+    if (done == total) std::cerr << "\r                    \r";
+  };
+
+  img::StableDiffusion::Result res;
+  if (!model->generate(opt, res, err, onStep)) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  if (!qorvix::vision::savePng(res.image, outPath, err)) {
+    std::cerr << "error: writing " << outPath << ": " << err << "\n";
+    return 1;
+  }
+
+  const double total = res.promptSeconds + res.unetSeconds + res.decodeSeconds;
+  if (json) {
+    namespace J = qorvix::api::json;
+    J::Value out = J::Value::object();
+    out["path"] = J::Value(outPath);
+    out["width"] = J::Value(res.image.width);
+    out["height"] = J::Value(res.image.height);
+    out["steps"] = J::Value(opt.steps);
+    out["sampler"] = J::Value(std::string(img::samplerName(opt.sampler)));
+    out["seed"] = J::Value(static_cast<double>(opt.seed));
+    out["unet_evaluations"] = J::Value(res.unetEvaluations);
+    out["prompt_truncated"] = J::Value(res.promptTruncated);
+    J::Value timings = J::Value::object();
+    timings["load_s"] = J::Value(loadSec);
+    timings["prompt_s"] = J::Value(res.promptSeconds);
+    timings["unet_s"] = J::Value(res.unetSeconds);
+    timings["decode_s"] = J::Value(res.decodeSeconds);
+    out["timings"] = timings;
+    std::cout << out.dump() << "\n";
+    return 0;
+  }
+
+  std::cout << "wrote " << outPath << "  (" << res.image.width << "x" << res.image.height << ")\n";
+  if (res.promptTruncated || res.negativeTruncated) {
+    // Named rather than hidden: CLIP's 77 positions are a hard bound, and a prompt that ran into
+    // it produced a different image from the one the user wrote.
+    std::cout << "note: the "
+              << (res.promptTruncated && res.negativeTruncated
+                      ? "prompt and negative prompt were"
+                      : (res.promptTruncated ? "prompt was" : "negative prompt was"))
+              << " truncated to the text encoder's " << cfg.text.contextLength
+              << " positions — the tail did not reach the model.\n";
+  }
+  std::cout << "[load " << loadSec << "s | prompt " << res.promptSeconds << "s | unet "
+            << res.unetSeconds << "s over " << res.unetEvaluations << " evaluations ("
+            << (res.unetEvaluations ? res.unetSeconds / res.unetEvaluations : 0.0)
+            << "s each) | decode " << res.decodeSeconds << "s | total " << total << "s]\n";
+  return 0;
+}
+
+// The Phase 11b-3c gate. Tiered like every other *-check here, and for the sharpest version of the
+// same reason: five separate things can be wrong and there is ONE observable, a picture that looks
+// plausible either way.
+int cmdSdCheck(const std::vector<std::string_view>& args) {
+  namespace img = qorvix::image;
+  const std::string modelPath = args.size() > 1 ? std::string(args[1]) : std::string();
+  const std::string refPath = flagValue(args, "--ref");
+  if (modelPath.empty() || refPath.empty()) {
+    std::cerr << "usage: qorvix sd-check <sd.gguf> --ref <fixture> [--tol 1e-3] [--min-cos 0.9999]\n";
+    return 1;
+  }
+  double tol = 1e-3;
+  float minCos = 0.9999f;
+  if (const std::string v = flagValue(args, "--tol"); !v.empty()) tol = std::stod(v);
+  if (const std::string v = flagValue(args, "--min-cos"); !v.empty()) minCos = std::stof(v);
+
+  std::string err;
+  img::SdReference ref;
+  if (!ref.load(refPath, err)) {
+    std::cerr << "error: reference: " << err << "\n";
+    return 1;
+  }
+  auto model = img::StableDiffusion::fromPath(modelPath, err);
+  if (!model) {
+    std::cerr << "error: " << err << "\n";
+    return 1;
+  }
+  const auto& cfg = model->config();
+
+  std::cout << "model:  " << modelPath << "  (" << cfg.name << ")\n"
+            << "ref:    " << ref.model << "  (" << ref.sampler << ", " << ref.steps << " steps at "
+            << ref.width << "x" << ref.height << ", guidance " << ref.guidance << ")\n"
+            << "gate:   |diff| <= " << tol << ", cos >= " << minCos << "\n\n";
+
+  // Wrong-pairing checks before any compute, so a fixture from another model reads as a mismatched
+  // pair rather than as a numerical failure forty seconds later.
+  if (static_cast<int>(ref.condRow0.size()) != cfg.text.dModel ||
+      ref.latentC != cfg.latentChannels) {
+    std::cout << "Reference conditioning is " << ref.condRow0.size() << "-d over " << ref.latentC
+              << " latent channels; the model is " << cfg.text.dModel << "-d over "
+              << cfg.latentChannels << " — wrong pairing.\n\nRESULT: MISMATCH\n";
+    return 1;
+  }
+
+  bool pass = true;
+  auto cosine = [](const std::vector<float>& a, const float* b, std::size_t n) {
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      dot += static_cast<double>(a[i]) * b[i];
+      na += static_cast<double>(a[i]) * a[i];
+      nb += static_cast<double>(b[i]) * b[i];
+    }
+    const double denom = std::sqrt(na) * std::sqrt(nb);
+    return denom > 0.0 ? dot / denom : 0.0;
+  };
+  auto maxDiff = [](const std::vector<float>& a, const float* b, std::size_t n) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      worst = std::max(worst, std::abs(static_cast<double>(a[i]) - b[i]));
+    }
+    return worst;
+  };
+  // One padded column for the label so tiers line up whatever their name's length — the point
+  // of a tiered report is reading DOWN it for the first failure.
+  auto report = [&](const std::string& label, const std::vector<float>& expect, const float* got) {
+    if (expect.empty()) return;
+    const double d = maxDiff(expect, got, expect.size());
+    const double c = cosine(expect, got, expect.size());
+    std::cout << std::left << std::setw(32) << label << std::right << "max |diff| " << d
+              << "  cos " << std::fixed << std::setprecision(7) << c << std::scientific
+              << std::setprecision(2) << "\n";
+    if (d > tol || c < minCos) pass = false;
+  };
+
+  // ---- tier 0: the schedule ----
+  // No weights involved at all. A wrong beta ladder or spacing produces a picture, just a
+  // washed-out one, so this is checked before anything that could be blamed for it.
+  const auto kind = img::samplerFromName(ref.sampler);
+  if (!kind) {
+    std::cerr << "error: the fixture names sampler '" << ref.sampler << "', which this build has no\n";
+    return 1;
+  }
+  auto scheduler = img::Scheduler::make(cfg.scheduler, *kind, ref.steps, err);
+  if (!scheduler) {
+    std::cerr << "error: scheduler: " << err << "\n";
+    return 1;
+  }
+  const bool timestepsOk = scheduler->timesteps() == ref.timesteps;
+  std::cout << std::left << std::setw(32) << "Timesteps:" << std::right;
+  for (std::size_t i = 0; i < scheduler->timesteps().size() && i < 8; ++i) {
+    std::cout << (i ? " " : "") << scheduler->timesteps()[i];
+  }
+  if (scheduler->timesteps().size() > 8) std::cout << " ...";
+  std::cout << (timestepsOk ? "   MATCHES reference\n" : "   != reference\n");
+  if (!timestepsOk) {
+    pass = false;
+    std::cout << std::left << std::setw(32) << "  reference:" << std::right;
+    for (std::size_t i = 0; i < ref.timesteps.size() && i < 8; ++i) {
+      std::cout << (i ? " " : "") << ref.timesteps[i];
+    }
+    std::cout << "\n";
+  }
+  std::cout << std::scientific << std::setprecision(2);
+  double alphaWorst = 0.0;
+  for (const auto& p : ref.alphaProbes) {
+    if (p.index < 0 || p.index >= static_cast<int>(scheduler->alphasCumprod().size())) continue;
+    alphaWorst = std::max(alphaWorst,
+                          std::abs(static_cast<double>(p.value) -
+                                   scheduler->alphasCumprod()[static_cast<std::size_t>(p.index)]));
+  }
+  std::cout << std::left << std::setw(32)
+            << ("alpha_bar over " + std::to_string(ref.alphaProbes.size()) + " probes:")
+            << std::right << "max |diff| " << alphaWorst << "\n";
+  if (alphaWorst > tol) pass = false;
+
+  // ---- tier 1: the tokenizer ----
+  bool truncated = false;
+  const std::vector<int> ids =
+      model->tokenizer().encodePadded(ref.prompt, cfg.text.contextLength, truncated);
+  const std::vector<int> negIds =
+      model->tokenizer().encodePadded(ref.negative, cfg.text.contextLength, truncated);
+  const bool tokensOk = ids == ref.tokens && (ref.negTokens.empty() || negIds == ref.negTokens);
+  std::cout << std::left << std::setw(32)
+            << ("Prompt tokens (" + std::to_string(ids.size()) + "):") << std::right
+            << (tokensOk ? "MATCH reference\n" : "!= reference\n");
+  if (!tokensOk) {
+    pass = false;
+    std::size_t at = 0;
+    while (at < ids.size() && at < ref.tokens.size() && ids[at] == ref.tokens[at]) ++at;
+    std::cout << "  first difference at position " << at << ": ours "
+              << (at < ids.size() ? std::to_string(ids[at]) : std::string("-")) << " ('"
+              << (at < ids.size() ? model->tokenizer().idToToken(ids[at]) : std::string()) << "'), "
+              << "reference " << (at < ref.tokens.size() ? std::to_string(ref.tokens[at]) : std::string("-"))
+              << "\n";
+  }
+
+  // ---- tier 2: the conditioning ----
+  std::vector<float> cond, uncond;
+  if (!model->textEncoder().encode(ids, ref.clipSkip, cond, err) ||
+      !model->textEncoder().encode(negIds, ref.clipSkip, uncond, err)) {
+    std::cerr << "error: text encoder: " << err << "\n";
+    return 1;
+  }
+  report("Conditioning position 0:", ref.condRow0, cond.data());
+  if (!ref.condDimMeans.empty()) {
+    // Per-dimension means over all 77 positions. This is the tier that catches a padding or
+    // causal-mask difference, which leaves position 0 alone and moves everything after it.
+    std::vector<float> means(static_cast<std::size_t>(cfg.text.dModel), 0.0f);
+    for (int i = 0; i < cfg.text.contextLength; ++i) {
+      for (int j = 0; j < cfg.text.dModel; ++j) {
+        means[static_cast<std::size_t>(j)] += cond[static_cast<std::size_t>(i) * cfg.text.dModel + j];
+      }
+    }
+    for (float& v : means) v /= static_cast<float>(cfg.text.contextLength);
+    report("Conditioning per-dim means:", ref.condDimMeans, means.data());
+  }
+  report("Negative conditioning row 0:", ref.uncondRow0, uncond.data());
+
+  // ---- tier 3: one UNet evaluation ----
+  // Over the fixture's OWN latent, with no guidance mixed in and no sampling: whatever this
+  // reports is the network, not the loop around it.
+  qorvix::image::FeatureMap latent;
+  latent.resize(ref.latentC, ref.latentH, ref.latentW);
+  latent.data = ref.latent;
+  qorvix::image::FeatureMap scaled = latent;
+  scheduler->scaleModelInput(scaled, 0);
+  qorvix::image::FeatureMap pred;
+  if (!model->unet().forward(scaled, ref.unetTimestep, cond, cfg.text.contextLength, pred, err)) {
+    std::cerr << "error: unet: " << err << "\n";
+    return 1;
+  }
+  report("UNet at t=" + std::to_string(ref.unetTimestep) + ", position 0:", ref.unetRow0,
+         pred.data.data());
+  if (!ref.unetChannelMeans.empty()) {
+    std::vector<float> means(static_cast<std::size_t>(pred.c), 0.0f);
+    for (std::size_t p = 0; p < pred.positions(); ++p) {
+      for (int ch = 0; ch < pred.c; ++ch) {
+        means[static_cast<std::size_t>(ch)] += pred.data[p * pred.c + ch];
+      }
+    }
+    for (float& v : means) v /= static_cast<float>(pred.positions());
+    report("UNet per-channel means:", ref.unetChannelMeans, means.data());
+  }
+
+  // ---- tier 4: the whole sampling loop ----
+  // Two runtimes that agree on one step still diverge here if they disagree about the input
+  // scaling, the guidance formula, or which step index the sigma table is read at.
+  if (!ref.finalLatent.empty()) {
+    qorvix::image::GaussianRng rng(0);
+    qorvix::image::FeatureMap x = latent;
+    qorvix::image::FeatureMap predCond, predUncond, modelIn;
+    const bool guided = ref.guidance > 1.0f;
+    for (int i = 0; i < scheduler->steps(); ++i) {
+      modelIn = x;
+      scheduler->scaleModelInput(modelIn, i);
+      const int t = scheduler->timesteps()[static_cast<std::size_t>(i)];
+      if (!model->unet().forward(modelIn, t, cond, cfg.text.contextLength, predCond, err)) {
+        std::cerr << "error: unet: " << err << "\n";
+        return 1;
+      }
+      if (guided) {
+        if (!model->unet().forward(modelIn, t, uncond, cfg.text.contextLength, predUncond, err)) {
+          std::cerr << "error: unet: " << err << "\n";
+          return 1;
+        }
+        for (std::size_t k = 0; k < predCond.size(); ++k) {
+          predCond.data[k] =
+              predUncond.data[k] + ref.guidance * (predCond.data[k] - predUncond.data[k]);
+        }
+      }
+      if (!scheduler->step(x, predCond, i, rng, err)) {
+        std::cerr << "error: sampler: " << err << "\n";
+        return 1;
+      }
+    }
+    report("Final latent after " + std::to_string(ref.steps) + " steps:", ref.finalLatent,
+           x.data.data());
+  }
+
+  // ---- tier 5: the VAE decode ----
+  // Fed the REFERENCE's final latent, not ours, so this measures the decoder alone rather than
+  // inheriting whatever the loop above accumulated.
+  if (!ref.finalLatent.empty() && !ref.imageChannelMeans.empty()) {
+    qorvix::image::FeatureMap refFinal;
+    refFinal.resize(ref.latentC, ref.latentH, ref.latentW);
+    refFinal.data = ref.finalLatent;
+    qorvix::image::FeatureMap rgb;
+    if (!model->vae().decode(refFinal, rgb, err)) {
+      std::cerr << "error: vae: " << err << "\n";
+      return 1;
+    }
+    if (rgb.h != ref.imageH || rgb.w != ref.imageW) {
+      std::cout << "VAE produced " << rgb.h << "x" << rgb.w << ", reference is " << ref.imageH
+                << "x" << ref.imageW << "\n";
+      pass = false;
+    } else {
+      report("VAE decode, pixel 0:", ref.imageRow0, rgb.data.data());
+      std::vector<float> means(3, 0.0f);
+      for (std::size_t p = 0; p < rgb.positions(); ++p) {
+        for (int ch = 0; ch < 3; ++ch) means[static_cast<std::size_t>(ch)] += rgb.data[p * 3 + ch];
+      }
+      for (float& v : means) v /= static_cast<float>(rgb.positions());
+      report("VAE decode, channel means:", ref.imageChannelMeans, means.data());
+    }
+  }
+
+  std::cout << std::defaultfloat << "\n"
+            << (pass ? "RESULT: PASS - the diffusion stack matches the diffusers reference.\n"
+                     : "RESULT: MISMATCH - the first failing tier above names the cause.\n");
+  return pass ? 0 : 1;
+}
+
 // ---- rag: index and search over a document directory ----------------------------------------
 
 // Loads an embedding model plus its tokenizer, the pair every RAG command needs. Keeps the
@@ -2133,7 +2530,8 @@ int cmdServe(const std::vector<std::string_view>& args) {
                  "[--port N] "
                  "[--max-concurrent N] [--ctx N] [--embed-model <file.gguf>] [--max-batch N]\n"
                  "       [--mmproj <clip.gguf>]   (vision-language chat: image_url content parts)\n"
-                 "       [--whisper <whisper.gguf>]   (POST /v1/audio/transcriptions)\n";
+                 "       [--whisper <whisper.gguf>]   (POST /v1/audio/transcriptions)\n"
+                 "       [--sd <sd.gguf>]   (POST /v1/images/generations)\n";
     return 1;
   }
   const std::string mmprojPath = flagValue(args, "--mmproj");
@@ -2147,6 +2545,11 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // --mmproj it needs no compatibility check against the chat engine: transcription is a whole
   // pipeline of its own (audio in, text out) rather than a stage feeding the decoder.
   const std::string whisperPath = flagValue(args, "--whisper");
+  // Fifth modality, same process, same opt-in shape. Like Whisper it is a whole pipeline rather
+  // than a stage feeding the decoder, so it needs no compatibility check against the chat engine —
+  // and like Whisper it is CPU-only by construction, so the backend flag deliberately does not
+  // follow it.
+  const std::string sdPath = flagValue(args, "--sd");
   // Same backend selection as generate: --gpu / --vulkan / --auto / (default) CPU. serve reaches
   // every backend through the ONE createEngine() factory + the IInferenceEngine seam.
   const qorvix::Backend backend = backendFromArgs(args);
@@ -2270,6 +2673,17 @@ int cmdServe(const std::vector<std::string_view>& args) {
     }
   }
 
+  // Fifth engine, fifth modality. Three networks behind one handle — text encoder, UNet, VAE —
+  // which is why it is one file and one object rather than three flags.
+  std::optional<qorvix::image::StableDiffusion> diffusion;
+  if (!sdPath.empty()) {
+    diffusion = qorvix::image::StableDiffusion::fromPath(sdPath, err);
+    if (!diffusion) {
+      std::cerr << "error: diffusion model: " << err << "\n";
+      return 1;
+    }
+  }
+
   const std::string modelId = engine->config().architecture + "/" + path;
   const std::string embedModelId =
       embedEngine ? embedEngine->config().architecture + "/" + embedPath : std::string();
@@ -2304,6 +2718,12 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // concurrent transcriptions would trample all three. Separate from schedMutex because a
   // 30-second encode has no reason to queue behind an in-flight chat generation.
   std::mutex whisperMutex;
+
+  // And a fifth. The diffusion stack keeps every intermediate feature map in members — a 512x512
+  // decode allocates hundreds of megabytes of them — so two concurrent samples would both trample
+  // each other's scratch and double the peak footprint. Separate from schedMutex because a sample
+  // takes minutes and has no reason to block a chat turn.
+  std::mutex sdMutex;
 
   api::HttpServer server(port);
   if (!server.start(err)) {
@@ -2345,8 +2765,17 @@ int cmdServe(const std::vector<std::string_view>& args) {
   } else {
     std::cout << "  audio:      none (pass --whisper <whisper.gguf> to enable /v1/audio/transcriptions)\n";
   }
+  if (diffusion) {
+    const auto& dcfg = diffusion->config();
+    std::cout << "  images:     " << sdPath << " | " << dcfg.name << " | native "
+              << dcfg.defaultPixels() << "px, multiples of " << diffusion->sizeMultiple()
+              << " | cpu\n";
+  } else {
+    std::cout << "  images:     none (pass --sd <sd.gguf> to enable /v1/images/generations)\n";
+  }
   std::cout << "  POST /v1/chat/completions   POST /v1/completions   POST /v1/embeddings\n"
             << "  POST /v1/audio/transcriptions   POST /v1/audio/translations\n"
+            << "  POST /v1/images/generations\n"
             << "  GET /v1/models\n"
             << "  (Ctrl-C to stop)\n";
 
@@ -2546,6 +2975,101 @@ int cmdServe(const std::vector<std::string_view>& args) {
         res.send(200, "application/json", out.dump());
         return;
       }
+    }
+
+    if (req.target == "/v1/images/generations") {
+      if (req.method != "POST") {
+        res.send(405, "application/json",
+                 api::errorResponse("use POST for /v1/images/generations", "invalid_request_error")
+                     .dump());
+        return;
+      }
+      if (!diffusion) {
+        // 501 for the same reason /v1/embeddings uses it: the route exists, this process just has
+        // no diffusion model loaded. A 404 would tell a client to stop trying rather than to start
+        // the server differently.
+        res.send(501, "application/json",
+                 api::errorResponse("no diffusion model loaded — restart with --sd <sd.gguf>",
+                                    "not_implemented")
+                     .dump());
+        return;
+      }
+      std::string perr;
+      auto ibody = api::json::parse(req.body, &perr);
+      if (!ibody) {
+        res.send(400, "application/json", api::errorResponse("invalid JSON: " + perr).dump());
+        return;
+      }
+      auto ir = api::parseImagesRequest(*ibody, perr);
+      if (!ir.valid) {
+        res.send(400, "application/json", api::errorResponse(perr).dump());
+        return;
+      }
+      // A sample is minutes of CPU on this hardware and the connection is held open for all of
+      // it, so `n` is bounded rather than trusted. The cap is named in the error, so a client
+      // that wanted four images knows to ask four times.
+      constexpr int kMaxImages = 4;
+      if (ir.n > kMaxImages) {
+        res.send(400, "application/json",
+                 api::errorResponse("'n' is capped at " + std::to_string(kMaxImages) +
+                                    " per request on this server")
+                     .dump());
+        return;
+      }
+      qorvix::image::StableDiffusion::Options opt;
+      opt.prompt = ir.prompt;
+      opt.negativePrompt = ir.negativePrompt;
+      opt.width = ir.width;
+      opt.height = ir.height;
+      if (ir.steps > 0) opt.steps = ir.steps;
+      if (ir.guidance >= 0.0f) opt.guidance = ir.guidance;
+      if (ir.clipSkip > 0) opt.clipSkip = ir.clipSkip;
+      if (!ir.sampler.empty()) {
+        const auto kind = qorvix::image::samplerFromName(ir.sampler);
+        if (!kind) {
+          res.send(400, "application/json",
+                   api::errorResponse("unknown sampler '" + ir.sampler +
+                                      "' (euler, euler-a, ddim)")
+                       .dump());
+          return;
+        }
+        opt.sampler = *kind;
+      }
+      // No seed means a different picture each time, which is what an image API is expected to
+      // do; a request that names one gets exactly that seed, and the n-th image of a batch gets
+      // seed + n so a batch is reproducible as a whole.
+      const std::uint64_t baseSeed =
+          ir.hasSeed ? ir.seed
+                     : static_cast<std::uint64_t>(std::chrono::steady_clock::now()
+                                                      .time_since_epoch()
+                                                      .count());
+
+      std::vector<std::string> images;
+      images.reserve(static_cast<std::size_t>(ir.n));
+      {
+        std::lock_guard<std::mutex> lock(sdMutex);
+        for (int i = 0; i < ir.n; ++i) {
+          opt.seed = baseSeed + static_cast<std::uint64_t>(i);
+          qorvix::image::StableDiffusion::Result result;
+          if (!diffusion->generate(opt, result, perr)) {
+            res.send(400, "application/json", api::errorResponse(perr).dump());
+            return;
+          }
+          std::vector<std::uint8_t> png;
+          if (!qorvix::vision::encodePng(result.image, png, perr)) {
+            res.send(500, "application/json",
+                     api::errorResponse("png encode: " + perr, "server_error").dump());
+            return;
+          }
+          images.push_back(api::encodeBase64(png.data(), png.size()));
+        }
+      }
+      const auto created = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+      res.send(200, "application/json",
+               api::imagesResponse(images, static_cast<long long>(created)).dump());
+      return;
     }
 
     if (req.target == "/v1/embeddings") {
@@ -3394,6 +3918,10 @@ int printUsage() {
             << "  transcribe <whisper.gguf> --audio <f.wav>   Transcribe speech (cpu only)\n"
             << "                      [--language en|auto] [--translate] [--timestamps]\n"
             << "                      [--max-tokens N] [--json]\n"
+            << "  draw <sd.gguf> --prompt \"...\" [--out image.png]   Generate an image\n"
+            << "                      [--negative \"...\"] [--steps N] [--guidance G]\n"
+            << "                      [--size WxH] [--seed N] [--sampler euler|euler-a|ddim]\n"
+            << "                      [--clip-skip N] [--json]   (cpu only)\n"
             << "  serve <file> [--gpu|--vulkan|--auto] [--port N] [--embed-model <f.gguf>]\n"
             << "               [--mmproj <clip.gguf>]   image_url content parts (cpu only)\n"
             << "                                  OpenAI-compatible HTTP server\n"
@@ -3412,6 +3940,8 @@ int printUsage() {
             << "  embed-check <file> [--ref F] [--min-cos C]   Gate embeddings against a\n"
             << "                      captured sentence-transformers reference\n"
             << "  vision-check <mmproj.gguf> --ref F [--image f.png]   Gate the CLIP tower\n"
+            << "  sd-check <sd.gguf> --ref F   Gate the schedule, the tokenizer, the text\n"
+            << "                      encoder, one UNet step, the sampling loop and the VAE\n"
             << "  audio-mel <file.wav> [--mels N]   Whisper log-mel front end\n"
             << "  audio-check [<file.wav>] --ref F  Gate the log-mel front end\n"
             << "                      against a captured transformers reference\n"
@@ -3456,6 +3986,8 @@ int main(int argc, char** argv) {
   if (command == "audio-check") return cmdAudioCheck(args);
   if (command == "transcribe") return cmdTranscribe(args);
   if (command == "whisper-check") return cmdWhisperCheck(args);
+  if (command == "draw") return cmdDraw(args);
+  if (command == "sd-check") return cmdSdCheck(args);
   if (command == "vision-check") return cmdVisionCheck(args);
   if (command == "vlm-check") return cmdVlmCheck(args);
   if (command == "rag") return cmdRag(args);

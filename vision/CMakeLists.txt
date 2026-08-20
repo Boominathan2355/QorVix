@@ -1,6 +1,7 @@
 add_library(qorvix_vision STATIC
   src/inflate.cpp
   src/image.cpp
+  src/png_encode.cpp
   src/preprocess.cpp
   src/clip_weights.cpp
   src/clip_model.cpp

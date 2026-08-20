@@ -104,6 +104,11 @@ std::string detectChatTemplateFamily(const std::string& chatTemplate);
 std::vector<std::string> flattenContentParts(std::vector<ChatMessage>& messages,
                                              const std::string& imageMarker);
 
+// Standard base64 of arbitrary bytes. Extracted from embeddingsBase64 when /v1/images needed the
+// same encoder for PNG bytes — an image and a float buffer differ in what they mean, not in how
+// they are spelled over JSON.
+std::string encodeBase64(const std::uint8_t* data, std::size_t size);
+
 // Decodes standard base64 (with or without padding). Returns false on an invalid character or a
 // truncated final group.
 bool decodeBase64(std::string_view text, std::vector<std::uint8_t>& out, std::string& error);
@@ -136,6 +141,37 @@ struct EmbeddingsRequest {
 EmbeddingsRequest parseEmbeddingsRequest(const json::Value& body, std::string& error);
 
 // ---- responses (return JSON values; the server serializes + frames them) -------------------
+
+// POST /v1/images/generations.
+//
+// OpenAI's own fields (prompt, n, size, response_format, model, user) plus the ones a local
+// diffusion runtime cannot do without and their API has no room for: negative_prompt, steps,
+// guidance_scale, sampler, seed, clip_skip. The extensions are named the way the rest of the local
+// ecosystem names them rather than invented here.
+//
+// Unset numeric fields stay at their sentinel (0 / -1) so the server can tell "the client did not
+// say" from "the client asked for zero" — a `steps: 0` that silently became 20 would answer a
+// malformed request with a picture.
+struct ImagesRequest {
+  bool valid = false;
+  std::string model;
+  std::string prompt;
+  std::string negativePrompt;
+  std::string responseFormat = "b64_json";
+  std::string sampler;          // empty = the server's default
+  int n = 1;
+  int width = 0, height = 0;    // 0 = the model's native size
+  int steps = 0;                // 0 = the server's default
+  float guidance = -1.0f;       // < 0 = the server's default
+  int clipSkip = 0;             // 0 = the server's default
+  unsigned long long seed = 0;
+  bool hasSeed = false;
+};
+
+ImagesRequest parseImagesRequest(const json::Value& body, std::string& error);
+
+// `images` are base64-encoded PNG payloads, one per generated picture.
+json::Value imagesResponse(const std::vector<std::string>& images, long long created);
 
 json::Value modelsResponse(const std::vector<std::string>& modelIds);
 

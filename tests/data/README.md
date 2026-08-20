@@ -17,6 +17,15 @@ Two kinds of file live here, and the distinction matters:
 | `whisper_reference_tiny.txt` | encoder states, one step's logits, greedy transcript | transformers `WhisperForConditionalGeneration`, fp32 |
 | `vision_reference_clip_vit_l14_336.txt` | preprocessed pixels + patch hidden states | transformers `CLIPVisionModel`, fp32 |
 | `embed_reference_*.txt` | token ids + pooled vectors | sentence-transformers |
+| `sd_reference_tiny.txt` | timesteps, prompt ids, conditioning, one UNet step, the sampled latent and the decode | diffusers `StableDiffusionPipeline` + `DDIMScheduler`, fp32 |
+
+**Why the diffusion fixture carries its own starting latent.** Every other reference here is
+compared against an input that is also committed. A diffusion sample starts from random noise, and
+qorvix's noise is deliberately its own (see `image/rng.hpp`) — reproducing `torch.randn` would tie
+this runtime's output to another project's internals and still only agree on CPU. So the fixture
+writes the latent diffusers started from, both runtimes denoise the same tensor, and no random
+number generator is part of what is being compared. It is captured at 32x32 on a tiny test
+checkpoint precisely because the whole latent has to fit in a text file.
 
 **Why the speech probe is real speech and the audio probe is not.** The front-end gate
 (`audio-check`) compares numbers, and a tone sweep exercises the filter bank harder than speech

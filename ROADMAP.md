@@ -699,10 +699,117 @@ resampling (16 kHz only, with the ffmpeg command in the error), beam search and 
 temperature-fallback loop, word-level timestamps (they need the alignment heads), and a GPU
 Whisper backend.
 
-### Phase 11b-3c — Image generation ⬜🖥️
-SDXL/Flux. One 1024² sample is ~50 U-Net evaluations over a 2.6 B-parameter model, which this
-CPU-only box cannot run at any useful rate, so it is gated on GPU hardware rather than started and
-left unrunnable. `image/` and `agents/` are still 0 files.
+### Phase 11b-3c — Image generation ✅
+
+**The first model in this repo that is not a transformer.** A diffusion pipeline is three networks
+and a loop: a CLIP text encoder, a convolutional UNet evaluated once per step, and a VAE decoder
+that turns the 64×64×4 latent into pixels. Only the first is anything the runtime had seen before —
+the other two brought convolution, GroupNorm, nearest-neighbour upsampling and a residual block into
+a codebase that had none of them, and the sampler brought arithmetic that has no weights at all.
+
+The phase was gated on GPU hardware because SDXL at 1024² is ~50 evaluations of a 2.6 B-parameter
+UNet. **The gate was on the checkpoint, not on the architecture**: SD 1.x/2.x at 512² is the same
+network an order of magnitude smaller, and it runs here. SDXL and Flux are still refused, now by
+name and with the reason (below).
+
+**Convolutions are matmuls, and activations are position-major.** The two decisions the module is
+organised around, and both are about not writing a second weight path:
+
+- Every conv weight is written by the converter as a 2-D `[out, kh*kw*in]` matrix, so it loads
+  through the same `detail::loadMat` and runs through the same `qmatmulN` as every linear layer in
+  this repo, with im2col supplying the patch vectors. `runtime::ops` gained one function for it —
+  `matmulN`, the F32 twin of the existing `qmatmulN` — because a convolution calls the GEMV with
+  *thousands* of vectors (one per output pixel), where calling it once per vector opens thousands
+  of OpenMP regions and re-streams the weight matrix each time.
+- A feature map is `[h*w, c]`, channel fastest — not PyTorch's `[c, h, w]`. That makes an im2col
+  patch nine contiguous runs instead of a strided gather, makes the GEMM's natural output the next
+  layer's input with no transpose between convolutions, and makes the spatial transformer's
+  "flatten to a sequence of tokens" step *nothing at all*, since a feature map already is
+  `[tokens, channels]`. The converter permutes conv kernels to `[out, kh, kw, in]` to match.
+
+**Five things can be wrong and there is one observable.** A wrong beta schedule, a wrong BPE split,
+a bidirectional text encoder, a skip stack off by one and a swapped GEGLU half all present
+identically: a picture that is plausible and is not the one every other runtime makes. Each was a
+real risk and each is called out where it occurs:
+
+- **CLIP's BPE is not the byte-level BPE this repo already had** (`image/clip_tokenizer.*`). CLIP
+  marks the END of a word (`dog</w>`) where GPT-2 marks the start (`Ġdog`), lowercases and collapses
+  whitespace first, and splits digits **one at a time** — "512" is three tokens. Threading a second
+  convention through the shared encoder would have put a branch in every step of a hot path the text
+  models depend on, to serve one caller.
+- **The text encoder's mask is causal.** Architecturally it is Phase 11b-1's CLIP vision tower with
+  token+position embeddings instead of patches; run it bidirectionally and the conditioning is
+  smooth, confident, and not what the UNet was trained against. Its padding is **not** masked either:
+  a diffusion pipeline runs CLIP with no attention mask at all, so the 77-position padding is part of
+  the conditioning.
+- **Two GroupNorm epsilons in one network.** Residual blocks use the config's `norm_eps` (1e-5); the
+  spatial transformer's own norm is hardcoded to 1e-6 in diffusers and appears in no config file.
+  Both are written into the GGUF rather than assumed.
+- **The skip stack is one deeper than the resnet count suggests** — `conv_in`'s output is pushed
+  before any block runs, and each down block pushes one per resnet *plus* one per downsampler. An
+  up block pops `layers_per_block + 1`. Off by one and most shapes still line up.
+- **`attention_head_dim` in a diffusers config is the NUMBER OF HEADS**, a documented wart. It is
+  resolved in the converter, against the config that carries the ambiguity, so the GGUF states head
+  counts unambiguously and the C++ side never learns the wart existed.
+
+**Surfaces.**
+- `qorvix draw <sd.gguf> --prompt "..." [--out image.png] [--negative "..."] [--steps N]
+  [--guidance G] [--size WxH] [--seed N] [--sampler euler|euler-a|ddim] [--clip-skip N] [--json]`.
+- `serve --sd <sd.gguf>` — `POST /v1/images/generations`, behind its own mutex for the same reason
+  the CLIP tower and Whisper have theirs. OpenAI's fields plus the ones a local diffusion runtime
+  cannot do without (`negative_prompt`, `steps`, `guidance_scale`, `sampler`, `seed`, `clip_skip`).
+  `response_format: "url"` is **refused**: a URL means this process serves bytes it owns for some
+  length of time, and returning a data: URI under that name would be a different contract wearing
+  the same label.
+- PNG **writing** landed in `vision/` next to the decoder rather than in `image/` — one module owns
+  the format, and the round trip through this repo's own inflate is the test that keeps both honest.
+  The DEFLATE stream is stored blocks, so the output is correct and larger than libpng's; that is a
+  size property, not a correctness one, and it is stated rather than hidden.
+- **Seeds are ours.** Seed 42 here is not seed 42 in a PyTorch pipeline, and making it so would mean
+  reimplementing MT19937 plus `torch.randn`'s fill order — tying this runtime's output to another
+  project's internals forever, and only on CPU. What a seed is actually for is guaranteed: same seed
+  and settings, same image, any machine, any build.
+
+**The gate: `qorvix sd-check <sd.gguf> --ref <fixture>`**, six tiers against diffusers' fp32 CPU
+forward pass, ordered so each can only fail for causes the ones above it have cleared. **The starting
+latent travels in the fixture**, so no random number generator is anywhere in the comparison.
+
+| tier | isolates | measured (tiny SD fixture, 4 steps at 32²) |
+|---|---|---|
+| schedule | the beta ladder and the spacing — no weights at all | timesteps `751 501 251 1` **match**; alpha_bar max \|diff\| **3.58e-07** |
+| tokenizer | CLIP's BPE, before anything encodes it | **77/77 ids identical** |
+| conditioning | the causal mask, quick-GELU, the padding convention | max \|diff\| **1.42e-06**, cos **1.0000000** |
+| one UNet step | cross-attention, the skip stack, GEGLU, both epsilons | max \|diff\| **5.22e-07**, cos **1.0000000** |
+| the whole loop | input scaling, the guidance formula, the step index | max \|diff\| **2.96e-05**, cos **1.0000000** |
+| VAE decode | the decoder alone, fed the reference's own final latent | max \|diff\| **5.22e-07**, cos **1.0000000** |
+
+**PASS.** The tiering earned itself immediately: the first run reported *schedule, tokenizer and
+conditioning exact; UNet and VAE both wrong* — which is only possible if the fault is in something
+those two share and the text encoder does not. It was: the conv weights on disk were still in
+PyTorch's axis order.
+
+`tests/image_test.cpp` covers what needs no model — the PNG round trip (including past the 65535-byte
+stored-block boundary), conv2d against a direct quadruple-loop convolution at stride 1 and 2, the
+1x1/pointwise equivalence, GroupNorm's statistics and affine, nearest upsampling, skip-concatenation
+order, causal attention, the timestep embedding's frequency ladder and `flip_sin_to_cos` ordering,
+every sampler refusal, the DDIM closed form (a perfectly predicted noise must recover the clean
+latent), CLIP's pretokenizer, and a synthetic UNet whose only job is to prove the skip stack is
+consumed exactly.
+
+**Deferred, with the reason stated:**
+- **SDXL** — refused by the converter, by name. It runs TWO text encoders concatenated to 2048
+  cross-attention dims and adds `text_time` conditioning (a pooled vector plus six micro-condition
+  scalars) into the timestep embedding. Neither is expressible in this file format, and converting
+  without them yields a UNet with the right shapes and the wrong conditioning. The UNet here is
+  already config-driven enough for SDXL's block layout; what is missing is the conditioning.
+- **Flux** — not a UNet at all: a rectified-flow DiT with a T5 encoder alongside CLIP.
+- **img2img and inpainting** — they need the VAE *encoder*, which the converter deliberately leaves
+  behind rather than shipping half a gigabyte of unread weights in every file.
+- **Quantized weights.** f32/f16 only, and structurally rather than "not done yet": the
+  block-quantized kernels need a row length that is a multiple of 32 (Q8_0) or 256 (K-quants), and a
+  conv row is `in_channels * 9` — 36 for the first convolution. A quantized SD file is a per-tensor
+  mixture, which is a feature and not a flag.
+- **A GPU backend.** Same status as Whisper and the CLIP tower — see Phase 11c.
 
 ### Phase 11c — GPU embedding + vision backends ⬜🖥️
 CUDA and Vulkan implementations of `IEmbeddingEngine` and the CLIP tower. `createEmbeddingEngine` reports honestly for
@@ -714,6 +821,10 @@ embedding table in VRAM and look rows up on-device, so taking a host `[d_model]`
 upload path and a kernel entry point that skips the lookup — not a wrapper. Until it exists,
 `acceptsInputEmbeddings()` returns false there and the multimodal surfaces refuse rather than
 silently degrade.
+
+### Phase 11b-4 — Multi-agent workflows ⬜
+`agents/` is still 0 files. SPEC's agent runtime — roles, tool calls, a shared blackboard — is the
+last unstarted item of Phase 11b.
 
 ## Phase 12 — Web UI⬜
 React/TS/Vite/Tailwind/shadcn app: Dashboard, Chat, Vision, Audio, Image Generation, Model,

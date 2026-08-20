@@ -19,6 +19,15 @@ void layernorm(float* out, const float* x, const float* weight, const float* bia
 // This is the layout GGUF stores weights in (out_features x in_features).
 void matmul(float* out, const float* weight, const float* x, int rows, int cols);
 
+// Batched matrix-vector: out is [nVec, rows] row-major, X is [nVec, cols] row-major.
+//
+// The F32 twin of qmatmulN, and it exists for the same reason: calling matmul() nVec times
+// streams the whole weight matrix nVec times and opens nVec OpenMP parallel regions. The
+// convolutions in Phase 11b-3c reach this with nVec in the thousands (one vector per output
+// pixel), where that overhead stops being a rounding error. Each output element is still the same
+// dot product accumulated in the same order, so results are bit-identical, not merely close.
+void matmulN(float* out, const float* weight, const float* X, int nVec, int rows, int cols);
+
 // Numerically stable softmax over the first n elements, in place.
 void softmax(float* x, int n);
 

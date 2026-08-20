@@ -284,3 +284,103 @@ it.
   ignored — answering a sampled request with a greedy transcript misreports what was run.
 - **Beam search and the temperature-fallback loop.** Decoding is greedy, which is what the
   reference capture compares against.
+
+## Validating image generation (Phase 11b-3c)
+
+**Stable Diffusion is converted, not downloaded**, for a different reason than Whisper's. GGUF files
+for SD do exist — stable-diffusion.cpp writes them — but they carry the *original CompVis* tensor
+names (`model.diffusion_model.input_blocks.4.1.transformer_blocks.0.attn2.to_k.weight`), a third
+naming scheme neither this repo nor diffusers uses. Reading them would mean owning a name-translation
+table anyway, so the table lives in Python next to the checkpoint whose names it translates:
+
+```sh
+pip install diffusers transformers torch numpy
+python scripts/convert_sd_to_gguf.py stabilityai/sd-turbo models/sd-turbo-f16.gguf --outtype f16
+python scripts/convert_sd_to_gguf.py stable-diffusion-v1-5/stable-diffusion-v1-5 \
+  models/sd15-f16.gguf --outtype f16
+```
+
+**Three networks, one file.** A pipeline is a CLIP text encoder, a UNet and a VAE, shipped as three
+safetensors and a pile of JSON. They convert into one GGUF with three tensor prefixes (`te.`,
+`unet.`, `vae.`), because at run time they are one artifact: a UNet paired with the wrong text
+encoder makes a fluent-looking picture of the wrong thing and nothing errors. One file makes that
+pairing unbreakable rather than a deployment convention — and the loader checks it anyway
+(`unet.cross_attention_dim` against the text encoder's width, at load).
+
+`--outtype f16` is lossless in practice for these checkpoints and halves the file. Quantized weights
+are not offered, and the reason is structural rather than "not done yet": the block-quantized kernels
+need a row length that is a multiple of 32 (Q8_0) or 256 (K-quants), and a convolution row is
+`in_channels * 9` — 36 for the first one.
+
+```sh
+qorvix draw models/sd-turbo-f16.gguf --prompt "a photograph of a red bicycle" \
+  --steps 4 --guidance 0 --size 512 --seed 7 --out bike.png
+qorvix serve models/tinyllama-1.1b-chat-q4km.gguf --sd models/sd-turbo-f16.gguf
+curl -X POST localhost:2005/v1/images/generations -H "Content-Type: application/json" \
+  -d '{"prompt":"a red bicycle","size":"512x512","steps":4,"guidance_scale":0,"seed":7}'
+```
+
+`--guidance 0` (anything <= 1) **skips the unconditional pass entirely** rather than computing it and
+multiplying by zero, which halves the work — that is what the distilled few-step models expect.
+
+### The gate
+
+`sd-check` is a **CLI gate rather than a CTest case**, like `embed-check`, `vision-check`,
+`whisper-check`, `gpu-check` and `vulkan-check`: the Docker test image has no GGUFs. The model-free
+mechanics are covered by `tests/image_test.cpp`.
+
+Its fixture is captured from a **tiny random test checkpoint**, deliberately:
+
+```sh
+pip install diffusers transformers torch numpy
+python scripts/convert_sd_to_gguf.py hf-internal-testing/tiny-stable-diffusion-torch \
+  models/sd-tiny-f32.gguf
+python scripts/capture_sd_reference.py hf-internal-testing/tiny-stable-diffusion-torch \
+  tests/data/sd_reference_tiny.txt --size 32 --steps 4
+
+qorvix sd-check models/sd-tiny-f32.gguf --ref tests/data/sd_reference_tiny.txt
+```
+
+That checkpoint's weights are random and its pictures are noise, which is exactly right for this
+job: the gate compares *numbers* against diffusers, and a 7 MB model exercises every code path a
+2 GB one does — conv stem, downsampling, cross-attention, the skip stack, upsampling, the VAE's
+single-head attention — while fitting its whole starting latent into a committed text file.
+
+### Measured results
+
+```
+Timesteps:                      751 501 251 1   MATCHES reference
+alpha_bar over 7 probes:        max |diff| 3.58e-07
+Prompt tokens (77):             MATCH reference
+Conditioning position 0:        max |diff| 1.42e-06  cos 1.0000000
+Conditioning per-dim means:     max |diff| 8.34e-07  cos 1.0000000
+Negative conditioning row 0:    max |diff| 1.42e-06  cos 1.0000000
+UNet at t=751, position 0:      max |diff| 5.22e-07  cos 1.0000000
+UNet per-channel means:         max |diff| 3.13e-07  cos 1.0000000
+Final latent after 4 steps:     max |diff| 2.96e-05  cos 1.0000000
+VAE decode, pixel 0:            max |diff| 5.22e-07  cos 1.0000000
+VAE decode, channel means:      max |diff| 4.54e-07  cos 1.0000000
+
+RESULT: PASS - the diffusion stack matches the diffusers reference.
+```
+
+The tiers are ordered so each can only fail for causes the ones above it have cleared, and that
+earned itself on the first run: *schedule, tokenizer and conditioning exact; UNet and VAE both
+wrong*. Two networks failing while the text encoder passes narrows the fault to something those two
+share and it does not — the convolutions. The weights on disk were still in PyTorch's `[out, in, kh,
+kw]` axis order rather than the `[out, kh, kw, in]` the im2col reads.
+
+### What is not implemented, and why it is refused rather than approximated
+
+- **SDXL.** The converter refuses it by name. SDXL runs two text encoders concatenated to 2048
+  cross-attention dims and adds `text_time` conditioning — a pooled vector plus six micro-condition
+  scalars — into the timestep embedding. Neither is expressible in this file format, and converting
+  without them produces a UNet with the right shapes and the wrong conditioning.
+- **Flux.** Not a UNet at all: a rectified-flow DiT with a T5 encoder alongside CLIP.
+- **img2img / inpainting.** They need the VAE *encoder*, which the converter deliberately leaves
+  behind rather than shipping half a gigabyte of unread weights in every file.
+- **`response_format: "url"`** on `/v1/images/generations`: refused. A URL means this process serves
+  the bytes from somewhere it owns, with an expiry policy; returning a data: URI under that name
+  would be a different contract wearing the same label.
+- **Seed compatibility with PyTorch.** Not attempted, and not a gap: the gate feeds both runtimes the
+  same latent, so the numbers are compared without a random number generator in the way.

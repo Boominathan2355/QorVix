@@ -75,26 +75,39 @@ bool qmatmulN(float* out, const void* weight, std::uint32_t ggmlType, const floa
   const auto* base = static_cast<const std::uint8_t*>(weight);
   const int elemsPerBatch = (kMaxBlock / blockSize) * blockSize;
 
-#pragma omp parallel for schedule(static)
-  for (int r = 0; r < rows; ++r) {
-    const std::uint8_t* rowPtr = base + static_cast<std::size_t>(r) * rowBytes;
-    // Tiled over vectors so the accumulator stays a bounded stack array. Each tile re-reads the
-    // weight row once, so the matrix is streamed ceil(nVec/kVecTile) times instead of nVec —
-    // 2 passes at nVec=256 rather than 256.
-    for (int vBase = 0; vBase < nVec; vBase += kVecTile) {
-      const int nv = nVec - vBase < kVecTile ? nVec - vBase : kVecTile;
-      float acc[kVecTile] = {};
-      float buf[kMaxBlock];
+  // One dequantized weight row per thread, reused across every vector. It replaces a 256-float
+  // stack buffer that used to be refilled inside the vector-tile loop, which meant the row was
+  // dequantized ceil(nVec/kVecTile) times — 64 times over at the thousands-of-vectors batch sizes
+  // a convolution reaches (Phase 11b-3c), and 4 times over for an encoder batch of 256.
+  //
+  // The dequantization still happens in the same elemsPerBatch chunks producing the same values,
+  // and the dot products still accumulate the same chunks in the same order, so this is
+  // bit-identical rather than merely equivalent — which is what qmatmul.hpp promises.
+#pragma omp parallel
+  {
+    std::vector<float> rowBuf(static_cast<std::size_t>(cols));
+#pragma omp for schedule(static)
+    for (int r = 0; r < rows; ++r) {
+      const std::uint8_t* rowPtr = base + static_cast<std::size_t>(r) * rowBytes;
       for (int e = 0; e < cols; e += elemsPerBatch) {
         const int n = cols - e < elemsPerBatch ? cols - e : elemsPerBatch;
         const std::size_t byteOff = static_cast<std::size_t>(e / blockSize) * traits->typeSize;
-        dequantize(ggmlType, rowPtr + byteOff, buf, static_cast<std::size_t>(n));
-        for (int v = 0; v < nv; ++v) {
-          acc[v] += vecDotF32(buf, X + static_cast<std::size_t>(vBase + v) * cols + e, n);
-        }
+        dequantize(ggmlType, rowPtr + byteOff, rowBuf.data() + e, static_cast<std::size_t>(n));
       }
-      for (int v = 0; v < nv; ++v) {
-        out[static_cast<std::size_t>(vBase + v) * rows + r] = acc[v];
+      // Tiled over vectors so the accumulator stays a bounded stack array.
+      for (int vBase = 0; vBase < nVec; vBase += kVecTile) {
+        const int nv = nVec - vBase < kVecTile ? nVec - vBase : kVecTile;
+        float acc[kVecTile] = {};
+        for (int e = 0; e < cols; e += elemsPerBatch) {
+          const int n = cols - e < elemsPerBatch ? cols - e : elemsPerBatch;
+          for (int v = 0; v < nv; ++v) {
+            acc[v] += vecDotF32(rowBuf.data() + e, X + static_cast<std::size_t>(vBase + v) * cols + e,
+                                n);
+          }
+        }
+        for (int v = 0; v < nv; ++v) {
+          out[static_cast<std::size_t>(vBase + v) * rows + r] = acc[v];
+        }
       }
     }
   }
