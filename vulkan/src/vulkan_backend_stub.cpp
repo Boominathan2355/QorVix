@@ -2,6 +2,8 @@
 // headers were not found. Every facade entry point stays callable and simply reports "no Vulkan",
 // so callers (CLI, tests) need no #ifdefs. Mirrors cuda/src/cuda_backend_stub.cpp.
 #include "qorvix/vulkan/backend.hpp"
+#include "qorvix/vulkan/clip_model.hpp"
+#include "qorvix/vulkan/embedding_model.hpp"
 #include "qorvix/vulkan/vulkan_model.hpp"
 
 namespace qorvix::vulkan {
@@ -33,6 +35,20 @@ SelfTestResult multiSessionSelfTest() { return {false, false, "Vulkan support no
 std::unique_ptr<VulkanModel> createVulkanModel(const VulkanModelConfig&, const float*, const float*,
                                                const VulkanWeight&, const std::vector<VulkanLayer>&,
                                                std::string& error, int) {
+  error = "Vulkan support not compiled in";
+  return nullptr;
+}
+
+std::unique_ptr<VulkanEmbeddingModel> createVulkanEmbeddingModel(
+    const EmbeddingConfig&, const VulkanEmbeddingTables&, const std::vector<VulkanEmbedLayer>&,
+    std::string& error) {
+  error = "Vulkan support not compiled in";
+  return nullptr;
+}
+
+std::unique_ptr<VulkanClipVisionModel> createVulkanClipVisionModel(
+    const ClipConfig&, const VulkanClipWeights&, const std::vector<VulkanClipLayer>&,
+    std::string& error) {
   error = "Vulkan support not compiled in";
   return nullptr;
 }

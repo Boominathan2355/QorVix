@@ -677,7 +677,8 @@ bool loadEmbedReference(const std::string& path, EmbedReference& ref, std::strin
 int cmdEmbedCheck(const std::vector<std::string_view>& args) {
   const std::string path = args.size() > 1 ? std::string(args[1]) : std::string();
   if (path.empty()) {
-    std::cerr << "usage: qorvix embed-check <file.gguf> [--ref <fixture>] [--min-cos 0.999]\n";
+    std::cerr << "usage: qorvix embed-check <file.gguf> [--ref <fixture>] [--min-cos 0.999] "
+                 "[--cuda|--vulkan]\n";
     return 1;
   }
   const std::string refPath = flagValue(args, "--ref");
@@ -692,7 +693,7 @@ int cmdEmbedCheck(const std::vector<std::string_view>& args) {
       std::cerr << "error: tokenizer: " << err << "\n";
       return 1;
     }
-    auto engine = qorvix::createEmbeddingEngine(qorvix::Backend::Cpu, std::move(file), 0, err);
+    auto engine = qorvix::createEmbeddingEngine(backendFromArgs(args), std::move(file), 0, err);
     if (!engine) {
       std::cerr << "error: " << err << "\n";
       return 1;

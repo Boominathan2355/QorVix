@@ -17,7 +17,7 @@ target_link_libraries(qorvix_cuda PUBLIC qorvix_memory)
 # enable_language(CUDA) only when an actual toolkit is present (otherwise it degrades to OFF).
 if(QORVIX_ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
   find_package(CUDAToolkit REQUIRED)
-  target_sources(qorvix_cuda PRIVATE src/cuda_backend.cu)
+  target_sources(qorvix_cuda PRIVATE src/cuda_backend.cu src/embedding_model.cu src/clip_model.cu)
   target_link_libraries(qorvix_cuda PUBLIC CUDA::cudart CUDA::cublas)
   set_target_properties(qorvix_cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
   # SASS for the datacenter/consumer arches the project targets (Turing..Hopper). Compiling for

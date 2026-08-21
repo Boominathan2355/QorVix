@@ -3,6 +3,8 @@
 // unchanged on machines without a GPU toolchain. The real implementation lives in
 // cuda_backend.cu; the two are never compiled together.
 #include "qorvix/cuda/backend.hpp"
+#include "qorvix/cuda/clip_model.hpp"
+#include "qorvix/cuda/embedding_model.hpp"
 #include "qorvix/cuda/gpu_memory.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/cuda/multi_gpu.hpp"
@@ -79,6 +81,20 @@ std::unique_ptr<memory::ITransferEngine> makeCudaTransferEngine() { return nullp
 
 std::unique_ptr<memory::MemoryManager> makeGpuMemoryManager(std::size_t, std::size_t, std::size_t,
                                                             const std::filesystem::path&) {
+  return nullptr;
+}
+
+std::unique_ptr<EmbeddingModel> createEmbeddingModel(
+    const EmbeddingConfig&, const GpuEmbeddingTables&, const std::vector<GpuEmbeddingLayer>&,
+    std::string& error) {
+  error = "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)";
+  return nullptr;
+}
+
+std::unique_ptr<ClipVisionModel> createClipVisionModel(
+    const ClipConfig&, const GpuClipWeights&, const std::vector<GpuClipLayer>&,
+    std::string& error) {
+  error = "CUDA support not built in (rebuild with -DQORVIX_ENABLE_CUDA=ON)";
   return nullptr;
 }
 

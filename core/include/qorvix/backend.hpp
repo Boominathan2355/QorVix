@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "qorvix/cuda/backend.hpp"
+#include "qorvix/cuda/clip_model.hpp"
+#include "qorvix/cuda/embedding_model.hpp"
 #include "qorvix/cuda/gpu_model.hpp"
 #include "qorvix/cuda/multi_gpu.hpp"
 #include "qorvix/embeddings/bert_model.hpp"
@@ -14,13 +16,18 @@
 #include "qorvix/gguf/gguf_file.hpp"
 #include "qorvix/gpu_engine.hpp"
 #include "qorvix/runtime/dequant.hpp"
+#include "qorvix/runtime/encoder_weights.hpp"
 #include "qorvix/runtime/inference_engine.hpp"
 #include "qorvix/runtime/model_config.hpp"
 #include "qorvix/runtime/text_model.hpp"
 #include "qorvix/runtime/weights.hpp"
 #include "qorvix/vulkan/backend.hpp"
+#include "qorvix/vulkan/clip_model.hpp"
+#include "qorvix/vulkan/embedding_model.hpp"
 #include "qorvix/vulkan/vulkan_model.hpp"
 #include "qorvix/vulkan_engine.hpp"
+#include "qorvix/vision/clip_model.hpp"
+#include "qorvix/vision/clip_weights.hpp"
 
 // Unified backend layer. Every compute backend (CPU / CUDA / Vulkan) is one implementation of the
 // runtime::IInferenceEngine seam, and createEngine() is the single place that builds one from a
@@ -73,6 +80,9 @@ namespace detail {
 // GGUF weight -> backend weight descriptor (same raw bytes, borrowed from the mmap).
 inline cuda::GpuWeight toGpuWeight(const runtime::WeightMat& m) {
   return cuda::GpuWeight{m.quant, m.type, m.rows, m.cols};
+}
+inline cuda::EmbedWeight toEmbedWeight(const runtime::WeightMat& m) {
+  return cuda::EmbedWeight{m.quant, m.type, m.rows, m.cols};
 }
 inline vulkan::VulkanWeight toVkWeight(const runtime::WeightMat& m) {
   return vulkan::VulkanWeight{m.quant, m.type, m.rows, m.cols};
@@ -251,22 +261,142 @@ inline std::unique_ptr<runtime::IInferenceEngine> createEngine(Backend backend, 
 // express (see embedding_engine.hpp). There is still no parallel path — `embed`, `embed-check`,
 // `serve --embed-model` and the RAG commands all come through here.
 //
-// Phase 11a implements Backend::Cpu only. The device backends report honestly rather than
-// silently falling back to CPU, because a silent fallback would make `--gpu` a lie in the logs.
+// Phase 11c adds CUDA and Vulkan GPU backends alongside CPU. GPU backends report honestly rather
+// than silently falling back to CPU, because a silent fallback would make `--gpu` a lie in the logs.
 inline std::unique_ptr<embeddings::IEmbeddingEngine> createEmbeddingEngine(
     Backend backend, gguf::GgufFile file, std::uint32_t maxSeq, std::string& err) {
   if (!backendAvailable(backend)) {
     err = std::string(backendName(backend)) + " backend unavailable (not built in, or no device)";
     return nullptr;
   }
-  if (backend != Backend::Cpu) {
-    err = std::string(backendName(backend)) +
-          " embedding backend is not implemented yet — use the CPU path";
+
+  if (backend == Backend::Cpu) {
+    auto m = embeddings::BertModel::fromGguf(std::move(file), err, maxSeq);
+    if (!m) return nullptr;
+    return std::make_unique<embeddings::BertModel>(std::move(*m));
+  }
+
+  // GPU backends: load the GGUF, extract weights, build the GPU embedding model.
+  auto cfg = runtime::configFromGguf(file, err);
+  if (!cfg.valid()) { if (err.empty()) err = "invalid model config"; return nullptr; }
+  if (!cfg.isEncoder()) {
+    err = "'" + cfg.architecture + "' is a decoder model — use the generation path";
     return nullptr;
   }
-  auto m = embeddings::BertModel::fromGguf(std::move(file), err, maxSeq);
-  if (!m) return nullptr;
-  return std::make_unique<embeddings::BertModel>(std::move(*m));
+  auto weights = runtime::loadEncoderWeights(file, cfg, err);
+  if (!weights) return nullptr;
+
+  const std::uint32_t cap = cfg.contextLength ? cfg.contextLength : 512;
+  const std::uint32_t seq = (maxSeq == 0 || maxSeq > cap) ? cap : maxSeq;
+
+  if (backend == Backend::Cuda) {
+    cuda::EmbeddingConfig ec;
+    ec.nLayers = static_cast<int>(cfg.blockCount);
+    ec.dModel = static_cast<int>(cfg.embeddingLength);
+    ec.nHeads = static_cast<int>(cfg.headCount);
+    ec.headDim = static_cast<int>(cfg.headDim());
+    ec.ffn = static_cast<int>(cfg.feedForwardLength);
+    ec.vocab = static_cast<int>(cfg.vocabSize);
+    ec.maxSeq = static_cast<int>(seq);
+    ec.normEps = cfg.normEpsilon;
+    ec.ffnGated = cfg.ffnGated;
+    ec.hasTokenTypes = cfg.tokenTypeCount > 0;
+    ec.hasPositionEmbd = cfg.hasPositionEmbd;
+    ec.hasEmbdNorm = !weights->embdNorm.empty();
+    ec.defaultPooling = static_cast<int>(cfg.pooling);
+    ec.defaultNormalize = true;
+
+    // Dequantize embedding tables to F32 (same as buildGpuModel does for the decoder path).
+    const std::size_t vocabD = static_cast<std::size_t>(cfg.vocabSize) * cfg.embeddingLength;
+    std::vector<float> embF32(vocabD);
+    if (!runtime::dequantize(weights->tokenEmbd.type, weights->tokenEmbd.quant,
+                             embF32.data(), vocabD)) {
+      err = "failed to dequantize token_embd for embedding engine";
+      return nullptr;
+    }
+
+    cuda::GpuEmbeddingTables tables{};
+    // Token embedding: dequantized F32 is in embF32; upload happens in createEmbeddingModel
+    // via the tables struct. The F32 data pointer is borrowed from embF32 which stays alive
+    // through the createEmbeddingModel call (it uploads to VRAM synchronously).
+    tables.tokenEmbd = embF32.data();
+
+    std::vector<float> posF32;
+    if (cfg.hasPositionEmbd) {
+      const std::size_t posD = static_cast<std::size_t>(cfg.contextLength) * cfg.embeddingLength;
+      posF32.resize(posD);
+      if (!runtime::dequantize(weights->positionEmbd.type, weights->positionEmbd.quant,
+                               posF32.data(), posD)) {
+        err = "failed to dequantize position_embd";
+        return nullptr;
+      }
+      tables.positionEmbd = posF32.data();
+    }
+
+    std::vector<float> typesF32;
+    if (cfg.tokenTypeCount > 0 && weights->tokenTypes.valid()) {
+      const std::size_t typesD = static_cast<std::size_t>(cfg.tokenTypeCount) * cfg.embeddingLength;
+      typesF32.resize(typesD);
+      if (!runtime::dequantize(weights->tokenTypes.type, weights->tokenTypes.quant,
+                               typesF32.data(), typesD)) {
+        err = "failed to dequantize token_types";
+        return nullptr;
+      }
+      tables.tokenTypes = typesF32.data();
+    }
+
+    if (!weights->embdNorm.empty()) tables.embdNorm = weights->embdNorm.data();
+    if (!weights->embdNormB.empty()) tables.embdNormB = weights->embdNormB.data();
+
+    std::vector<cuda::GpuEmbeddingLayer> gl(cfg.blockCount);
+    for (std::uint32_t l = 0; l < cfg.blockCount; ++l) {
+      const auto& L = weights->layers[l];
+      auto& g = gl[l];
+      g.attnNorm = L.attnNorm.data();
+      g.attnNormB = L.attnNormB.empty() ? nullptr : L.attnNormB.data();
+      g.ffnNorm = L.ffnNorm.data();
+      g.ffnNormB = L.ffnNormB.empty() ? nullptr : L.ffnNormB.data();
+      g.wq = detail::toEmbedWeight(L.wq);
+      g.wk = detail::toEmbedWeight(L.wk);
+      g.wv = detail::toEmbedWeight(L.wv);
+      g.wo = detail::toEmbedWeight(L.wo);
+      g.bq = L.bq.empty() ? nullptr : L.bq.data();
+      g.bk = L.bk.empty() ? nullptr : L.bk.data();
+      g.bv = L.bv.empty() ? nullptr : L.bv.data();
+      g.bo = L.bo.empty() ? nullptr : L.bo.data();
+      g.ffnUp = detail::toEmbedWeight(L.ffnUp);
+      g.ffnDown = detail::toEmbedWeight(L.ffnDown);
+      g.ffnUpB = L.ffnUpB.empty() ? nullptr : L.ffnUpB.data();
+      g.ffnDownB = L.ffnDownB.empty() ? nullptr : L.ffnDownB.data();
+      if (L.ffnGate.valid()) g.ffnGate = detail::toEmbedWeight(L.ffnGate);
+    }
+
+    auto m = cuda::createEmbeddingModel(ec, tables, gl, err);
+    if (!m) return nullptr;
+    // Wrap the cuda::EmbeddingModel in an IEmbeddingEngine adapter
+    struct CudaEmbedAdapter : public embeddings::IEmbeddingEngine {
+      std::unique_ptr<cuda::EmbeddingModel> impl;
+      runtime::ModelConfig cfg;
+      explicit CudaEmbedAdapter(std::unique_ptr<cuda::EmbeddingModel> m, runtime::ModelConfig c)
+          : impl(std::move(m)), cfg(std::move(c)) {}
+      bool embed(const std::vector<int>& t, std::vector<float>& o, std::string& e) override { return impl->embed(t, o, e); }
+      bool embedWith(const std::vector<int>& t, embeddings::PoolingType p, bool n, std::vector<float>& o, std::string& e) override {
+        return impl->embedWith(t, static_cast<int>(p), n, o, e);
+      }
+      bool embedTokens(const std::vector<int>& t, std::vector<float>& o, std::string& e) override { return impl->embedTokens(t, o, e); }
+      std::uint32_t dim() const override { return static_cast<std::uint32_t>(impl->dim()); }
+      std::uint32_t maxSeqLen() const override { return static_cast<std::uint32_t>(impl->maxSeqLen()); }
+      embeddings::PoolingType defaultPooling() const override { return cfg.pooling; }
+      bool defaultNormalize() const override { return impl->defaultNormalize(); }
+      const runtime::ModelConfig& config() const override { return cfg; }
+      std::string backendName() const override { return impl->backendName(); }
+    };
+    return std::make_unique<CudaEmbedAdapter>(std::move(m), std::move(cfg));
+  }
+
+  // Vulkan: stub for now (returns nullptr with error)
+  err = "vulkan embedding backend not yet implemented";
+  return nullptr;
 }
 
 }  // namespace qorvix
