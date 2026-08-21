@@ -192,6 +192,8 @@ __global__ void mulK(float* a, const float* b, int n) {
 __global__ void attnBidirK(float* out, const float* q, const float* k, const float* v,
                            int d, int nHeads, int nSeq) {
   extern __shared__ float shS[];
+  __shared__ float mx[256];
+  __shared__ float sm[256];
   int h = blockIdx.x;
   if (h >= nHeads) return;
   int hd = d / nHeads, off = h * hd;
@@ -205,7 +207,6 @@ __global__ void attnBidirK(float* out, const float* q, const float* k, const flo
     }
     __syncthreads();
     // softmax max
-    __shared__ float mx[256];
     mx[threadIdx.x] = -1e30f;
     for (int t = threadIdx.x; t < nSeq; t += blockDim.x) mx[threadIdx.x] = fmaxf(mx[threadIdx.x], shS[t]);
     __syncthreads();
@@ -214,7 +215,6 @@ __global__ void attnBidirK(float* out, const float* q, const float* k, const flo
     // softmax exp+sum
     float ls = 0.0f;
     for (int t = threadIdx.x; t < nSeq; t += blockDim.x) { shS[t] = expf(shS[t]-m); ls += shS[t]; }
-    __shared__ float sm[256];
     sm[threadIdx.x] = ls;
     __syncthreads();
     for (int s=128; s>0; s>>=1) { if(threadIdx.x<s) sm[threadIdx.x]+=sm[threadIdx.x+s]; __syncthreads(); }
@@ -292,7 +292,7 @@ class CudaEmbedImpl : public EmbeddingModel {
       cudaMemcpy(p, h, c*sizeof(float), cudaMemcpyHostToDevice);
       return p;
     };
-    auto upW = [&](const GpuWeight& w, EmbW& out) -> bool {
+    auto upW = [&](const EmbedWeight& w, EmbW& out) -> bool {
       std::size_t bytes = embWBytes(w.ggmlType, w.rows, w.cols);
       if (!bytes) { err = "unsupported weight type"; return false; }
       if (cudaMalloc(&out.d, bytes) != cudaSuccess) { err = "cudaMalloc failed"; return false; }
@@ -304,7 +304,11 @@ class CudaEmbedImpl : public EmbeddingModel {
     tab_.tokenEmbd = upF(t.tokenEmbd, std::size_t(cfg_.vocab)*d);
     if (!tab_.tokenEmbd) { err = "token_embd malloc failed"; return false; }
     if (t.positionEmbd) { tab_.positionEmbd = upF(t.positionEmbd, std::size_t(n)*d); if(!tab_.positionEmbd){err="pos malloc fail";return false;} }
-    if (t.tokenTypes) { tab_.tokenTypes = upF(t.tokenTypes, std::size_t(cfg_.vocab)*d); if(!tab_.tokenTypes){err="types malloc fail";return false;} }
+    if (t.tokenTypes) {
+      int ttCount = cfg_.tokenTypeCount > 0 ? cfg_.tokenTypeCount : 2;
+      tab_.tokenTypes = upF(t.tokenTypes, std::size_t(ttCount)*d);
+      if (!tab_.tokenTypes) { err = "types malloc fail"; return false; }
+    }
     if (t.embdNorm) { tab_.embdNorm = upF(t.embdNorm, d); tab_.embdNormB = t.embdNormB ? upF(t.embdNormB, d) : nullptr; if(!tab_.embdNorm){err="norm malloc fail";return false;} }
 
     layers_.resize(inL.size());
@@ -427,15 +431,25 @@ class CudaEmbedImpl : public EmbeddingModel {
       }
     }
 
-    // Pooling
-    out.resize(d);
+    // Pooling: run into device scratch buffer, then copy to host
     switch (pooling) {
-      case 0: clsPoolK<<<g(d),kEmbThreads>>>(out.data(), scratch_[0], d); break;
-      case 3: lastPoolK<<<g(d),kEmbThreads>>>(out.data(), scratch_[0], n-1, d); break;
-      case 1: case 2: default: meanPoolK<<<g(d),kEmbThreads>>>(out.data(), scratch_[0], n, d); break;
+      case 0: clsPoolK<<<g(d),kEmbThreads>>>(scratch_[6], scratch_[0], d); break;
+      case 3: lastPoolK<<<g(d),kEmbThreads>>>(scratch_[6], scratch_[0], n-1, d); break;
+      case 1: case 2: default: meanPoolK<<<g(d),kEmbThreads>>>(scratch_[6], scratch_[0], n, d); break;
     }
-    if (normalize) l2NormK<<<1,kEmbThreads>>>(out.data(), d);
+    if (normalize) l2NormK<<<1,kEmbThreads>>>(scratch_[6], d);
+    out.resize(d);
+    cudaMemcpy(out.data(), scratch_[6], d * sizeof(float), cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
+    return true;
+  }
+
+  bool embedBatch(const std::vector<std::vector<int>>& batch,
+                  std::vector<std::vector<float>>& out, std::string& err) override {
+    out.resize(batch.size());
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+      if (!embed(batch[i], out[i], err)) return false;
+    }
     return true;
   }
 

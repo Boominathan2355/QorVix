@@ -23,6 +23,7 @@ struct EmbeddingConfig {
     float normEps = 1e-5f;
     bool ffnGated = false;
     bool hasTokenTypes = false;
+    int tokenTypeCount = 0;
     bool hasPositionEmbd = true;   // false => RoPE (not supported yet)
     bool hasEmbdNorm = false;
     int defaultPooling = 2;        // 0=CLS, 1=Last, 2=Mean, 3=None
@@ -85,7 +86,13 @@ class EmbeddingModel {
 
     // Batch encode in request order.
     virtual bool embedBatch(const std::vector<std::vector<int>>& batch,
-                            std::vector<std::vector<float>>& out, std::string& error) = 0;
+                            std::vector<std::vector<float>>& out, std::string& error) {
+      out.resize(batch.size());
+      for (std::size_t i = 0; i < batch.size(); ++i) {
+        if (!embed(batch[i], out[i], error)) return false;
+      }
+      return true;
+    }
 
     virtual int dim() const = 0;              // embedding width (== d_model)
     virtual int maxSeqLen() const = 0;        // hard truncation limit

@@ -84,8 +84,14 @@ inline cuda::GpuWeight toGpuWeight(const runtime::WeightMat& m) {
 inline cuda::EmbedWeight toEmbedWeight(const runtime::WeightMat& m) {
   return cuda::EmbedWeight{m.quant, m.type, m.rows, m.cols};
 }
+inline cuda::GpuClipWeight toGpuClipWeight(const runtime::WeightMat& m) {
+  return cuda::GpuClipWeight{m.quant, m.type, m.rows, m.cols};
+}
 inline vulkan::VulkanWeight toVkWeight(const runtime::WeightMat& m) {
   return vulkan::VulkanWeight{m.quant, m.type, m.rows, m.cols};
+}
+inline vulkan::VulkanClipWeight toVkClipWeight(const runtime::WeightMat& m) {
+  return vulkan::VulkanClipWeight{m.quant, m.type, m.rows, m.cols};
 }
 
 // The one bridge from a loaded GGUF (runtime Weights) to a backend model config + layer list.
@@ -301,6 +307,7 @@ inline std::unique_ptr<embeddings::IEmbeddingEngine> createEmbeddingEngine(
     ec.normEps = cfg.normEpsilon;
     ec.ffnGated = cfg.ffnGated;
     ec.hasTokenTypes = cfg.tokenTypeCount > 0;
+    ec.tokenTypeCount = static_cast<int>(cfg.tokenTypeCount);
     ec.hasPositionEmbd = cfg.hasPositionEmbd;
     ec.hasEmbdNorm = !weights->embdNorm.empty();
     ec.defaultPooling = static_cast<int>(cfg.pooling);
@@ -384,6 +391,9 @@ inline std::unique_ptr<embeddings::IEmbeddingEngine> createEmbeddingEngine(
         return impl->embedWith(t, static_cast<int>(p), n, o, e);
       }
       bool embedTokens(const std::vector<int>& t, std::vector<float>& o, std::string& e) override { return impl->embedTokens(t, o, e); }
+      bool embedBatch(const std::vector<std::vector<int>>& b, std::vector<std::vector<float>>& o, std::string& e) override {
+        return impl->embedBatch(b, o, e);
+      }
       std::uint32_t dim() const override { return static_cast<std::uint32_t>(impl->dim()); }
       std::uint32_t maxSeqLen() const override { return static_cast<std::uint32_t>(impl->maxSeqLen()); }
       embeddings::PoolingType defaultPooling() const override { return cfg.pooling; }
@@ -396,6 +406,142 @@ inline std::unique_ptr<embeddings::IEmbeddingEngine> createEmbeddingEngine(
 
   // Vulkan: stub for now (returns nullptr with error)
   err = "vulkan embedding backend not yet implemented";
+  return nullptr;
+}
+
+// THE construction point for CLIP vision towers — the vision twin of createEngine() and
+// createEmbeddingEngine(). Supports CPU and CUDA (and reports honestly for Vulkan).
+inline std::unique_ptr<vision::ClipVisionModel> createClipVisionModel(
+    Backend backend, gguf::GgufFile file, std::string& err) {
+  if (!backendAvailable(backend)) {
+    err = std::string(backendName(backend)) + " backend unavailable (not built in, or no device)";
+    return nullptr;
+  }
+
+  if (backend == Backend::Cpu) {
+    auto m = vision::ClipVisionModel::fromGguf(std::move(file), err);
+    if (!m) return nullptr;
+    return std::make_unique<vision::ClipVisionModel>(std::move(*m));
+  }
+
+  auto cfg = vision::clipConfigFromGguf(file, err);
+  if (!cfg.valid()) {
+    if (err.empty()) err = "invalid clip config";
+    return nullptr;
+  }
+  auto weights = vision::loadClipWeights(file, cfg, err);
+  if (!weights) return nullptr;
+
+  if (backend == Backend::Cuda) {
+    cuda::ClipConfig cc;
+    cc.imageSize = static_cast<int>(cfg.imageSize);
+    cc.patchSize = static_cast<int>(cfg.patchSize);
+    cc.embeddingLength = static_cast<int>(cfg.embeddingLength);
+    cc.feedForwardLength = static_cast<int>(cfg.feedForwardLength);
+    cc.headCount = static_cast<int>(cfg.headCount);
+    cc.blockCount = static_cast<int>(cfg.blockCount);
+    cc.projectionDim = static_cast<int>(cfg.projectionDim);
+    cc.normEpsilon = cfg.normEpsilon;
+    cc.useGelu = cfg.useGelu;
+    cc.hasProjector = cfg.hasLlavaProjector;
+    cc.projectedDim = weights->projectedDim();
+    cc.imageMean[0] = cfg.imageMean[0];
+    cc.imageMean[1] = cfg.imageMean[1];
+    cc.imageMean[2] = cfg.imageMean[2];
+    cc.imageStd[0] = cfg.imageStd[0];
+    cc.imageStd[1] = cfg.imageStd[1];
+    cc.imageStd[2] = cfg.imageStd[2];
+
+    cuda::GpuClipWeights gw{};
+    gw.patchEmbd = detail::toGpuClipWeight(weights->patchEmbd);
+    gw.classEmbd = weights->classEmbd.data();
+
+    // Dequantize positionEmbd to F32
+    const std::size_t posElems = static_cast<std::size_t>(cfg.tokenCount()) * cfg.embeddingLength;
+    std::vector<float> posF32(posElems);
+    if (!runtime::dequantize(weights->positionEmbd.type, weights->positionEmbd.quant,
+                             posF32.data(), posElems)) {
+      err = "failed to dequantize clip position_embd";
+      return nullptr;
+    }
+    gw.positionEmbd = posF32.data();
+
+    gw.preLnW = weights->preLnW.empty() ? nullptr : weights->preLnW.data();
+    gw.preLnB = weights->preLnB.empty() ? nullptr : weights->preLnB.data();
+    gw.postLnW = weights->postLnW.empty() ? nullptr : weights->postLnW.data();
+    gw.postLnB = weights->postLnB.empty() ? nullptr : weights->postLnB.data();
+
+    if (weights->hasProjector()) {
+      gw.mm0 = detail::toGpuClipWeight(weights->mm0);
+      gw.mm0B = weights->mm0B.empty() ? nullptr : weights->mm0B.data();
+      gw.mm2 = detail::toGpuClipWeight(weights->mm2);
+      gw.mm2B = weights->mm2B.empty() ? nullptr : weights->mm2B.data();
+    }
+
+    std::vector<cuda::GpuClipLayer> gl(cfg.blockCount);
+    for (std::uint32_t i = 0; i < cfg.blockCount; ++i) {
+      const auto& L = weights->layers[i];
+      auto& g = gl[i];
+      g.wq = detail::toGpuClipWeight(L.wq);
+      g.wk = detail::toGpuClipWeight(L.wk);
+      g.wv = detail::toGpuClipWeight(L.wv);
+      g.wo = detail::toGpuClipWeight(L.wo);
+      g.bq = L.bq.empty() ? nullptr : L.bq.data();
+      g.bk = L.bk.empty() ? nullptr : L.bk.data();
+      g.bv = L.bv.empty() ? nullptr : L.bv.data();
+      g.bo = L.bo.empty() ? nullptr : L.bo.data();
+      g.ln1W = L.ln1W.data();
+      g.ln1B = L.ln1B.empty() ? nullptr : L.ln1B.data();
+      g.ln2W = L.ln2W.data();
+      g.ln2B = L.ln2B.empty() ? nullptr : L.ln2B.data();
+      g.ffnExpand = detail::toGpuClipWeight(L.ffnExpand);
+      g.ffnExpandB = L.ffnExpandB.empty() ? nullptr : L.ffnExpandB.data();
+      g.ffnContract = detail::toGpuClipWeight(L.ffnContract);
+      g.ffnContractB = L.ffnContractB.empty() ? nullptr : L.ffnContractB.data();
+    }
+
+    auto cm = cuda::createClipVisionModel(cc, gw, gl, err);
+    if (!cm) return nullptr;
+
+    struct CudaVisionAdapter : public vision::ClipVisionModel {
+      std::unique_ptr<cuda::ClipVisionModel> impl;
+      vision::ClipConfig cfg;
+      int projDim = 0;
+      bool hasProj = false;
+      explicit CudaVisionAdapter(std::unique_ptr<cuda::ClipVisionModel> m, vision::ClipConfig c,
+                                 int pDim, bool hProj)
+          : impl(std::move(m)), cfg(std::move(c)), projDim(pDim), hasProj(hProj) {}
+      bool encodePixels(const std::vector<float>& chw, std::vector<float>& out,
+                        std::string& e) override {
+        return impl->encodePixels(chw, out, e);
+      }
+      bool project(const std::vector<float>& hidden, std::vector<float>& out,
+                   std::string& e) override {
+        return impl->project(hidden, out, e);
+      }
+      const vision::ClipConfig& config() const override { return cfg; }
+      vision::PreprocessConfig preprocessConfig() const override {
+        vision::PreprocessConfig p;
+        p.size = static_cast<int>(cfg.imageSize);
+        p.mean = cfg.imageMean;
+        p.std = cfg.imageStd;
+        return p;
+      }
+      std::uint32_t embeddingLength() const override {
+        return static_cast<std::uint32_t>(impl->embeddingLength());
+      }
+      std::uint32_t patchTokens() const override {
+        return static_cast<std::uint32_t>(impl->patchTokens());
+      }
+      int projectedDim() const override { return projDim; }
+      bool hasProjector() const override { return hasProj; }
+      std::string backendName() const override { return impl->backendName(); }
+    };
+    return std::make_unique<CudaVisionAdapter>(std::move(cm), std::move(cfg),
+                                              weights->projectedDim(), weights->hasProjector());
+  }
+
+  err = "vulkan clip backend not yet implemented";
   return nullptr;
 }
 

@@ -36,6 +36,7 @@ struct GpuClipWeight {
     std::uint32_t ggmlType = 0;
     int rows = 0;
     int cols = 0;
+    bool valid() const { return host != nullptr && rows > 0 && cols > 0; }
 };
 
 struct GpuClipLayer {
@@ -57,7 +58,7 @@ struct GpuClipLayer {
 struct GpuClipWeights {
     GpuClipWeight patchEmbd;
     const float* classEmbd = nullptr;
-    GpuClipWeight positionEmbd;
+    const float* positionEmbd = nullptr;
     const float* preLnW = nullptr;
     const float* preLnB = nullptr;
     const float* postLnW = nullptr;

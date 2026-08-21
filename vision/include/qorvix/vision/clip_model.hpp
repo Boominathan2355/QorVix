@@ -26,7 +26,9 @@ class ClipVisionModel {
  public:
   static std::optional<ClipVisionModel> fromGguf(gguf::GgufFile file, std::string& error);
 
+  ClipVisionModel() = default;
   ClipVisionModel(ClipConfig cfg, ClipWeights weights);
+  virtual ~ClipVisionModel() = default;
   ClipVisionModel(ClipVisionModel&&) noexcept = default;
   ClipVisionModel& operator=(ClipVisionModel&&) noexcept = default;
 
@@ -36,28 +38,29 @@ class ClipVisionModel {
   // LLaVA consumes the SECOND-TO-LAST hidden state of the original 24-layer tower. The mmproj
   // conversion already dropped the final block — hence block_count 23 — so running every block
   // present here yields exactly that state, with no layer-skipping logic needed.
-  bool encodePixels(const std::vector<float>& chw, std::vector<float>& out, std::string& error);
+  virtual bool encodePixels(const std::vector<float>& chw, std::vector<float>& out, std::string& error);
 
   // Full path: decode-independent image → preprocess → encode. `out` is as above.
-  bool encodeImage(const Image& img, std::vector<float>& out, std::string& error);
+  virtual bool encodeImage(const Image& img, std::vector<float>& out, std::string& error);
 
   // Applies the LLaVA mlp projector to per-patch hidden states, producing the vectors the
   // language model consumes: [patchTokens(), projectedDim()].
-  bool project(const std::vector<float>& hidden, std::vector<float>& out, std::string& error);
+  virtual bool project(const std::vector<float>& hidden, std::vector<float>& out, std::string& error);
 
   // The whole vision half of a VLM turn in one call: image -> preprocess -> tower -> projector,
   // producing [patchTokens(), projectedDim()] ready to splice into the decoder's input embeddings
   // (Phase 11b-2). Fails with a clear error when the file carries no projector, since a tower-only
   // mmproj yields 1024-d vectors that would silently mismatch a 4096-d decoder.
-  bool encodeProjected(const Image& img, std::vector<float>& out, std::string& error);
+  virtual bool encodeProjected(const Image& img, std::vector<float>& out, std::string& error);
 
-  const ClipConfig& config() const { return cfg_; }
-  PreprocessConfig preprocessConfig() const;
-  std::uint32_t embeddingLength() const { return cfg_.embeddingLength; }
+  virtual const ClipConfig& config() const { return cfg_; }
+  virtual PreprocessConfig preprocessConfig() const;
+  virtual std::uint32_t embeddingLength() const { return cfg_.embeddingLength; }
   // Patch tokens only — the class token is dropped, which is what LLaVA feeds the decoder.
-  std::uint32_t patchTokens() const { return cfg_.tokenCount() - 1; }
-  int projectedDim() const { return w_.projectedDim(); }
-  bool hasProjector() const { return w_.hasProjector(); }
+  virtual std::uint32_t patchTokens() const { return cfg_.tokenCount() > 0 ? cfg_.tokenCount() - 1 : 0; }
+  virtual int projectedDim() const { return w_.projectedDim(); }
+  virtual bool hasProjector() const { return w_.hasProjector(); }
+  virtual std::string backendName() const { return "cpu"; }
 
  private:
   void attention(const ClipLayerWeights& L, int n);

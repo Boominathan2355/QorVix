@@ -192,6 +192,8 @@ __global__ void addK(float* out, const float* x, int n) {
 __global__ void attnBidirK(float* out, const float* q, const float* k, const float* v,
                            int d, int nHeads, int nSeq) {
   extern __shared__ float shS[];
+  __shared__ float mx[256];
+  __shared__ float sm[256];
   int h = blockIdx.x;
   if (h >= nHeads) return;
   int hd = d / nHeads, off = h * hd;
@@ -203,7 +205,6 @@ __global__ void attnBidirK(float* out, const float* q, const float* k, const flo
       shS[t] = dot * scale;
     }
     __syncthreads();
-    __shared__ float mx[256];
     mx[threadIdx.x] = -1e30f;
     for (int t = threadIdx.x; t < nSeq; t += blockDim.x) mx[threadIdx.x] = fmaxf(mx[threadIdx.x], shS[t]);
     __syncthreads();
@@ -211,7 +212,6 @@ __global__ void attnBidirK(float* out, const float* q, const float* k, const flo
     float m = mx[0];
     float ls = 0.0f;
     for (int t = threadIdx.x; t < nSeq; t += blockDim.x) { shS[t] = expf(shS[t]-m); ls += shS[t]; }
-    __shared__ float sm[256];
     sm[threadIdx.x] = ls;
     __syncthreads();
     for (int s=128; s>0; s>>=1) { if(threadIdx.x<s) sm[threadIdx.x]+=sm[threadIdx.x+s]; __syncthreads(); }
@@ -229,6 +229,20 @@ __global__ void attnBidirK(float* out, const float* q, const float* k, const flo
 
 // ---- CudaClipVisionModel ----
 
+struct ClipDevWeights {
+  ClipDevW patchEmbd;
+  float* classEmbd = nullptr;
+  float* positionEmbd = nullptr;
+  float* preLnW = nullptr;
+  float* preLnB = nullptr;
+  float* postLnW = nullptr;
+  float* postLnB = nullptr;
+  ClipDevW mm0;
+  float* mm0B = nullptr;
+  ClipDevW mm2;
+  float* mm2B = nullptr;
+};
+
 struct ClipDevLayer {
   ClipDevW wq, wk, wv, wo;
   float *bq=nullptr, *bk=nullptr, *bv=nullptr, *bo=nullptr;
@@ -243,13 +257,14 @@ class CudaClipImpl : public ClipVisionModel {
   ~CudaClipImpl() override {
     auto f = [](void* p){ if(p) cudaFree(p); };
     f(wtab_.classEmbd);
+    f(wtab_.positionEmbd);
     for (auto& L : layers_) {
       f(L.bq); f(L.bk); f(L.bv); f(L.bo);
       f(L.ln1W); f(L.ln1B); f(L.ln2W); f(L.ln2B);
       f(L.ffnExpandB); f(L.ffnContractB);
       for (ClipDevW* w : {&L.wq,&L.wk,&L.wv,&L.wo,&L.ffnExpand,&L.ffnContract}) f(w->d);
     }
-    for (void* p : {wtab_.patchEmbd.d, wtab_.positionEmbd.d, wtab_.preLnW, wtab_.preLnB, wtab_.postLnW, wtab_.postLnB, wtab_.mm0.d, wtab_.mm0B, wtab_.mm2.d, wtab_.mm2B}) f(p);
+    for (void* p : {wtab_.patchEmbd.d, wtab_.preLnW, wtab_.preLnB, wtab_.postLnW, wtab_.postLnB, wtab_.mm0.d, wtab_.mm0B, wtab_.mm2.d, wtab_.mm2B}) f(p);
     for (void* p : dScratch_) f(p);
   }
 
@@ -273,8 +288,9 @@ class CudaClipImpl : public ClipVisionModel {
     // Upload patch embedding weight
     if (!upW(w.patchEmbd, wtab_.patchEmbd)) { err = "patch_embd failed"; return false; }
     if (w.classEmbd) wtab_.classEmbd = upF(w.classEmbd, d);
-    if (w.positionEmbd.valid()) {
-      if (!upW(w.positionEmbd, wtab_.positionEmbd)) { err = "pos_embd failed"; return false; }
+    if (w.positionEmbd) {
+      wtab_.positionEmbd = upF(w.positionEmbd, static_cast<std::size_t>(n) * d);
+      if (!wtab_.positionEmbd) { err = "pos_embd failed"; return false; }
     }
     if (w.preLnW) { wtab_.preLnW = upF(w.preLnW, d); wtab_.preLnB = w.preLnB ? upF(w.preLnB, d) : nullptr; }
     if (w.postLnW) { wtab_.postLnW = upF(w.postLnW, d); wtab_.postLnB = w.postLnB ? upF(w.postLnB, d) : nullptr; }
@@ -339,11 +355,14 @@ class CudaClipImpl : public ClipVisionModel {
                   chw[c*plane + static_cast<std::size_t>(py*patch+ky)*imgSize + px*patch+kx];
       }
 
-    // Upload flat patches and run patchEmbd matmul
+    // Upload flat patches and run patchEmbd matmul for each patch
     float* dFlat = nullptr;
     cudaMalloc(&dFlat, flat.size()*sizeof(float));
     cudaMemcpy(dFlat, flat.data(), flat.size()*sizeof(float), cudaMemcpyHostToDevice);
-    clipMatmul(dScratch_[0]+d, wtab_.patchEmbd, dFlat);
+    for (int p = 0; p < side * side; ++p) {
+      clipMatmul(dScratch_[0] + static_cast<std::size_t>(1 + p) * d, wtab_.patchEmbd,
+                 dFlat + static_cast<std::size_t>(p) * patchElems);
+    }
     cudaFree(dFlat);
 
     // Copy class embedding to row 0
@@ -351,9 +370,9 @@ class CudaClipImpl : public ClipVisionModel {
       cudaMemcpy(dScratch_[0], wtab_.classEmbd, d*sizeof(float), cudaMemcpyDeviceToDevice);
 
     // Position embeddings
-    if (wtab_.positionEmbd.d)
+    if (wtab_.positionEmbd)
       for (int t = 0; t < n; ++t) {
-        embedRowK<<<g(d),kClipThreads>>>(dScratch_[6], (const float*)wtab_.positionEmbd.d, t, d);
+        embedRowK<<<g(d),kClipThreads>>>(dScratch_[6], wtab_.positionEmbd, t, d);
         addK<<<g(d),kClipThreads>>>(dScratch_[0]+t*d, dScratch_[6], d);
       }
 
@@ -463,7 +482,7 @@ class CudaClipImpl : public ClipVisionModel {
 
  private:
   ClipConfig cfg_;
-  GpuClipWeights wtab_{};
+  ClipDevWeights wtab_{};
   std::vector<ClipDevLayer> layers_;
   float* dScratch_[8] = {};
 };

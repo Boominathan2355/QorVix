@@ -21,6 +21,7 @@ struct EmbeddingConfig {
     float normEps = 1e-5f;
     bool ffnGated = false;
     bool hasTokenTypes = false;
+    int tokenTypeCount = 0;
     bool hasPositionEmbd = true;
     bool hasEmbdNorm = false;
     int defaultPooling = 0;  // 0=CLS, 1=Last, 2=Mean
@@ -32,6 +33,7 @@ struct VulkanEmbedWeight {
     std::uint32_t ggmlType = 0;
     int rows = 0;
     int cols = 0;
+    bool valid() const { return host != nullptr && rows > 0 && cols > 0; }
 };
 
 struct VulkanEmbedLayer {
@@ -67,6 +69,14 @@ public:
                            std::vector<float>& out, std::string& error) = 0;
     virtual bool embedTokens(const std::vector<int>& tokens, std::vector<float>& out,
                              std::string& error) = 0;
+    virtual bool embedBatch(const std::vector<std::vector<int>>& batch,
+                            std::vector<std::vector<float>>& out, std::string& error) {
+      out.resize(batch.size());
+      for (std::size_t i = 0; i < batch.size(); ++i) {
+        if (!embed(batch[i], out[i], error)) return false;
+      }
+      return true;
+    }
     virtual int dim() const = 0;
     virtual int maxSeqLen() const = 0;
     virtual int defaultPooling() const = 0;

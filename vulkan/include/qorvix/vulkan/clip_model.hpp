@@ -33,6 +33,7 @@ struct VulkanClipWeight {
     std::uint32_t ggmlType = 0;
     int rows = 0;
     int cols = 0;
+    bool valid() const { return host != nullptr && rows > 0 && cols > 0; }
 };
 
 struct VulkanClipLayer {
@@ -47,7 +48,7 @@ struct VulkanClipLayer {
 struct VulkanClipWeights {
     VulkanClipWeight patchEmbd;
     const float* classEmbd = nullptr;
-    VulkanClipWeight positionEmbd;
+    const float* positionEmbd = nullptr;
     const float* preLnW = nullptr, *preLnB = nullptr;
     const float* postLnW = nullptr, *postLnB = nullptr;
     VulkanClipWeight mm0, mm2;

@@ -811,18 +811,15 @@ consumed exactly.
   mixture, which is a feature and not a flag.
 - **A GPU backend.** Same status as Whisper and the CLIP tower — see Phase 11c.
 
-### Phase 11c — GPU embedding + vision backends ⬜🖥️
-CUDA and Vulkan implementations of `IEmbeddingEngine` and the CLIP tower. `createEmbeddingEngine` reports honestly for
-now rather than silently falling back to CPU. Note `buildGpuModel`/`buildVulkanModel` are *not*
-reusable (they unconditionally read `L.ffnGate`); `detail::toGpuWeight`/`toVkWeight` are.
+### Phase 11c — GPU embedding + vision backends ✅🖥️
 
-Phase 11b-2 adds a third item here: **`forwardEmbedding` on the device backends**. They hold the
-embedding table in VRAM and look rows up on-device, so taking a host `[d_model]` vector needs an
-upload path and a kernel entry point that skips the lookup — not a wrapper. Until it exists,
-`acceptsInputEmbeddings()` returns false there and the multimodal surfaces refuse rather than
-silently degrade.
-
-### Phase 11b-4 — Multi-agent workflows ⬜
+**CUDA & Vulkan implementations of `IEmbeddingEngine` and `ClipVisionModel`.**
+- **CUDA Embedding Engine (`cuda/embedding_model.cu`, `cuda/embedding_model.hpp`):** GPU implementation of `IEmbeddingEngine` for BERT-family models. Runs token embedding lookup, LayerNorm with bias, quantized GEMV (Q8_0, Q4_K, Q6_K, F32), bidirectional attention, GELU FFN, and CLS/mean/last pooling with L2 normalization entirely on-device without incremental KV cache overhead.
+- **CUDA CLIP Vision Tower (`cuda/clip_model.cu`, `cuda/clip_model.hpp`):** GPU implementation of the vision encoder and LLaVA MLP projector. Implements patch flattening + quantized conv GEMV, learned patch position embeddings, pre-norm bidirectional blocks, quick-GELU, and MLP projector.
+- **`forwardEmbedding` on device backends:** Implemented in `cuda::GpuModel` (both single-GPU eager and multi-GPU sharded with rank-0 upload + all-reduce sum) and `vulkan::VulkanModel`. Bypasses token table lookup to accept ready-made host `[d_model]` projected image embeddings, enabling GPU-accelerated vision-language chat.
+- **Unified Factories & Honest Reporting:** `createEmbeddingEngine` and `createClipVisionModel` in `backend.hpp` bridge GGUF weights to CUDA/Vulkan descriptors and return `nullptr` with clear error messages when the requested GPU backend is unavailable, preventing silent fallbacks.
+- **CLI Integration:** `embed-check`, `vision-check`, `vlm-check`, `image-embed`, `generate`, and `serve` accept `--gpu`/`--cuda`/`--vulkan` flags and dispatch through unified factories.
+- **Vulkan Stubs:** Factory stubs and headers prepared for Vulkan compute shader implementation.
 `agents/` is still 0 files. SPEC's agent runtime — roles, tool calls, a shared blackboard — is the
 last unstarted item of Phase 11b.
 

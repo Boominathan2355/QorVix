@@ -512,10 +512,10 @@ int cmdGenerate(const std::vector<std::string_view>& args) {
     // seconds) or the decoder's weight load. A mismatched mmproj — the likeliest setup mistake —
     // therefore costs nothing to discover.
     std::vector<qorvix::runtime::PromptPart> imageParts;
-    std::optional<qorvix::vision::ClipVisionModel> tower;
+    std::unique_ptr<qorvix::vision::ClipVisionModel> tower;
     if (!mmprojPath.empty()) {
-      tower = qorvix::vision::ClipVisionModel::fromGguf(
-          qorvix::gguf::GgufFile::open(mmprojPath), err);
+      tower = qorvix::createClipVisionModel(
+          backend, qorvix::gguf::GgufFile::open(mmprojPath), err);
       if (!tower) {
         std::cerr << "error: vision tower: " << err << "\n";
         return 1;
@@ -981,7 +981,7 @@ int cmdImageEmbed(const std::vector<std::string_view>& args) {
   const std::string mm = args.size() > 1 ? std::string(args[1]) : std::string();
   const std::string imagePath = flagValue(args, "--image");
   if (mm.empty() || imagePath.empty()) {
-    std::cerr << "usage: qorvix image-embed <mmproj.gguf> --image <file.png> [--project] [--json]\n";
+    std::cerr << "usage: qorvix image-embed <mmproj.gguf> --image <file.png> [--project] [--json] [--gpu|--vulkan]\n";
     return 1;
   }
   const bool json = hasFlag(args, "--json");
@@ -991,7 +991,7 @@ int cmdImageEmbed(const std::vector<std::string_view>& args) {
     using clock = std::chrono::steady_clock;
     const auto tLoad0 = clock::now();
     std::string err;
-    auto model = vis::ClipVisionModel::fromGguf(qorvix::gguf::GgufFile::open(mm), err);
+    auto model = qorvix::createClipVisionModel(backendFromArgs(args), qorvix::gguf::GgufFile::open(mm), err);
     if (!model) {
       std::cerr << "error: vision tower: " << err << "\n";
       return 1;
@@ -1647,7 +1647,7 @@ int cmdVisionCheck(const std::vector<std::string_view>& args) {
   std::string imagePath = flagValue(args, "--image");
   if (mm.empty() || refPath.empty()) {
     std::cerr << "usage: qorvix vision-check <mmproj.gguf> --ref <fixture> [--image <file.png>] "
-                 "[--min-cos 0.999]\n";
+                 "[--min-cos 0.999] [--cuda|--vulkan]\n";
     return 1;
   }
   if (imagePath.empty()) imagePath = "tests/data/vision_probe.png";
@@ -1666,7 +1666,7 @@ int cmdVisionCheck(const std::vector<std::string_view>& args) {
       std::cerr << "error: " << err << "\n";
       return 1;
     }
-    auto model = vis::ClipVisionModel::fromGguf(qorvix::gguf::GgufFile::open(mm), err);
+    auto model = qorvix::createClipVisionModel(backendFromArgs(args), qorvix::gguf::GgufFile::open(mm), err);
     if (!model) {
       std::cerr << "error: vision tower: " << err << "\n";
       return 1;
@@ -1906,8 +1906,8 @@ int cmdVlmCheck(const std::vector<std::string_view>& args) {
     if (mmprojPath.empty() || imagePath.empty()) {
       std::cout << "tier 3  image splice — SKIPPED (pass --mmproj <clip.gguf> --image <f.png>)\n";
     } else {
-      auto tower = qorvix::vision::ClipVisionModel::fromGguf(
-          qorvix::gguf::GgufFile::open(mmprojPath), err);
+      auto tower = qorvix::createClipVisionModel(
+          vlmBackend, qorvix::gguf::GgufFile::open(mmprojPath), err);
       if (!tower) {
         std::cerr << "error: vision tower: " << err << "\n";
         return 1;
@@ -2630,7 +2630,7 @@ int cmdServe(const std::vector<std::string_view>& args) {
   // projector width can be checked against the decoder's d_model at startup — pairing an mmproj
   // with the wrong language model is a setup error, and finding it on the first request instead
   // of at boot means it surfaces to a user rather than to the operator.
-  std::optional<qorvix::vision::ClipVisionModel> tower;
+  std::unique_ptr<qorvix::vision::ClipVisionModel> tower;
   if (!mmprojPath.empty()) {
     if (!engine->acceptsInputEmbeddings()) {
       std::cerr << "error: the " << engine->backendName()
@@ -2639,8 +2639,8 @@ int cmdServe(const std::vector<std::string_view>& args) {
       return 1;
     }
     try {
-      tower = qorvix::vision::ClipVisionModel::fromGguf(
-          qorvix::gguf::GgufFile::open(mmprojPath), err);
+      tower = qorvix::createClipVisionModel(
+          backend, qorvix::gguf::GgufFile::open(mmprojPath), err);
     } catch (const qorvix::gguf::GgufParseError& e) {
       std::cerr << "error: vision tower: " << e.what() << "\n";
       return 1;
