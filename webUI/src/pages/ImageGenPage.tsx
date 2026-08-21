@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
+import { Card, CardTitle } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Slider } from '../components/ui/Slider';
 import { Badge } from '../components/ui/Badge';
@@ -9,7 +9,6 @@ import {
   ImageIcon,
   SparklesIcon,
   DownloadIcon,
-  ZapIcon,
   TrashIcon,
 } from '../components/icons/Icons';
 import { api } from '../services/api';
@@ -93,8 +92,8 @@ export const ImageGenPage: React.FC = () => {
             <Badge variant="warning" size="sm">Stable Diffusion UNet + VAE</Badge>
             <Badge variant="primary" size="sm">Native C++ Euler Ancestral Sampler</Badge>
           </div>
-          <h2 className="text-2xl font-bold text-slate-100 tracking-tight flex items-center gap-2">
-            <ImageIcon size={24} className="text-pink-400" />
+          <h2 className="text-2xl font-bold text-foreground tracking-tight flex items-center gap-2">
+            <ImageIcon size={24} className="text-pink-500" />
             Stable Diffusion Studio
           </h2>
         </div>
@@ -104,35 +103,35 @@ export const ImageGenPage: React.FC = () => {
         {/* Left Column: Prompt & Sampling Controls */}
         <div className="lg:col-span-5 space-y-5">
           <Card glass className="p-6 space-y-5">
-            <CardTitle className="text-sm font-semibold text-slate-200">
+            <CardTitle className="text-sm font-semibold text-foreground">
               Prompt & Synthesis Settings
             </CardTitle>
 
             <div className="space-y-3">
               <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-slate-300">Prompt</label>
+                <label className="block text-xs font-medium text-foreground">Prompt</label>
                 <textarea
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
                   placeholder="A cinematic futuristic cityscape..."
                   rows={3}
-                  className="w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-teal-500/60 focus:ring-2 focus:ring-teal-500/20"
+                  className="w-full bg-background border border-border rounded-xl p-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-teal-500/60 focus:ring-2 focus:ring-teal-500/20"
                 />
               </div>
 
               <div className="space-y-1.5">
-                <label className="block text-xs font-medium text-slate-400">Negative Prompt</label>
+                <label className="block text-xs font-medium text-muted-foreground">Negative Prompt</label>
                 <input
                   type="text"
                   value={negativePrompt}
                   onChange={(e) => setNegativePrompt(e.target.value)}
                   placeholder="blurry, distorted, low quality..."
-                  className="w-full bg-slate-950/60 border border-slate-800 rounded-xl p-2.5 text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:border-teal-500/50"
+                  className="w-full bg-background border border-border rounded-xl p-2.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-teal-500/50"
                 />
               </div>
             </div>
 
-            <div className="space-y-4 pt-2 border-t border-slate-800/80">
+            <div className="space-y-4 pt-2 border-t border-border">
               <Slider
                 label="Diffusion Steps"
                 min={5}
@@ -154,11 +153,11 @@ export const ImageGenPage: React.FC = () => {
 
               <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1.5">
-                  <label className="block text-xs font-medium text-slate-300">Resolution</label>
+                  <label className="block text-xs font-medium text-foreground">Resolution</label>
                   <select
                     value={size}
                     onChange={(e) => setSize(e.target.value as typeof size)}
-                    className="w-full bg-slate-950/70 border border-slate-800 rounded-xl p-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-teal-500/50"
+                    className="w-full bg-background border border-border rounded-xl p-2 text-xs font-mono text-foreground focus:outline-none focus:border-teal-500/50"
                   >
                     <option value="512x512">512 × 512 (Square)</option>
                     <option value="768x512">768 × 512 (Landscape)</option>
@@ -167,12 +166,12 @@ export const ImageGenPage: React.FC = () => {
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="block text-xs font-medium text-slate-300">Seed (-1 = Random)</label>
+                  <label className="block text-xs font-medium text-foreground">Seed (-1 = Random)</label>
                   <input
                     type="number"
                     value={seed}
                     onChange={(e) => setSeed(parseInt(e.target.value) || -1)}
-                    className="w-full bg-slate-950/70 border border-slate-800 rounded-xl p-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-teal-500/50"
+                    className="w-full bg-background border border-border rounded-xl p-2 text-xs font-mono text-foreground focus:outline-none focus:border-teal-500/50"
                   />
                 </div>
               </div>
@@ -195,9 +194,9 @@ export const ImageGenPage: React.FC = () => {
         {/* Right Column: Generation Output & Gallery */}
         <div className="lg:col-span-7 space-y-5">
           <Card glass className="p-6 space-y-4 min-h-[480px]">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <CardTitle className="text-sm font-bold text-slate-100 flex items-center gap-2">
-                <SparklesIcon size={16} className="text-pink-400" />
+            <div className="flex items-center justify-between border-b border-border pb-3">
+              <CardTitle className="text-sm font-bold text-foreground flex items-center gap-2">
+                <SparklesIcon size={16} className="text-pink-500" />
                 Image Gallery ({gallery.length})
               </CardTitle>
             </div>
@@ -209,17 +208,17 @@ export const ImageGenPage: React.FC = () => {
                   <span className="relative inline-flex rounded-full h-5 w-5 bg-pink-500" />
                 </span>
                 <div className="space-y-1">
-                  <p className="text-sm font-bold text-slate-100">
+                  <p className="text-sm font-bold text-foreground">
                     Running UNet Denoising Steps ({steps} iterations)...
                   </p>
-                  <p className="text-xs text-slate-500 font-mono">
+                  <p className="text-xs text-muted-foreground font-mono">
                     VAE Latent Decoding onto host frame buffer
                   </p>
                 </div>
               </div>
             ) : gallery.length === 0 ? (
-              <div className="h-80 flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
-                <ImageIcon size={40} className="text-slate-700" />
+              <div className="h-80 flex flex-col items-center justify-center text-center text-muted-foreground space-y-2">
+                <ImageIcon size={40} className="text-muted-foreground/50" />
                 <p className="text-xs font-mono">No images synthesized yet. Enter a prompt to begin.</p>
               </div>
             ) : (
@@ -228,18 +227,18 @@ export const ImageGenPage: React.FC = () => {
                   <div
                     key={img.id}
                     onClick={() => setSelectedImage(img)}
-                    className="group relative aspect-square rounded-2xl overflow-hidden border border-slate-800 hover:border-teal-500/60 bg-slate-950 cursor-pointer shadow-lg transition-all"
+                    className="group relative aspect-square rounded-2xl overflow-hidden border border-border hover:border-teal-500/60 bg-card cursor-pointer shadow-md transition-all"
                   >
                     <img
                       src={img.url}
                       alt={img.prompt}
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                     />
-                    <div className="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity p-3 flex flex-col justify-end">
-                      <p className="text-[11px] text-slate-200 line-clamp-2 font-medium">
+                    <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity p-3 flex flex-col justify-end">
+                      <p className="text-[11px] text-white line-clamp-2 font-medium">
                         {img.prompt}
                       </p>
-                      <div className="flex items-center justify-between mt-2 pt-1 border-t border-slate-700/60 text-[10px] text-slate-400 font-mono">
+                      <div className="flex items-center justify-between mt-2 pt-1 border-t border-white/20 text-[10px] text-white/80 font-mono">
                         <span>{img.width}×{img.height}</span>
                         <button
                           onClick={(e) => handleDelete(img.id, e)}
@@ -267,7 +266,7 @@ export const ImageGenPage: React.FC = () => {
           maxWidth="2xl"
         >
           <div className="space-y-4">
-            <div className="relative rounded-2xl overflow-hidden bg-slate-950 border border-slate-800 shadow-2xl flex items-center justify-center">
+            <div className="rounded-2xl overflow-hidden bg-background border border-border flex items-center justify-center">
               <img
                 src={selectedImage.url}
                 alt={selectedImage.prompt}
@@ -275,22 +274,22 @@ export const ImageGenPage: React.FC = () => {
               />
             </div>
 
-            <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 space-y-2 text-xs">
+            <div className="p-4 rounded-xl bg-secondary border border-border space-y-2 text-xs">
               <div className="space-y-1">
-                <span className="text-slate-400 font-mono uppercase text-[10px]">Prompt</span>
-                <p className="text-slate-200 font-medium">{selectedImage.prompt}</p>
+                <span className="text-muted-foreground font-mono uppercase text-[10px]">Prompt</span>
+                <p className="text-foreground font-medium">{selectedImage.prompt}</p>
               </div>
               {selectedImage.negativePrompt && (
                 <div className="space-y-1">
-                  <span className="text-slate-400 font-mono uppercase text-[10px]">Negative</span>
-                  <p className="text-slate-400">{selectedImage.negativePrompt}</p>
+                  <span className="text-muted-foreground font-mono uppercase text-[10px]">Negative</span>
+                  <p className="text-muted-foreground">{selectedImage.negativePrompt}</p>
                 </div>
               )}
-              <div className="flex flex-wrap gap-4 pt-2 border-t border-slate-800/80 font-mono text-slate-400 text-[11px]">
-                <span>Steps: <b className="text-slate-200">{selectedImage.steps}</b></span>
-                <span>CFG: <b className="text-slate-200">{selectedImage.guidance}</b></span>
-                <span>Seed: <b className="text-slate-200">{selectedImage.seed}</b></span>
-                <span>Size: <b className="text-slate-200">{selectedImage.width}×{selectedImage.height}</b></span>
+              <div className="flex flex-wrap gap-4 pt-2 border-t border-border font-mono text-muted-foreground text-[11px]">
+                <span>Steps: <b className="text-foreground">{selectedImage.steps}</b></span>
+                <span>CFG: <b className="text-foreground">{selectedImage.guidance}</b></span>
+                <span>Seed: <b className="text-foreground">{selectedImage.seed}</b></span>
+                <span>Size: <b className="text-foreground">{selectedImage.width}×{selectedImage.height}</b></span>
               </div>
             </div>
 

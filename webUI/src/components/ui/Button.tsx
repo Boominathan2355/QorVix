@@ -28,23 +28,23 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
 
     const variants = {
       primary:
-        'bg-teal-500 hover:bg-teal-400 text-slate-950 font-semibold shadow-lg shadow-teal-500/20 hover:shadow-teal-500/35 border border-teal-400/30',
+        'bg-teal-500 hover:bg-teal-400 text-slate-950 font-semibold shadow-sm shadow-teal-500/20 border border-teal-400/40',
       secondary:
-        'bg-slate-800/80 hover:bg-slate-700/80 text-slate-100 border border-slate-700/50 shadow-sm',
+        'bg-secondary hover:bg-muted text-foreground border border-border shadow-xs',
       outline:
-        'border border-slate-700/80 hover:border-slate-500 bg-transparent hover:bg-slate-800/50 text-slate-200',
+        'border border-border hover:border-foreground/40 bg-background hover:bg-secondary text-foreground shadow-xs',
       ghost:
-        'hover:bg-slate-800/60 text-slate-300 hover:text-slate-100',
+        'hover:bg-secondary text-muted-foreground hover:text-foreground',
       danger:
-        'bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 hover:border-red-500/60 shadow-sm',
+        'bg-red-500/15 hover:bg-red-500/25 text-red-600 dark:text-red-400 border border-red-500/30 shadow-xs',
       glow:
-        'bg-gradient-to-r from-teal-500 to-emerald-500 hover:from-teal-400 hover:to-emerald-400 text-slate-950 font-semibold shadow-lg shadow-teal-500/30 border border-teal-300/40',
+        'bg-teal-500 hover:bg-teal-400 text-slate-950 font-semibold shadow-md shadow-teal-500/30 border border-teal-300/40',
     };
 
     const sizes = {
-      sm: 'text-xs h-8 px-3 rounded-lg gap-1.5',
-      md: 'text-sm h-9.5 px-4 rounded-xl gap-2',
-      lg: 'text-base h-11 px-5 rounded-xl gap-2.5',
+      sm: 'text-xs h-8 px-3 rounded-xl gap-1.5',
+      md: 'text-sm h-9 px-4 rounded-xl gap-2',
+      lg: 'text-base h-11 px-5 rounded-2xl gap-2.5',
       icon: 'h-9 w-9 rounded-xl p-0',
     };
 

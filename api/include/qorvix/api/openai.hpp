@@ -16,22 +16,52 @@ namespace qorvix::api {
 // One element of OpenAI's multimodal `content` array. A message whose content is a plain string
 // has no parts; a message whose content is an array has one part per element.
 struct ContentPart {
-  enum class Type { Text, ImageUrl };
+  enum class Type { Text, ImageUrl, InputAudio, VideoUrl };
   Type type = Type::Text;
-  std::string text;      // Type::Text
-  std::string imageUrl;  // Type::ImageUrl — the raw url field, usually a data: URI
+  std::string text;         // Type::Text
+  std::string imageUrl;     // Type::ImageUrl — raw url field, usually a data: URI
+  std::string videoUrl;     // Type::VideoUrl — video data URI or URL
+  std::string audioData;    // Type::InputAudio — base64 encoded audio bytes
+  std::string audioFormat;  // Type::InputAudio — "wav", "mp3", "ogg", "flac"
+};
+
+// Model Context Protocol (MCP) and OpenAI Tool schemas
+struct ToolFunction {
+  std::string name;
+  std::string description;
+  json::Value parameters;  // JSON Schema definition of input parameters
+};
+
+struct ToolDefinition {
+  std::string type = "function";
+  ToolFunction function;
+};
+
+struct ToolCall {
+  std::string id;
+  std::string type = "function";
+  std::string name;
+  std::string arguments;  // JSON stringified arguments
 };
 
 struct ChatMessage {
   std::string role;
-  // The message as text. For an array content this is the flattened form — see
-  // flattenContentParts, which is what fills it with image markers in the right places.
+  // The message as text. For an array content this is the flattened form
   std::string content;
-  std::vector<ContentPart> parts;  // empty when `content` arrived as a plain string
+  std::string reasoningContent;     // Chain-of-thought / <think> reasoning tokens
+  std::vector<ContentPart> parts;   // empty when `content` arrived as a plain string
+  std::vector<ToolCall> toolCalls;  // tool calls emitted by assistant
+  std::string toolCallId;           // for role="tool", the id of the call this answers
 
   bool hasImages() const {
     for (const auto& p : parts)
       if (p.type == ContentPart::Type::ImageUrl) return true;
+    return false;
+  }
+
+  bool hasAudio() const {
+    for (const auto& p : parts)
+      if (p.type == ContentPart::Type::InputAudio) return true;
     return false;
   }
 };
@@ -54,6 +84,8 @@ struct ChatRequest {
   bool valid = false;
   std::string model;
   std::vector<ChatMessage> messages;
+  std::vector<ToolDefinition> tools;  // MCP tools exposed to model
+  std::string toolChoice = "auto";
   bool stream = false;
   SamplingRequest sampling;
 };

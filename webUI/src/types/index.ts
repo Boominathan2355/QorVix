@@ -1,6 +1,8 @@
 // Type definitions for QorVix Studio & Dashboard
 
-export type MessageRole = 'system' | 'user' | 'assistant';
+export type PageId = 'chat' | 'dashboard' | 'settings' | 'vision' | 'audio' | 'images' | 'embeddings' | 'models' | 'memory' | 'performance' | 'metrics';
+
+export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ImageContentPart {
   type: 'image_url';
@@ -9,18 +11,85 @@ export interface ImageContentPart {
   };
 }
 
+export interface AudioContentPart {
+  type: 'input_audio';
+  input_audio: {
+    data: string; // base64 encoded audio
+    format: string; // wav, mp3, ogg, flac
+  };
+}
+
+export interface VideoContentPart {
+  type: 'video_url';
+  video_url: {
+    url: string; // base64 data URI or video URL
+  };
+}
+
 export interface TextContentPart {
   type: 'text';
   text: string;
 }
 
-export type ChatContent = string | (TextContentPart | ImageContentPart)[];
+export type ContentPart = TextContentPart | ImageContentPart | AudioContentPart | VideoContentPart;
+export type ChatContent = string | ContentPart[];
+
+// Model Context Protocol (MCP) Schemas
+export interface McpTool {
+  name: string;
+  description: string;
+  inputSchema: {
+    type?: string;
+    properties?: Record<string, any>;
+    required?: string[];
+  };
+  serverId: string;
+  enabled?: boolean;
+}
+
+export interface McpServer {
+  id: string;
+  name: string;
+  type: 'stdio' | 'sse';
+  command?: string;
+  args?: string[];
+  url?: string;
+  status: 'connected' | 'disconnected' | 'connecting' | 'error';
+  error?: string;
+  tools: McpTool[];
+}
+
+export interface McpToolCall {
+  id: string;
+  name: string;
+  arguments: Record<string, any>;
+  status: 'pending' | 'running' | 'completed' | 'error';
+  result?: any;
+  error?: string;
+  durationMs?: number;
+}
+
+export interface ThinkingState {
+  isThinking: boolean;
+  text: string;
+  durationSeconds: number;
+  startTime?: number;
+}
 
 export interface ChatMessage {
   id: string;
   role: MessageRole;
   content: string;
+  thinking?: string; // Chain-of-thought / <think> reasoning tokens
+  thinkingDuration?: number; // Thinking duration in seconds
   images?: string[]; // data URLs
+  videos?: string[]; // video data URLs
+  audioUrl?: string; // audio playback url
+  audioData?: string; // base64 audio data
+  audioFormat?: string;
+  toolCalls?: McpToolCall[]; // MCP tool calls requested by assistant
+  toolCallId?: string; // For role="tool", the call ID this answers
+  generatedImage?: GeneratedImage;
   timestamp: number;
   tokensPerSec?: number;
   totalTokens?: number;
@@ -41,6 +110,17 @@ export interface ChatSession {
   topK: number;
   maxTokens: number;
   repeatPenalty: number;
+  enableThinking?: boolean;
+  enableMcpTools?: boolean;
+}
+
+export interface ModelCapabilities {
+  text: boolean;
+  image: boolean;
+  audio: boolean;
+  video: boolean;
+  thinking: boolean;
+  mcp_tools: boolean;
 }
 
 export interface ModelInfo {
@@ -56,6 +136,7 @@ export interface ModelInfo {
   quantization?: string;
   backend?: string;
   is_multimodal?: boolean;
+  capabilities?: ModelCapabilities;
 }
 
 export interface AudioTranscriptionResult {

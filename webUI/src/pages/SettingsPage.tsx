@@ -1,11 +1,11 @@
 import React, { useState } from 'react';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
+import { Card, CardTitle } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
 import { Switch } from '../components/ui/Switch';
 import { Badge } from '../components/ui/Badge';
 import { useToast } from '../components/ui/Toast';
-import { SettingsIcon, HardDriveIcon, ZapIcon, TrashIcon } from '../components/icons/Icons';
+import { SettingsIcon, TrashIcon } from '../components/icons/Icons';
 import { api } from '../services/api';
 
 export const SettingsPage: React.FC = () => {
@@ -60,8 +60,8 @@ export const SettingsPage: React.FC = () => {
           <Badge variant="primary" size="sm">System Configuration</Badge>
           <Badge variant="neutral" size="sm">Single Source of Truth</Badge>
         </div>
-        <h2 className="text-2xl font-bold text-slate-100 tracking-tight flex items-center gap-2">
-          <SettingsIcon size={24} className="text-teal-400" />
+        <h2 className="text-2xl font-bold text-foreground tracking-tight flex items-center gap-2">
+          <SettingsIcon size={24} className="text-teal-500" />
           Settings & Port Allocations
         </h2>
       </div>
@@ -70,7 +70,7 @@ export const SettingsPage: React.FC = () => {
         {/* Connection Settings */}
         <div className="md:col-span-6 space-y-5">
           <Card glass className="p-6 space-y-5">
-            <CardTitle className="text-sm font-semibold text-slate-200">
+            <CardTitle className="text-sm font-semibold text-foreground">
               API Connection Endpoints
             </CardTitle>
 
@@ -111,7 +111,7 @@ export const SettingsPage: React.FC = () => {
 
           {/* Preferences */}
           <Card glass className="p-6 space-y-4">
-            <CardTitle className="text-sm font-semibold text-slate-200">
+            <CardTitle className="text-sm font-semibold text-foreground">
               UI Preferences
             </CardTitle>
 
@@ -130,7 +130,7 @@ export const SettingsPage: React.FC = () => {
               />
             </div>
 
-            <div className="pt-4 border-t border-slate-800">
+            <div className="pt-4 border-t border-border">
               <Button
                 variant="danger"
                 size="sm"
@@ -146,12 +146,12 @@ export const SettingsPage: React.FC = () => {
         {/* Port Allocations Reference */}
         <div className="md:col-span-6 space-y-5">
           <Card glass className="p-6 space-y-4">
-            <CardTitle className="text-sm font-semibold text-slate-200 flex items-center justify-between">
+            <CardTitle className="text-sm font-semibold text-foreground flex items-center justify-between">
               <span>Port Allocation Registry</span>
-              <span className="text-xs font-mono text-teal-400 font-normal">2005-2010 BLOCK</span>
+              <span className="text-xs font-mono text-teal-600 dark:text-teal-400 font-normal">2005-2010 BLOCK</span>
             </CardTitle>
 
-            <p className="text-xs text-slate-400 font-sans leading-relaxed">
+            <p className="text-xs text-muted-foreground font-sans leading-relaxed">
               QorVix reserves the contiguous 2005–2010 range to avoid firewall and routing conflicts.
             </p>
 
@@ -159,13 +159,13 @@ export const SettingsPage: React.FC = () => {
               {portAllocations.map((p) => (
                 <div
                   key={p.port}
-                  className="p-3 rounded-xl bg-slate-950/70 border border-slate-800/80 space-y-1 text-xs font-mono"
+                  className="p-3 rounded-xl bg-secondary border border-border space-y-1 text-xs font-mono"
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-bold text-teal-300">{p.port} • {p.service}</span>
-                    <span className="text-[10px] text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-slate-800">{p.status}</span>
+                    <span className="font-bold text-teal-600 dark:text-teal-400">{p.port} • {p.service}</span>
+                    <span className="text-[10px] text-muted-foreground bg-card px-2 py-0.5 rounded border border-border">{p.status}</span>
                   </div>
-                  <p className="text-[11px] text-slate-400 font-sans">{p.description}</p>
+                  <p className="text-[11px] text-muted-foreground font-sans">{p.description}</p>
                 </div>
               ))}
             </div>

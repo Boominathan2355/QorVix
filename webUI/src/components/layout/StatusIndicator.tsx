@@ -23,7 +23,7 @@ export const StatusIndicator: React.FC = () => {
   }, []);
 
   return (
-    <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-900/90 border border-slate-800 text-xs font-mono select-none">
+    <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-card border border-border text-xs font-mono select-none shadow-xs">
       <span className="relative flex h-2 w-2">
         {online === true && (
           <>
@@ -38,7 +38,7 @@ export const StatusIndicator: React.FC = () => {
           <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500 animate-pulse" />
         )}
       </span>
-      <span className={online ? 'text-emerald-400 font-medium' : online === false ? 'text-red-400 font-medium' : 'text-slate-400'}>
+      <span className={online ? 'text-emerald-600 dark:text-emerald-400 font-medium' : online === false ? 'text-red-600 dark:text-red-400 font-medium' : 'text-muted-foreground'}>
         {online === true ? `Online (${latency}ms)` : online === false ? 'Disconnected' : 'Checking...'}
       </span>
     </div>

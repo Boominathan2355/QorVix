@@ -3,65 +3,88 @@
 @tailwind utilities;
 
 @layer base {
-  :root {
-    --background: 224 71% 4%;
-    --foreground: 213 31% 91%;
+  :root,
+  .dark {
+    --background: #09090b;
+    --foreground: #f4f4f5;
     
-    --card: 224 71% 6%;
-    --card-foreground: 213 31% 91%;
+    --card: #111114;
+    --card-foreground: #f4f4f5;
     
-    --popover: 224 71% 6%;
-    --popover-foreground: 213 31% 91%;
+    --popover: #111114;
+    --popover-foreground: #f4f4f5;
     
-    --primary: 168 80% 45%;
-    --primary-foreground: 224 71% 4%;
+    --primary: #14b8a6;
+    --primary-foreground: #09090b;
     
-    --secondary: 222 47% 11%;
-    --secondary-foreground: 210 40% 98%;
+    --secondary: #18181b;
+    --secondary-foreground: #f4f4f5;
     
-    --muted: 223 47% 11%;
-    --muted-foreground: 215 20% 65%;
+    --muted: #27272a;
+    --muted-foreground: #a1a1aa;
     
-    --accent: 217 33% 17%;
-    --accent-foreground: 210 40% 98%;
+    --accent: #27272a;
+    --accent-foreground: #f4f4f5;
     
-    --destructive: 0 63% 31%;
-    --destructive-foreground: 210 40% 98%;
+    --destructive: #ef4444;
+    --destructive-foreground: #f4f4f5;
     
-    --border: 217 33% 14%;
-    --input: 217 33% 14%;
-    --ring: 168 80% 45%;
+    --border: #27272a;
+    --input: #27272a;
+    --ring: #14b8a6;
     
-    --radius: 0.625rem;
+    --radius: 0.875rem;
+    color-scheme: dark;
   }
 
+  html.light,
+  :root.light,
   .light {
-    --background: 0 0% 100%;
-    --foreground: 222.2 84% 4.9%;
-    --card: 0 0% 100%;
-    --card-foreground: 222.2 84% 4.9%;
-    --popover: 0 0% 100%;
-    --popover-foreground: 222.2 84% 4.9%;
-    --primary: 168 80% 40%;
-    --primary-foreground: 210 40% 98%;
-    --secondary: 210 40% 96.1%;
-    --secondary-foreground: 222.2 47.4% 11.2%;
-    --muted: 210 40% 96.1%;
-    --muted-foreground: 215.4 16.3% 46.9%;
-    --accent: 210 40% 96.1%;
-    --accent-foreground: 222.2 47.4% 11.2%;
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
-    --ring: 168 80% 40%;
+    --background: #f8fafc;
+    --foreground: #0f172a;
+    
+    --card: #ffffff;
+    --card-foreground: #0f172a;
+    
+    --popover: #ffffff;
+    --popover-foreground: #0f172a;
+    
+    --primary: #0d9488;
+    --primary-foreground: #ffffff;
+    
+    --secondary: #f1f5f9;
+    --secondary-foreground: #0f172a;
+    
+    --muted: #e2e8f0;
+    --muted-foreground: #64748b;
+    
+    --accent: #f1f5f9;
+    --accent-foreground: #0f172a;
+    
+    --destructive: #ef4444;
+    --destructive-foreground: #ffffff;
+    
+    --border: #e2e8f0;
+    --input: #cbd5e1;
+    --ring: #0d9488;
+    color-scheme: light;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
 }
 
-/* Custom modern scrollbars */
+/* Custom smooth scrollbars */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 
 ::-webkit-scrollbar-track {
@@ -69,60 +92,50 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(148, 163, 184, 0.15);
+  background: rgba(148, 163, 184, 0.25);
   border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(148, 163, 184, 0.35);
+  background: rgba(148, 163, 184, 0.45);
 }
 
-/* Glassmorphism helpers */
-.glass-panel {
-  background: rgba(13, 18, 30, 0.7);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
+/* Glass card styling */
+.dark .glass-card {
+  background-color: rgba(17, 17, 20, 0.8);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-.glass-panel-hover {
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+.light .glass-card {
+  background-color: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
 }
 
-.glass-panel-hover:hover {
-  background: rgba(20, 27, 45, 0.85);
-  border-color: rgba(45, 212, 191, 0.25);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
-}
-
-.glow-teal {
-  box-shadow: 0 0 25px -5px rgba(45, 212, 191, 0.25);
-}
-
-.glow-indigo {
-  box-shadow: 0 0 25px -5px rgba(99, 102, 241, 0.25);
-}
-
-/* Custom range sliders */
+/* Range sliders */
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
-  background: rgba(255, 255, 255, 0.1);
+  background: rgba(148, 163, 184, 0.25);
   border-radius: 9999px;
-  height: 6px;
+  height: 5px;
   outline: none;
 }
 
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 16px;
-  height: 16px;
+  width: 15px;
+  height: 15px;
   border-radius: 50%;
-  background: #2dd4bf;
+  background: #14b8a6;
   cursor: pointer;
-  box-shadow: 0 0 10px rgba(45, 212, 191, 0.6);
-  transition: transform 0.1s ease;
+  box-shadow: 0 0 8px rgba(20, 184, 166, 0.5);
+  transition: transform 0.15s ease;
 }
 
 input[type="range"]::-webkit-slider-thumb:hover {

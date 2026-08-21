@@ -1,26 +1,71 @@
 import React, { useState, useEffect } from 'react';
-import { Sidebar, PageId } from './components/layout/Sidebar';
+import { Sidebar } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
 import { ToastProvider } from './components/ui/Toast';
-import { DashboardPage } from './pages/DashboardPage';
+import { Modal } from './components/ui/Modal';
 import { ChatPage } from './pages/ChatPage';
-import { VisionPage } from './pages/VisionPage';
-import { AudioPage } from './pages/AudioPage';
-import { ImageGenPage } from './pages/ImageGenPage';
-import { EmbeddingsPage } from './pages/EmbeddingsPage';
-import { ModelsPage } from './pages/ModelsPage';
-import { MemoryPage } from './pages/MemoryPage';
-import { PerformancePage } from './pages/PerformancePage';
-import { MetricsPage } from './pages/MetricsPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { api } from './services/api';
-import { ModelInfo } from './types';
+import { ModelInfo, ChatSession } from './types';
 
 export const App: React.FC = () => {
-  const [activePage, setActivePage] = useState<PageId>('dashboard');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [models, setModels] = useState<ModelInfo[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>('qorvix-default-model');
+  const [selectedModel, setSelectedModel] = useState<string>('google/gemma-4-E2B');
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
+  // Dark / Light Theme Manager
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    const saved = localStorage.getItem('qorvix_theme');
+    if (saved === 'light' || saved === 'dark') return saved;
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  });
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+      root.classList.remove('light');
+    } else {
+      root.classList.add('light');
+      root.classList.remove('dark');
+    }
+    localStorage.setItem('qorvix_theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  };
+
+  // Chat Sessions state
+  const [sessions, setSessions] = useState<ChatSession[]>(() => {
+    const saved = localStorage.getItem('qorvix_chat_sessions');
+    if (saved) {
+      try { return JSON.parse(saved); } catch { /* ignore */ }
+    }
+    return [
+      {
+        id: 'default',
+        title: 'New Conversation',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        messages: [],
+        model: selectedModel || 'qorvix-model',
+        temperature: 0.7,
+        topP: 0.9,
+        topK: 40,
+        maxTokens: 2048,
+        repeatPenalty: 1.1,
+      },
+    ];
+  });
+
+  const [activeSessionId, setActiveSessionId] = useState<string>(sessions[0]?.id || 'default');
+  const activeSession = sessions.find((s) => s.id === activeSessionId) || sessions[0];
+
+  useEffect(() => {
+    localStorage.setItem('qorvix_chat_sessions', JSON.stringify(sessions));
+  }, [sessions]);
 
   useEffect(() => {
     const init = async () => {
@@ -33,60 +78,88 @@ export const App: React.FC = () => {
     init();
   }, []);
 
-  const renderCurrentPage = () => {
-    switch (activePage) {
-      case 'dashboard':
-        return <DashboardPage onNavigate={setActivePage} />;
-      case 'chat':
-        return <ChatPage models={models} selectedModel={selectedModel} />;
-      case 'vision':
-        return <VisionPage models={models} selectedModel={selectedModel} />;
-      case 'audio':
-        return <AudioPage />;
-      case 'images':
-        return <ImageGenPage />;
-      case 'embeddings':
-        return <EmbeddingsPage />;
-      case 'models':
-        return <ModelsPage />;
-      case 'memory':
-        return <MemoryPage />;
-      case 'performance':
-        return <PerformancePage models={models} selectedModel={selectedModel} />;
-      case 'metrics':
-        return <MetricsPage />;
-      case 'settings':
-        return <SettingsPage />;
-      default:
-        return <DashboardPage onNavigate={setActivePage} />;
+  const handleNewSession = () => {
+    const newSession: ChatSession = {
+      id: Math.random().toString(36).substring(2, 9),
+      title: 'New Conversation',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [],
+      model: selectedModel || 'qorvix-model',
+      temperature: 0.7,
+      topP: 0.9,
+      topK: 40,
+      maxTokens: 2048,
+      repeatPenalty: 1.1,
+    };
+    setSessions((prev) => [newSession, ...prev]);
+    setActiveSessionId(newSession.id);
+  };
+
+  const handleDeleteSession = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const remaining = sessions.filter((s) => s.id !== id);
+    if (remaining.length === 0) {
+      handleNewSession();
+    } else {
+      setSessions(remaining);
+      if (activeSessionId === id) {
+        setActiveSessionId(remaining[0].id);
+      }
     }
+  };
+
+  const updateActiveSession = (updater: (s: ChatSession) => ChatSession) => {
+    setSessions((prev) =>
+      prev.map((s) => (s.id === activeSessionId ? updater(s) : s))
+    );
   };
 
   return (
     <ToastProvider>
-      <div className="flex h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 font-sans">
-        {/* Navigation Sidebar */}
+      <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground font-sans selection:bg-teal-500/30 selection:text-teal-200">
+        {/* Sleek Collapsible Conversations Sidebar */}
         <Sidebar
-          activePage={activePage}
-          onNavigate={setActivePage}
           collapsed={sidebarCollapsed}
           onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onSelectSession={setActiveSessionId}
+          onNewSession={handleNewSession}
+          onDeleteSession={handleDeleteSession}
+          onOpenSettings={() => setIsSettingsOpen(true)}
         />
 
-        {/* Main View Area */}
-        <div className="flex-1 flex flex-col h-full overflow-hidden">
+        {/* Main Canvas: Unified All-in-One Multimodal Omni-Dashboard */}
+        <div className="flex-1 flex flex-col h-full overflow-hidden bg-background">
           <Header
-            activePage={activePage}
             models={models}
             selectedModel={selectedModel}
             onSelectModel={setSelectedModel}
-            onNavigate={setActivePage}
+            theme={theme}
+            onToggleTheme={toggleTheme}
+            onOpenSettings={() => setIsSettingsOpen(true)}
           />
 
-          <main className="flex-1 overflow-y-auto bg-gradient-to-b from-slate-950 to-slate-900/40">
-            {renderCurrentPage()}
+          <main className="flex-1 overflow-hidden flex flex-col bg-background relative">
+            <ChatPage
+              models={models}
+              selectedModel={selectedModel}
+              activeSession={activeSession}
+              onUpdateSession={updateActiveSession}
+            />
           </main>
         </div>
+
+        {/* Settings & Port Allocations Modal */}
+        <Modal
+          isOpen={isSettingsOpen}
+          onClose={() => setIsSettingsOpen(false)}
+          title="Settings & Engine Ports"
+          maxWidth="2xl"
+        >
+          <SettingsPage />
+        </Modal>
       </div>
     </ToastProvider>
   );

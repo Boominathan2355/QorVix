@@ -25,7 +25,7 @@ export const MarkdownView: React.FC<MarkdownViewProps> = ({ content, className =
   };
 
   return (
-    <div className={`prose prose-invert max-w-none text-slate-200 text-sm leading-relaxed space-y-3 ${className}`}>
+    <div className={`max-w-none text-foreground text-sm leading-relaxed space-y-3 ${className}`}>
       {renderFormattedText(content)}
     </div>
   );
@@ -41,18 +41,18 @@ const CodeBlock: React.FC<{ code: string; language: string }> = ({ code, languag
   };
 
   return (
-    <div className="relative my-3 rounded-xl border border-slate-800 bg-slate-950 overflow-hidden shadow-lg group">
-      <div className="flex items-center justify-between px-4 py-2 bg-slate-900/80 border-b border-slate-800/80 text-xs text-slate-400 font-mono">
-        <span className="uppercase tracking-wider font-semibold text-teal-400/90">{language}</span>
+    <div className="relative my-3 rounded-2xl border border-border bg-card/90 overflow-hidden shadow-md group">
+      <div className="flex items-center justify-between px-4 py-2 bg-secondary/80 border-b border-border text-xs text-muted-foreground font-mono">
+        <span className="uppercase tracking-wider font-semibold text-teal-500">{language}</span>
         <button
           onClick={handleCopy}
-          className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-slate-800/60 hover:bg-slate-800 text-slate-300 hover:text-slate-100 transition-all text-xs"
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-background hover:bg-muted text-foreground transition-all text-xs border border-border shadow-xs"
         >
-          {copied ? <CheckIcon size={13} className="text-emerald-400" /> : <CopyIcon size={13} />}
-          <span>{copied ? 'Copied!' : 'Copy'}</span>
+          {copied ? <CheckIcon size={13} className="text-emerald-500" /> : <CopyIcon size={13} />}
+          <span>{copied ? 'Copied!' : 'Copy code'}</span>
         </button>
       </div>
-      <pre className="p-4 text-xs font-mono text-slate-200 overflow-x-auto selection:bg-teal-500/30">
+      <pre className="p-4 text-xs font-mono text-foreground overflow-x-auto selection:bg-teal-500/30">
         <code>{code}</code>
       </pre>
     </div>
@@ -62,7 +62,6 @@ const CodeBlock: React.FC<{ code: string; language: string }> = ({ code, languag
 const RichTextChunk: React.FC<{ text: string }> = ({ text }) => {
   if (!text) return null;
 
-  // Split lines
   const lines = text.split('\n');
   const elements: React.ReactNode[] = [];
 
@@ -70,27 +69,27 @@ const RichTextChunk: React.FC<{ text: string }> = ({ text }) => {
     const line = lines[i];
 
     if (line.startsWith('# ')) {
-      elements.push(<h1 key={i} className="text-xl font-bold text-slate-100 mt-4 mb-2">{formatInline(line.slice(2))}</h1>);
+      elements.push(<h1 key={i} className="text-xl font-bold text-foreground mt-4 mb-2">{formatInline(line.slice(2))}</h1>);
     } else if (line.startsWith('## ')) {
-      elements.push(<h2 key={i} className="text-lg font-bold text-slate-100 mt-3 mb-1.5">{formatInline(line.slice(3))}</h2>);
+      elements.push(<h2 key={i} className="text-lg font-bold text-foreground mt-3 mb-1.5">{formatInline(line.slice(3))}</h2>);
     } else if (line.startsWith('### ')) {
-      elements.push(<h3 key={i} className="text-base font-semibold text-slate-100 mt-2 mb-1">{formatInline(line.slice(4))}</h3>);
+      elements.push(<h3 key={i} className="text-base font-semibold text-foreground mt-2 mb-1">{formatInline(line.slice(4))}</h3>);
     } else if (line.startsWith('- ') || line.startsWith('* ')) {
       elements.push(
-        <li key={i} className="ml-4 list-disc text-slate-300 my-0.5">
+        <li key={i} className="ml-4 list-disc text-foreground my-0.5">
           {formatInline(line.slice(2))}
         </li>
       );
     } else if (/^\d+\.\s/.test(line)) {
       const match = line.match(/^(\d+\.)\s(.*)/);
       elements.push(
-        <li key={i} className="ml-4 list-decimal text-slate-300 my-0.5">
+        <li key={i} className="ml-4 list-decimal text-foreground my-0.5">
           {match ? formatInline(match[2]) : formatInline(line)}
         </li>
       );
     } else if (line.startsWith('> ')) {
       elements.push(
-        <blockquote key={i} className="border-l-2 border-teal-500/60 pl-3.5 italic text-slate-400 my-2">
+        <blockquote key={i} className="border-l-2 border-teal-500 pl-3.5 italic text-muted-foreground my-2">
           {formatInline(line.slice(2))}
         </blockquote>
       );
@@ -105,9 +104,6 @@ const RichTextChunk: React.FC<{ text: string }> = ({ text }) => {
 };
 
 function formatInline(str: string): React.ReactNode {
-  // Bold: **text** or __text__
-  // Italic: *text* or _text_
-  // Inline code: `text`
   const parts: React.ReactNode[] = [];
   let remaining = str;
   let keyIdx = 0;
@@ -123,14 +119,14 @@ function formatInline(str: string): React.ReactNode {
     const token = match[0];
     if (token.startsWith('`') && token.endsWith('`')) {
       parts.push(
-        <code key={keyIdx++} className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700/60 text-teal-300 font-mono text-[13px]">
+        <code key={keyIdx++} className="px-1.5 py-0.5 rounded-md bg-secondary border border-border text-teal-600 dark:text-teal-400 font-mono text-[12px]">
           {token.slice(1, -1)}
         </code>
       );
     } else if (token.startsWith('**') && token.endsWith('**')) {
-      parts.push(<strong key={keyIdx++} className="font-semibold text-slate-100">{token.slice(2, -2)}</strong>);
+      parts.push(<strong key={keyIdx++} className="font-semibold text-foreground">{token.slice(2, -2)}</strong>);
     } else if (token.startsWith('*') && token.endsWith('*')) {
-      parts.push(<em key={keyIdx++} className="italic text-slate-200">{token.slice(1, -1)}</em>);
+      parts.push(<em key={keyIdx++} className="italic text-foreground">{token.slice(1, -1)}</em>);
     }
     lastIndex = regex.lastIndex;
   }

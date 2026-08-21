@@ -41,20 +41,67 @@ export class QorvixApiClient {
       const res = await fetch(`${this.baseUrl}/v1/models`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      return (data.data || []).map((m: ModelInfo) => ({
-        ...m,
-        is_multimodal: m.id.toLowerCase().includes('llava') || m.id.toLowerCase().includes('vision'),
-      }));
+      return (data.data || []).map((m: ModelInfo) => {
+        const idLower = m.id.toLowerCase();
+        const isGemma4 = idLower.includes('gemma-4') || idLower.includes('gemma');
+        const isVision = isGemma4 || idLower.includes('llava') || idLower.includes('vision') || idLower.includes('omni') || idLower.includes('vl');
+        const isAudio = isGemma4 || idLower.includes('audio') || idLower.includes('speech') || idLower.includes('voice') || idLower.includes('omni');
+        const isVideo = isGemma4 || idLower.includes('video') || idLower.includes('omni');
+        const isThinking = isGemma4 || idLower.includes('r1') || idLower.includes('reason') || idLower.includes('think') || idLower.includes('deepseek') || idLower.includes('qwq');
+
+        return {
+          ...m,
+          is_multimodal: isVision || isAudio || isVideo,
+          capabilities: {
+            text: true,
+            image: isVision,
+            audio: isAudio,
+            video: isVideo,
+            thinking: isThinking,
+            mcp_tools: true,
+          },
+        };
+      });
     } catch {
-      // Fallback default list if server is initializing
+      // Primary Any-to-Any Model configuration for testing
       return [
         {
-          id: 'qorvix-default-model',
+          id: 'google/gemma-4-E2B',
+          object: 'model',
+          created: Date.now(),
+          owned_by: 'google',
+          architecture: 'gemma4-any-to-any',
+          context_length: 131072,
+          quantization: 'Q4_K_M (Native Block FP8/INT4)',
+          backend: 'CUDA Continuous Batching',
+          is_multimodal: true,
+          capabilities: {
+            text: true,
+            image: true,
+            audio: true,
+            video: true,
+            thinking: true,
+            mcp_tools: true,
+          },
+        },
+        {
+          id: 'qorvix-omni-model',
           object: 'model',
           created: Date.now(),
           owned_by: 'qorvix',
-          architecture: 'transformer',
+          architecture: 'multimodal-transformer',
+          context_length: 32768,
           quantization: 'Q4_K_M',
+          backend: 'CUDA / Vulkan',
+          is_multimodal: true,
+          capabilities: {
+            text: true,
+            image: true,
+            audio: true,
+            video: true,
+            thinking: true,
+            mcp_tools: true,
+          },
         },
       ];
     }

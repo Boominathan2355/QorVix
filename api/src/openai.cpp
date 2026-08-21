@@ -89,24 +89,74 @@ ChatRequest parseChatRequest(const json::Value& body, std::string& error) {
               return req;
             }
             cm.parts.push_back(std::move(p));
+          } else if (type == "input_audio") {
+            ContentPart p;
+            p.type = ContentPart::Type::InputAudio;
+            if (const auto* v = part.get("input_audio")) {
+              if (v->isObject()) {
+                if (const auto* d = v->get("data")) p.audioData = d->asString();
+                if (const auto* f = v->get("format")) p.audioFormat = f->asString();
+              }
+            }
+            if (p.audioData.empty()) {
+              error = "an input_audio content part is missing 'data'";
+              return req;
+            }
+            if (p.audioFormat.empty()) p.audioFormat = "wav";
+          } else if (type == "video_url") {
+            ContentPart p;
+            p.type = ContentPart::Type::VideoUrl;
+            if (const auto* v = part.get("video_url")) {
+              if (v->isString()) {
+                p.videoUrl = v->asString();
+              } else if (const auto* u = v->get("url")) {
+                p.videoUrl = u->asString();
+              }
+            }
+            if (p.videoUrl.empty()) {
+              error = "a video_url content part is missing its 'url'";
+              return req;
+            }
+            cm.parts.push_back(std::move(p));
           } else {
-            // Named rather than ignored: silently dropping an input_audio part would answer a
-            // question about media the model never received.
-            error = "unsupported content part type '" + type + "' (expected 'text' or 'image_url')";
+            error = "unsupported content part type '" + type + "' (expected 'text', 'image_url', 'input_audio', or 'video_url')";
             return req;
           }
         }
         // Default flattening, so a caller that never calls flattenContentParts still sees text.
         for (const auto& p : cm.parts)
-          if (p.type == ContentPart::Type::Text) cm.content += p.text;
-      } else {
+          if (p.type == ContentPart::Type::Text) {
+            if (!cm.content.empty()) cm.content += '\n';
+            cm.content += p.text;
+          }
+      } else if (c->isString()) {
         cm.content = c->asString();
       }
     }
+    if (const auto* rc = m.get("reasoning_content")) cm.reasoningContent = rc->asString();
+    if (const auto* tcId = m.get("tool_call_id")) cm.toolCallId = tcId->asString();
     req.messages.push_back(std::move(cm));
   }
   if (const auto* model = body.get("model")) req.model = model->asString();
-  if (const auto* stream = body.get("stream")) req.stream = stream->asBool();
+  if (const auto* stream = body.get("stream")) req.stream = stream->asBool(false);
+  if (const auto* tools = body.get("tools")) {
+    if (tools->isArray()) {
+      for (const auto& t : tools->items()) {
+        if (!t.isObject()) continue;
+        ToolDefinition td;
+        if (const auto* type = t.get("type")) td.type = type->asString();
+        if (const auto* fn = t.get("function")) {
+          if (fn->isObject()) {
+            if (const auto* name = fn->get("name")) td.function.name = name->asString();
+            if (const auto* desc = fn->get("description")) td.function.description = desc->asString();
+            if (const auto* params = fn->get("parameters")) td.function.parameters = *params;
+          }
+        }
+        req.tools.push_back(std::move(td));
+      }
+    }
+  }
+  if (const auto* tc = body.get("tool_choice")) req.toolChoice = tc->asString("auto");
   req.sampling = parseSampling(body);
   req.valid = true;
   return req;

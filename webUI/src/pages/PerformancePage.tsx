@@ -1,15 +1,12 @@
 import React, { useState } from 'react';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
+import { Card, CardTitle } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Slider } from '../components/ui/Slider';
 import { useToast } from '../components/ui/Toast';
 import {
   PerformanceIcon,
-  ZapIcon,
   PlayIcon,
-  StopIcon,
-  SparklesIcon,
 } from '../components/icons/Icons';
 import { api } from '../services/api';
 import { streamChatCompletion } from '../services/sse';
@@ -21,7 +18,7 @@ interface PerformancePageProps {
 }
 
 export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel }) => {
-  const { success: toastSuccess, error: toastError } = useToast();
+  const { success: toastSuccess } = useToast();
   const [concurrency, setConcurrency] = useState(4);
   const [totalRequests, setTotalRequests] = useState(10);
   const [isRunning, setIsRunning] = useState(false);
@@ -68,10 +65,8 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
     const tpsList: number[] = [];
     const ttftList: number[] = [];
 
-    const startTime = performance.now();
     let completed = 0;
 
-    // Run batch of requests
     const runWorker = async () => {
       while (completed < totalRequests) {
         completed++;
@@ -79,7 +74,6 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
 
         const reqStart = performance.now();
         let firstTokenTime = 0;
-        let tokenCount = 0;
 
         try {
           const abort = new AbortController();
@@ -98,9 +92,8 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
                   firstTokenTime = performance.now() - reqStart;
                   setLiveTtft(Math.round(firstTokenTime * 10) / 10);
                 }
-                tokenCount++;
               },
-              onComplete: (_, total, tps) => {
+              onComplete: (_, _total, tps) => {
                 const totalSec = (performance.now() - reqStart) / 1000;
                 latencies.push(Math.round(totalSec * 1000));
                 tpsList.push(tps);
@@ -154,8 +147,8 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
             <Badge variant="primary" size="sm">C++ Continuous Batching</Badge>
             <Badge variant="info" size="sm">Fused Attention Speedometer</Badge>
           </div>
-          <h2 className="text-2xl font-bold text-slate-100 tracking-tight flex items-center gap-2">
-            <PerformanceIcon size={24} className="text-teal-400" />
+          <h2 className="text-2xl font-bold text-foreground tracking-tight flex items-center gap-2">
+            <PerformanceIcon size={24} className="text-teal-500" />
             Throughput & Performance Benchmarking
           </h2>
         </div>
@@ -164,35 +157,35 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
       {/* Speedometer Gauges */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <Card glass className="p-5 space-y-2">
-          <span className="text-xs font-mono text-slate-400">THROUGHPUT (TPS)</span>
-          <div className="text-3xl font-extrabold font-mono text-teal-300">
-            {liveTps} <span className="text-xs text-slate-400 font-sans font-normal">tok/s</span>
+          <span className="text-xs font-mono text-muted-foreground">THROUGHPUT (TPS)</span>
+          <div className="text-3xl font-extrabold font-mono text-teal-600 dark:text-teal-400">
+            {liveTps} <span className="text-xs text-muted-foreground font-sans font-normal">tok/s</span>
           </div>
-          <div className="text-xs text-slate-400">Peak single-stream generation rate</div>
+          <div className="text-xs text-muted-foreground">Peak single-stream generation rate</div>
         </Card>
 
         <Card glass className="p-5 space-y-2">
-          <span className="text-xs font-mono text-slate-400">TIME TO FIRST TOKEN (TTFT)</span>
-          <div className="text-3xl font-extrabold font-mono text-sky-300">
-            {liveTtft} <span className="text-xs text-slate-400 font-sans font-normal">ms</span>
+          <span className="text-xs font-mono text-muted-foreground">TIME TO FIRST TOKEN (TTFT)</span>
+          <div className="text-3xl font-extrabold font-mono text-sky-600 dark:text-sky-400">
+            {liveTtft} <span className="text-xs text-muted-foreground font-sans font-normal">ms</span>
           </div>
-          <div className="text-xs text-slate-400">Prompt prefill latency</div>
+          <div className="text-xs text-muted-foreground">Prompt prefill latency</div>
         </Card>
 
         <Card glass className="p-5 space-y-2">
-          <span className="text-xs font-mono text-slate-400">P95 LATENCY</span>
-          <div className="text-3xl font-extrabold font-mono text-purple-300">
-            {history[0]?.latencyP95Ms || 0} <span className="text-xs text-slate-400 font-sans font-normal">ms</span>
+          <span className="text-xs font-mono text-muted-foreground">P95 LATENCY</span>
+          <div className="text-3xl font-extrabold font-mono text-purple-600 dark:text-purple-400">
+            {history[0]?.latencyP95Ms || 0} <span className="text-xs text-muted-foreground font-sans font-normal">ms</span>
           </div>
-          <div className="text-xs text-slate-400">95th percentile total response time</div>
+          <div className="text-xs text-muted-foreground">95th percentile total response time</div>
         </Card>
 
         <Card glass className="p-5 space-y-2">
-          <span className="text-xs font-mono text-slate-400">RADIX CACHE HIT RATE</span>
-          <div className="text-3xl font-extrabold font-mono text-emerald-300">
+          <span className="text-xs font-mono text-muted-foreground">RADIX CACHE HIT RATE</span>
+          <div className="text-3xl font-extrabold font-mono text-emerald-600 dark:text-emerald-400">
             94.2%
           </div>
-          <div className="text-xs text-slate-400">Prefix KV cache reuse savings</div>
+          <div className="text-xs text-muted-foreground">Prefix KV cache reuse savings</div>
         </Card>
       </div>
 
@@ -200,7 +193,7 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-5 space-y-5">
           <Card glass className="p-6 space-y-5">
-            <CardTitle className="text-sm font-semibold text-slate-200">
+            <CardTitle className="text-sm font-semibold text-foreground">
               Synthetic Load Simulator
             </CardTitle>
 
@@ -224,13 +217,13 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
 
             {isRunning && (
               <div className="space-y-1.5">
-                <div className="flex justify-between text-xs font-mono text-slate-400">
+                <div className="flex justify-between text-xs font-mono text-muted-foreground">
                   <span>Benchmarking...</span>
-                  <span className="text-teal-400">{currentProgress}%</span>
+                  <span className="text-teal-600 dark:text-teal-400 font-bold">{currentProgress}%</span>
                 </div>
-                <div className="h-2 w-full bg-slate-950 rounded-full overflow-hidden p-0.5 border border-slate-800">
+                <div className="h-2 w-full bg-secondary rounded-full overflow-hidden p-0.5 border border-border">
                   <div
-                    className="h-full bg-teal-400 rounded-full transition-all duration-150"
+                    className="h-full bg-teal-500 rounded-full transition-all duration-150"
                     style={{ width: `${currentProgress}%` }}
                   />
                 </div>
@@ -253,9 +246,9 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
         {/* Benchmark History Table */}
         <div className="lg:col-span-7 space-y-5">
           <Card glass className="p-6 space-y-4">
-            <CardTitle className="text-sm font-bold text-slate-100 flex items-center justify-between">
+            <CardTitle className="text-sm font-bold text-foreground flex items-center justify-between">
               <span>Benchmark History</span>
-              <span className="text-xs text-slate-400 font-mono font-normal">
+              <span className="text-xs text-muted-foreground font-mono font-normal">
                 {history.length} Runs
               </span>
             </CardTitle>
@@ -263,7 +256,7 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
             <div className="overflow-x-auto">
               <table className="w-full text-xs font-mono border-collapse">
                 <thead>
-                  <tr className="text-slate-500 border-b border-slate-800 pb-2 text-left">
+                  <tr className="text-muted-foreground border-b border-border pb-2 text-left">
                     <th className="pb-2">Concurrency</th>
                     <th className="pb-2">Avg TPS</th>
                     <th className="pb-2">Avg TTFT</th>
@@ -272,14 +265,14 @@ export const PerformancePage: React.FC<PerformancePageProps> = ({ selectedModel 
                     <th className="pb-2">Status</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-800/60">
+                <tbody className="divide-y divide-border">
                   {history.map((run) => (
-                    <tr key={run.id} className="hover:bg-slate-900/40">
-                      <td className="py-2.5 text-slate-300 font-bold">{run.concurrency} clients</td>
-                      <td className="py-2.5 text-teal-400 font-semibold">{run.tpsAvg} tok/s</td>
-                      <td className="py-2.5 text-sky-400">{run.ttftMsAvg} ms</td>
-                      <td className="py-2.5 text-slate-300">{run.latencyP50Ms} ms</td>
-                      <td className="py-2.5 text-purple-300 font-semibold">{run.latencyP95Ms} ms</td>
+                    <tr key={run.id} className="hover:bg-secondary/50 transition-colors">
+                      <td className="py-2.5 text-foreground font-bold">{run.concurrency} clients</td>
+                      <td className="py-2.5 text-teal-600 dark:text-teal-400 font-semibold">{run.tpsAvg} tok/s</td>
+                      <td className="py-2.5 text-sky-600 dark:text-sky-400">{run.ttftMsAvg} ms</td>
+                      <td className="py-2.5 text-foreground">{run.latencyP50Ms} ms</td>
+                      <td className="py-2.5 text-purple-600 dark:text-purple-400 font-semibold">{run.latencyP95Ms} ms</td>
                       <td className="py-2.5">
                         <Badge variant="success" size="sm">
                           {run.successfulRequests}/{run.totalRequests}

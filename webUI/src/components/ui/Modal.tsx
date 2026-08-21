@@ -45,19 +45,19 @@ export const Modal: React.FC<ModalProps> = ({
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       {/* Frosted Backdrop */}
       <div
-        className="fixed inset-0 bg-black/70 backdrop-blur-md transition-opacity duration-200"
+        className="fixed inset-0 bg-black/60 backdrop-blur-md transition-opacity duration-200"
         onClick={onClose}
       />
 
       {/* Modal Dialog Box */}
       <Card
-        className={`relative z-10 w-full ${maxWidths[maxWidth]} shadow-2xl border-slate-700/80 bg-slate-900/95 overflow-hidden animate-in fade-in zoom-in-95 duration-150`}
+        className={`relative z-10 w-full ${maxWidths[maxWidth]} shadow-2xl border-border bg-card overflow-hidden animate-in fade-in zoom-in-95 duration-150`}
       >
         <CardHeader className="py-4">
-          <CardTitle className="text-lg">{title}</CardTitle>
+          <CardTitle className="text-base">{title}</CardTitle>
           <button
             onClick={onClose}
-            className="text-slate-400 hover:text-slate-100 p-1.5 rounded-lg hover:bg-slate-800 transition-colors"
+            className="text-muted-foreground hover:text-foreground p-1.5 rounded-lg hover:bg-secondary transition-colors"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <line x1="18" y1="6" x2="6" y2="18" />

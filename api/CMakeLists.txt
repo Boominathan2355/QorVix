@@ -5,6 +5,7 @@ add_library(qorvix_api STATIC
   src/openai.cpp
   src/http_server.cpp
   src/multipart.cpp
+  src/mcp.cpp
 )
 
 target_include_directories(qorvix_api PUBLIC include)

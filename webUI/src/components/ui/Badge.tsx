@@ -15,13 +15,13 @@ export const Badge: React.FC<BadgeProps> = ({
   ...props
 }) => {
   const variants = {
-    success: 'bg-emerald-950/60 text-emerald-300 border-emerald-800/50',
-    warning: 'bg-amber-950/60 text-amber-300 border-amber-800/50',
-    danger: 'bg-red-950/60 text-red-300 border-red-800/50',
-    info: 'bg-sky-950/60 text-sky-300 border-sky-800/50',
-    neutral: 'bg-slate-800/70 text-slate-300 border-slate-700/60',
-    primary: 'bg-teal-950/60 text-teal-300 border-teal-800/50',
-    purple: 'bg-purple-950/60 text-purple-300 border-purple-800/50',
+    success: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30',
+    warning: 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30',
+    danger: 'bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30',
+    info: 'bg-sky-500/10 text-sky-600 dark:text-sky-400 border-sky-500/30',
+    neutral: 'bg-secondary text-muted-foreground border-border',
+    primary: 'bg-teal-500/10 text-teal-600 dark:text-teal-400 border-teal-500/30',
+    purple: 'bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/30',
   };
 
   const sizes = {
@@ -30,13 +30,13 @@ export const Badge: React.FC<BadgeProps> = ({
   };
 
   const dotColors = {
-    success: 'bg-emerald-400',
-    warning: 'bg-amber-400',
-    danger: 'bg-red-400',
-    info: 'bg-sky-400',
+    success: 'bg-emerald-500',
+    warning: 'bg-amber-500',
+    danger: 'bg-red-500',
+    info: 'bg-sky-500',
     neutral: 'bg-slate-400',
-    primary: 'bg-teal-400',
-    purple: 'bg-purple-400',
+    primary: 'bg-teal-500',
+    purple: 'bg-purple-500',
   };
 
   return (

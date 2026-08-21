@@ -1,12 +1,11 @@
 import React, { useState } from 'react';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
+import { Card, CardTitle } from '../components/ui/Card';
 import { Button } from '../components/ui/Button';
 import { Badge } from '../components/ui/Badge';
 import { useToast } from '../components/ui/Toast';
 import {
   EmbeddingsIcon,
   SparklesIcon,
-  ZapIcon,
   LayersIcon,
 } from '../components/icons/Icons';
 import { api } from '../services/api';
@@ -45,7 +44,6 @@ export const EmbeddingsPage: React.FC = () => {
       const embeddings = await api.createEmbeddings(lines);
       setResults(embeddings);
 
-      // Compute N x N similarity matrix
       const matrix: number[][] = [];
       for (let i = 0; i < embeddings.length; ++i) {
         matrix[i] = [];
@@ -66,11 +64,11 @@ export const EmbeddingsPage: React.FC = () => {
   };
 
   const getHeatmapColor = (val: number) => {
-    if (val >= 0.85) return 'bg-teal-500/90 text-slate-950 font-bold';
-    if (val >= 0.65) return 'bg-teal-600/70 text-slate-100 font-semibold';
-    if (val >= 0.45) return 'bg-teal-800/50 text-slate-200';
-    if (val >= 0.25) return 'bg-slate-800/80 text-slate-300';
-    return 'bg-slate-900/60 text-slate-500';
+    if (val >= 0.85) return 'bg-teal-500 text-slate-950 font-bold';
+    if (val >= 0.65) return 'bg-teal-500/70 text-white dark:text-slate-950 font-semibold';
+    if (val >= 0.45) return 'bg-teal-500/40 text-foreground';
+    if (val >= 0.25) return 'bg-secondary text-foreground';
+    return 'bg-muted text-muted-foreground';
   };
 
   return (
@@ -81,8 +79,8 @@ export const EmbeddingsPage: React.FC = () => {
             <Badge variant="success" size="sm">BERT Encoder Architecture</Badge>
             <Badge variant="primary" size="sm">L2 Normalized Vector Space</Badge>
           </div>
-          <h2 className="text-2xl font-bold text-slate-100 tracking-tight flex items-center gap-2">
-            <EmbeddingsIcon size={24} className="text-emerald-400" />
+          <h2 className="text-2xl font-bold text-foreground tracking-tight flex items-center gap-2">
+            <EmbeddingsIcon size={24} className="text-emerald-500" />
             Embeddings & Cosine Similarity Matrix
           </h2>
         </div>
@@ -92,7 +90,7 @@ export const EmbeddingsPage: React.FC = () => {
         {/* Left Column: Sentences Input */}
         <div className="lg:col-span-5 space-y-5">
           <Card glass className="p-6 space-y-4">
-            <CardTitle className="text-sm font-semibold text-slate-200">
+            <CardTitle className="text-sm font-semibold text-foreground">
               Input Sentences (One per line)
             </CardTitle>
 
@@ -101,7 +99,7 @@ export const EmbeddingsPage: React.FC = () => {
               onChange={(e) => setInputText(e.target.value)}
               rows={8}
               placeholder="Enter sentences to embed and compare..."
-              className="w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-teal-500/60 focus:ring-2 focus:ring-teal-500/20"
+              className="w-full bg-background border border-border rounded-xl p-3 text-xs font-mono text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-teal-500/60 focus:ring-2 focus:ring-teal-500/20"
             />
 
             <Button
@@ -120,21 +118,21 @@ export const EmbeddingsPage: React.FC = () => {
         {/* Right Column: Similarity Heatmap Matrix */}
         <div className="lg:col-span-7 space-y-5">
           <Card glass className="p-6 space-y-5 min-h-[460px]">
-            <CardTitle className="text-sm font-bold text-slate-100 flex items-center gap-2">
-              <LayersIcon size={18} className="text-teal-400" />
+            <CardTitle className="text-sm font-bold text-foreground flex items-center gap-2">
+              <LayersIcon size={18} className="text-teal-500" />
               Cosine Similarity Heatmap ({results.length} × {results.length})
             </CardTitle>
 
             {results.length > 0 ? (
               <div className="space-y-6">
                 {/* Heatmap Grid */}
-                <div className="overflow-x-auto border border-slate-800 rounded-xl bg-slate-950/80 p-4">
+                <div className="overflow-x-auto border border-border rounded-xl bg-card p-4">
                   <table className="w-full border-collapse text-xs font-mono">
                     <thead>
                       <tr>
-                        <th className="p-2 text-left text-slate-500">Sentence</th>
+                        <th className="p-2 text-left text-muted-foreground">Sentence</th>
                         {results.map((_, idx) => (
-                          <th key={idx} className="p-2 text-center text-teal-400 font-bold">
+                          <th key={idx} className="p-2 text-center text-teal-600 dark:text-teal-400 font-bold">
                             S{idx + 1}
                           </th>
                         ))}
@@ -142,9 +140,9 @@ export const EmbeddingsPage: React.FC = () => {
                     </thead>
                     <tbody>
                       {similarityMatrix.map((row, i) => (
-                        <tr key={i} className="border-t border-slate-800/60">
-                          <td className="p-2 text-slate-300 max-w-[180px] truncate font-sans">
-                            <span className="text-teal-400 font-mono font-bold mr-1.5">S{i + 1}:</span>
+                        <tr key={i} className="border-t border-border">
+                          <td className="p-2 text-foreground max-w-[180px] truncate font-sans">
+                            <span className="text-teal-600 dark:text-teal-400 font-mono font-bold mr-1.5">S{i + 1}:</span>
                             {results[i]?.text}
                           </td>
                           {row.map((val, j) => (
@@ -167,22 +165,22 @@ export const EmbeddingsPage: React.FC = () => {
 
                 {/* Vectors Inspector */}
                 <div className="space-y-2">
-                  <span className="text-xs font-mono font-bold text-slate-400 uppercase tracking-wider">
+                  <span className="text-xs font-mono font-bold text-muted-foreground uppercase tracking-wider">
                     Vector Dimensions & Norms
                   </span>
                   <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
                     {results.map((r, idx) => (
                       <div
                         key={idx}
-                        className="p-3 rounded-xl bg-slate-900/70 border border-slate-800 flex items-center justify-between text-xs font-mono"
+                        className="p-3 rounded-xl bg-secondary border border-border flex items-center justify-between text-xs font-mono"
                       >
                         <div className="flex items-center gap-2 truncate pr-3">
                           <Badge variant="primary" size="sm">S{idx + 1}</Badge>
-                          <span className="truncate text-slate-300 font-sans">{r.text}</span>
+                          <span className="truncate text-foreground font-sans">{r.text}</span>
                         </div>
-                        <div className="flex items-center gap-3 shrink-0 text-slate-400">
-                          <span>Dim: <b className="text-slate-200">{r.dim}</b></span>
-                          <span>Norm: <b className="text-teal-400">{r.norm.toFixed(4)}</b></span>
+                        <div className="flex items-center gap-3 shrink-0 text-muted-foreground">
+                          <span>Dim: <b className="text-foreground">{r.dim}</b></span>
+                          <span>Norm: <b className="text-teal-600 dark:text-teal-400">{r.norm.toFixed(4)}</b></span>
                         </div>
                       </div>
                     ))}
@@ -190,8 +188,8 @@ export const EmbeddingsPage: React.FC = () => {
                 </div>
               </div>
             ) : (
-              <div className="h-64 flex flex-col items-center justify-center text-center text-slate-500 space-y-2">
-                <EmbeddingsIcon size={40} className="text-slate-700" />
+              <div className="h-64 flex flex-col items-center justify-center text-center text-muted-foreground space-y-2">
+                <EmbeddingsIcon size={40} className="text-muted-foreground/50" />
                 <p className="text-xs font-mono">
                   Click 'Generate Embeddings' to compute representations
                 </p>
