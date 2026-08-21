@@ -10,6 +10,7 @@ cmake-build-*/
 *.pdb
 *.ilk
 *.exp
+*.tsbuildinfo
 
 # CMake
 CMakeFiles/
@@ -32,6 +33,12 @@ vcpkg_installed/
 ui/node_modules/
 ui/dist/
 ui/.vite/
+webUI/node_modules/
+webUI/dist/
+webUI/.vite/
+web/node_modules/
+web/dist/
+web/.vite/
 
 # Models and large binary artifacts (never commit these)
 models/*.gguf

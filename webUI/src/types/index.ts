@@ -1,0 +1,143 @@
+// Type definitions for QorVix Studio & Dashboard
+
+export type MessageRole = 'system' | 'user' | 'assistant';
+
+export interface ImageContentPart {
+  type: 'image_url';
+  image_url: {
+    url: string; // base64 data URI or URL
+  };
+}
+
+export interface TextContentPart {
+  type: 'text';
+  text: string;
+}
+
+export type ChatContent = string | (TextContentPart | ImageContentPart)[];
+
+export interface ChatMessage {
+  id: string;
+  role: MessageRole;
+  content: string;
+  images?: string[]; // data URLs
+  timestamp: number;
+  tokensPerSec?: number;
+  totalTokens?: number;
+  latencyMs?: number;
+  error?: string;
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  messages: ChatMessage[];
+  systemPrompt?: string;
+  model: string;
+  temperature: number;
+  topP: number;
+  topK: number;
+  maxTokens: number;
+  repeatPenalty: number;
+}
+
+export interface ModelInfo {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+  architecture?: string;
+  context_length?: number;
+  embedding_length?: number;
+  vocab_size?: number;
+  block_count?: number;
+  quantization?: string;
+  backend?: string;
+  is_multimodal?: boolean;
+}
+
+export interface AudioTranscriptionResult {
+  text: string;
+  segments?: {
+    id: number;
+    start: number;
+    end: number;
+    text: string;
+  }[];
+  language?: string;
+  duration?: number;
+}
+
+export interface GeneratedImage {
+  id: string;
+  url: string; // base64 or blob URL
+  prompt: string;
+  negativePrompt?: string;
+  steps: number;
+  guidance: number;
+  seed: number;
+  width: number;
+  height: number;
+  timestamp: number;
+}
+
+export interface EmbeddingResult {
+  text: string;
+  vector: number[];
+  norm: number;
+  dim: number;
+}
+
+export interface MemoryTierStats {
+  vramTotalBytes: number;
+  vramUsedBytes: number;
+  vramAllocatedBytes: number;
+  ramTotalBytes: number;
+  ramUsedBytes: number;
+  spoolTotalBytes: number;
+  spoolUsedBytes: number;
+  kvCacheTotalPages: number;
+  kvCacheUsedPages: number;
+  slabFragmentation: number;
+}
+
+export interface BenchmarkRun {
+  id: string;
+  timestamp: number;
+  concurrency: number;
+  totalRequests: number;
+  successfulRequests: number;
+  tpsAvg: number;
+  ttftMsAvg: number;
+  latencyP50Ms: number;
+  latencyP95Ms: number;
+  latencyP99Ms: number;
+  model: string;
+}
+
+export interface ServerMetrics {
+  uptimeSeconds: number;
+  totalRequests: number;
+  activeRequests: number;
+  promptTokensTotal: number;
+  completionTokensTotal: number;
+  tpsCurrent: number;
+  avgLatencyMs: number;
+  status200Count: number;
+  status400Count: number;
+  status500Count: number;
+  metricsRaw: string;
+}
+
+export interface AppSettings {
+  baseUrl: string;
+  metricsUrl: string;
+  defaultModel: string;
+  theme: 'dark' | 'light' | 'system';
+  enableStreaming: boolean;
+  defaultSystemPrompt: string;
+  autoScroll: boolean;
+  soundEffects: boolean;
+}

@@ -823,9 +823,19 @@ consumed exactly.
 `agents/` is still 0 files. SPEC's agent runtime — roles, tool calls, a shared blackboard — is the
 last unstarted item of Phase 11b.
 
-## Phase 12 — Web UI⬜
-React/TS/Vite/Tailwind/shadcn app: Dashboard, Chat, Vision, Audio, Image Generation, Model,
-Memory, Performance, Settings pages. Prometheus/Grafana exporter wiring.
+## Phase 12 — Web UI ✅🖥️
+Modern React 19 + TypeScript + Vite + Tailwind CSS dashboard (`webUI/`) with zero bloated external UI runtime dependencies:
+- **Overview & Hardware Dashboard (`DashboardPage`):** Real-time hardware telemetry, active models, runtime latency, quick workspace launch tiles.
+- **Chat & Instruct Studio (`ChatPage`):** Streaming SSE client for `/v1/chat/completions`, multi-turn sessions, tok/s speedometer, generation parameters drawer, system prompt customization, Markdown code syntax highlighting.
+- **Multimodal Vision Studio (`VisionPage`):** Image upload, CLIP ViT-L/14 patch projection preview (576 patches), VQA reasoning with LLaVA projector.
+- **Whisper Audio Studio (`AudioPage`):** Live HTML5 AudioContext microphone waveform visualizer, audio drag-and-drop, transcription & translation (`/v1/audio/transcriptions`, `/translations`), timestamped segment breakdown.
+- **Stable Diffusion Studio (`ImageGenPage`):** On-device UNet text-to-image synthesis (`/v1/images/generations`), CFG guidance, steps slider, seed controller, interactive gallery with lightbox modal and PNG download.
+- **Embeddings & Vector Matrix (`EmbeddingsPage`):** BERT dense representations (`/v1/embeddings`), real-time pairwise cosine similarity heatmap matrix, vector norm inspector.
+- **Model Registry (`ModelsPage`):** GGUF tensor explorer, quantization breakdown (`Q4_K`, `Q8_0`), architecture diagnostics, context length.
+- **Memory & VRAM Visualizer (`MemoryPage`):** 3-tier storage monitor (GPU VRAM, Host RAM, NVMe Spool), KV cache page table allocation, slab allocator fragmentation gauges.
+- **Performance & Benchmarking (`PerformancePage`):** Real-time TPS speedometer, TTFT prefill latency, multi-client synthetic load test simulator, P50/P95/P99 latency distribution histogram.
+- **Prometheus Metrics (`MetricsPage`):** Live Port 2009 (`/metrics`) scraper, HTTP request counters, token totals, raw scrape exporter.
+- **Settings & Port Manager (`SettingsPage`):** Endpoints configuration (Port 2005 inference, Port 2009 metrics), Port Allocation Registry (2005-2010 single source of truth), streaming toggles, cache manager.
 
 ## Phase 13 — Enterprise Hardening⬜
 Speculative decoding (draft/target/verification), API keys, rate limiting, audit logs, security
