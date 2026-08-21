@@ -30,6 +30,21 @@
 #include "qorvix/ports.hpp"
 #include "qorvix/embeddings/embed_benchmark.hpp"
 #include "qorvix/rag/pipeline.hpp"
+#include "qorvix/agents/agent.hpp"
+#include "qorvix/agents/blackboard.hpp"
+#include "qorvix/agents/builtin_tools.hpp"
+#include "qorvix/agents/orchestrator.hpp"
+#include "qorvix/agents/role.hpp"
+#include "qorvix/agents/tool.hpp"
+#include "qorvix/agents/tool_registry.hpp"
+#include "qorvix/agents/workflow.hpp"
+#include "qorvix/agents/skill.hpp"
+#include "qorvix/agents/skill_registry.hpp"
+#include "qorvix/agents/skill_loader.hpp"
+#include "qorvix/agents/builtin_skills.hpp"
+#include "qorvix/agents/artifact.hpp"
+#include "qorvix/agents/artifact_store.hpp"
+#include "qorvix/agents/artifact_tools.hpp"
 #include "qorvix/audio/audio_check.hpp"
 #include "qorvix/audio/audio_file.hpp"
 #include "qorvix/audio/mel.hpp"
@@ -2506,6 +2521,303 @@ int cmdRag(const std::vector<std::string_view>& args) {
   return 1;
 }
 
+int cmdAgentCheck(const std::vector<std::string_view>& /*args*/) {
+  std::cout << "Running QorVix Agent Runtime Correctness Gate (Phase 11b)...\n";
+  int passCount = 0;
+  int totalTests = 6;
+
+  // Tier 1: Role system & preset schemas
+  {
+    auto planner = qorvix::agents::createPlannerRole();
+    auto coder = qorvix::agents::createCoderRole();
+    auto jsonVal = planner.toJson();
+    qorvix::agents::RoleDefinition parsed;
+    std::string err;
+    if (qorvix::agents::RoleDefinition::fromJson(jsonVal, parsed, err) && parsed.name == "Planner" && coder.type == qorvix::agents::RoleType::Coder) {
+      std::cout << "  [PASS] Tier 1: Role Definitions & Preset Schemas\n";
+      ++passCount;
+    } else {
+      std::cout << "  [FAIL] Tier 1: Role Definitions\n";
+    }
+  }
+
+  // Tier 2: Built-in Tool Registry & Calculator execution
+  {
+    qorvix::agents::ToolRegistry reg;
+    qorvix::agents::registerDefaultTools(reg);
+    auto calcArgs = qorvix::api::json::Value::object();
+    calcArgs["expression"] = "sqrt(144) * (2 + 3)";
+    auto res = reg.execute("calculator", calcArgs);
+    if (res.ok() && res.output == "60") {
+      std::cout << "  [PASS] Tier 2: Tool Registry & Math Expression Engine (output = 60)\n";
+      ++passCount;
+    } else {
+      std::cout << "  [FAIL] Tier 2: Tool Registry & Calculator (" << res.output << ")\n";
+    }
+  }
+
+  // Tier 3: Blackboard Task Dependency & Shared Memory
+  {
+    qorvix::agents::Blackboard bb;
+    qorvix::agents::Task t1; t1.id = "t1"; t1.title = "Step 1";
+    qorvix::agents::Task t2; t2.id = "t2"; t2.title = "Step 2"; t2.dependencies = {"t1"};
+    bb.addTask(t1);
+    bb.addTask(t2);
+    auto ready1 = bb.readyTasks();
+    bb.updateTaskStatus("t1", qorvix::agents::TaskStatus::Done, "ok");
+    auto ready2 = bb.readyTasks();
+    if (ready1.size() == 1 && ready1[0].id == "t1" && ready2.size() == 1 && ready2[0].id == "t2") {
+      std::cout << "  [PASS] Tier 3: Blackboard Task Graph & Dependency Resolution\n";
+      ++passCount;
+    } else {
+      std::cout << "  [FAIL] Tier 3: Blackboard Graph\n";
+    }
+  }
+
+  // Tier 4: ReAct Agent Reasoning & Tool Invocation
+  {
+    auto reg = std::make_shared<qorvix::agents::ToolRegistry>();
+    qorvix::agents::registerDefaultTools(*reg);
+    auto bb = std::make_shared<qorvix::agents::Blackboard>();
+    qorvix::agents::Agent agent("agent_1", qorvix::agents::createResearcherRole(), reg, bb);
+
+    int stepIdx = 0;
+    agent.setInferenceCallback([&stepIdx](const auto&, const auto&, const auto&, const auto&) {
+      ++stepIdx;
+      if (stepIdx == 1) return "Action: calculator\nAction Input: 10 + 32";
+      return "Final Answer: The calculated sum is 42.";
+    });
+
+    auto res = agent.run("Calculate 10 + 32");
+    if (res.success && res.finalAnswer == "The calculated sum is 42." && res.totalSteps == 2) {
+      std::cout << "  [PASS] Tier 4: ReAct Agent Multi-Step Reasoning & Action Loop\n";
+      ++passCount;
+    } else {
+      std::cout << "  [FAIL] Tier 4: ReAct Agent (" << res.finalAnswer << ")\n";
+    }
+  }
+
+  // Tier 5: Multi-Agent Workflow Orchestration (SoftwareDev Team)
+  {
+    qorvix::agents::WorkflowOrchestrator orch;
+    orch.setInferenceCallback([](const auto& history, const auto&, const auto&, const auto&) {
+      std::string rolePrompt = history.empty() ? "" : history[0].content;
+      if (rolePrompt.find("Strategic Planner") != std::string::npos) {
+        return "Final Answer: Plan: 1. Build 2. Verify";
+      }
+      return "Final Answer: Verified Result: Success";
+    });
+    auto wf = orch.createSoftwareDevTeam(qorvix::agents::WorkflowPattern::Sequential);
+    auto res = wf->run("Build and verify subsystem");
+    if (res.success && !res.finalAnswer.empty()) {
+      std::cout << "  [PASS] Tier 5: Multi-Agent Workflow Orchestration (SoftwareDev Team)\n";
+      ++passCount;
+    } else {
+      std::cout << "  [FAIL] Tier 5: Multi-Agent Workflow Orchestration\n";
+    }
+  }
+
+  // Tier 6: Skills System & Playbook Injection
+  {
+    qorvix::agents::SkillRegistry skillReg;
+    qorvix::agents::registerDefaultSkills(skillReg);
+    auto skills = skillReg.listSkills();
+    std::string promptSection = skillReg.composeSkillsPrompt({"code-review", "math-solver"});
+    auto tool = skillReg.createSkillTool("math-solver");
+
+    if (skills.size() >= 5 && !promptSection.empty() && tool != nullptr &&
+        promptSection.find("math-solver") != std::string::npos) {
+      std::cout << "  [PASS] Tier 6: Agent Skills System, Dynamic Playbooks & Tool Meta-Bridge ("
+                << skills.size() << " skills active)\n";
+      ++passCount;
+    } else {
+      std::cout << "  [FAIL] Tier 6: Skills System\n";
+    }
+  }
+
+  // Tier 7: Artifact Management & Revision History
+  {
+    auto store = std::make_shared<qorvix::agents::ArtifactStore>();
+    qorvix::agents::ArtifactMetadata meta;
+    meta.title = "Math Utilities";
+    meta.language = "cpp";
+    meta.author = "CoderAgent";
+
+    qorvix::agents::Artifact art("math_utils", qorvix::agents::ArtifactType::Code, "int add(int a, int b) { return a + b; }\n", meta);
+    store->createArtifact(std::move(art));
+    store->updateArtifact("math_utils", "int add(int a, int b) { return a + b; }\nint mul(int a, int b) { return a * b; }\n", "CoderAgent", "Added multiplication function");
+
+    auto retrieved = store->getArtifact("math_utils");
+    if (retrieved.has_value() && retrieved->currentVersion() == 2) {
+      auto diff = retrieved->diff(1, 2);
+      if (diff.additions > 0) {
+        std::cout << "  [PASS] Tier 7: Artifact Store, Multi-Version Snapshots & Line Diff ("
+                  << diff.additions << " additions recorded)\n";
+        ++passCount;
+      } else {
+        std::cout << "  [FAIL] Tier 7: Artifact Diff\n";
+      }
+    } else {
+      std::cout << "  [FAIL] Tier 7: Artifact Store\n";
+    }
+  }
+
+  std::cout << "\nAgent Runtime Correctness Gate: " << passCount << "/" << totalTests << " passed.\n";
+  return passCount == totalTests ? 0 : 1;
+}
+
+int cmdAgent(const std::vector<std::string_view>& args) {
+  if (args.size() <= 1) {
+    std::cout << "usage: qorvix agent <command> [options]\n\n"
+              << "Commands:\n"
+              << "  run [--workflow <seq|supervisor|blackboard|consensus>] [--goal \"...\"]\n"
+              << "  roles\n"
+              << "  tools\n"
+              << "  skills [dir]\n"
+              << "  artifacts [list|show <name>|diff <name> <v1> [v2]]\n";
+    return 1;
+  }
+
+  const std::string sub = std::string(args[1]);
+
+  if (sub == "roles") {
+    std::cout << "Available Built-in Agent Roles:\n"
+              << "  - coordinator : Oversees execution and resolves task deadlocks\n"
+              << "  - planner     : Decomposes complex goals into actionable subtasks\n"
+              << "  - researcher  : Performs knowledge retrieval and fact synthesis\n"
+              << "  - coder       : Writes, inspects, and refactors clean code\n"
+              << "  - critic      : Reviews logic, identifies flaws, and verifies output\n"
+              << "  - executor    : Operates tools and records results\n"
+              << "  - synthesizer : Consolidates contributions into unified answers\n";
+    return 0;
+  }
+
+  if (sub == "tools") {
+    qorvix::agents::ToolRegistry reg;
+    qorvix::agents::registerDefaultTools(reg);
+    std::cout << "Available Default Tools in Registry:\n";
+    for (const auto& def : reg.definitions()) {
+      std::cout << "  - " << std::left << std::setw(15) << def.name << " : " << def.description << "\n";
+    }
+    return 0;
+  }
+
+  if (sub == "skills") {
+    qorvix::agents::SkillRegistry skillReg;
+    std::string skillsDir = args.size() > 2 ? std::string(args[2]) : "skills";
+    qorvix::agents::registerDefaultSkills(skillReg, skillsDir);
+
+    std::cout << "Available Agent Skills & Playbooks:\n";
+    for (const auto& skill : skillReg.listSkills()) {
+      std::cout << "  - " << std::left << std::setw(18) << skill.name << " [v" << skill.version
+                << " | " << std::setw(8) << skill.category << "] : " << skill.description << "\n";
+      if (!skill.requiredTools.empty()) {
+        std::cout << "      Required Tools: ";
+        for (std::size_t i = 0; i < skill.requiredTools.size(); ++i) {
+          std::cout << (i > 0 ? ", " : "") << skill.requiredTools[i];
+        }
+        std::cout << "\n";
+      }
+    }
+    std::cout << "\nTotal: " << skillReg.listSkills().size() << " skills loaded.\n";
+    return 0;
+  }
+
+  if (sub == "artifacts") {
+    auto store = std::make_shared<qorvix::agents::ArtifactStore>();
+    std::string action = args.size() > 2 ? std::string(args[2]) : "list";
+
+    if (action == "list") {
+      auto list = store->listArtifacts();
+      if (list.empty()) {
+        std::cout << "No artifacts in store.\n";
+      } else {
+        std::cout << "Stored Artifacts:\n";
+        for (const auto& art : list) {
+          std::cout << "  - " << std::left << std::setw(20) << art.name() << " [v" << art.currentVersion()
+                    << " | " << qorvix::agents::artifactTypeName(art.type()) << "] : "
+                    << (art.metadata().summary.empty() ? "(no summary)" : art.metadata().summary) << "\n";
+        }
+      }
+      return 0;
+    }
+
+    if (action == "show" && args.size() > 3) {
+      std::string artName = std::string(args[3]);
+      auto artOpt = store->getArtifact(artName);
+      if (!artOpt.has_value()) {
+        std::cerr << "Artifact not found: " << artName << "\n";
+        return 1;
+      }
+      std::cout << artOpt->toMarkdown() << "\n";
+      return 0;
+    }
+
+    if (action == "diff" && args.size() > 4) {
+      std::string artName = std::string(args[3]);
+      int v1 = std::stoi(std::string(args[4]));
+      int v2 = args.size() > 5 ? std::stoi(std::string(args[5])) : -1;
+      auto artOpt = store->getArtifact(artName);
+      if (!artOpt.has_value()) {
+        std::cerr << "Artifact not found: " << artName << "\n";
+        return 1;
+      }
+      auto diff = artOpt->diff(v1, v2);
+      std::cout << diff.toString() << "\n";
+      return 0;
+    }
+
+    std::cout << "usage: qorvix agent artifacts [list|show <name>|diff <name> <v1> [v2]]\n";
+    return 0;
+  }
+
+  if (sub == "run") {
+    std::string workflowType = "sequential";
+    std::string goal = "Build a robust multi-agent pipeline";
+
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      if ((args[i] == "--workflow" || args[i] == "-w") && i + 1 < args.size()) {
+        workflowType = std::string(args[++i]);
+      } else if ((args[i] == "--goal" || args[i] == "-g" || args[i] == "--prompt" || args[i] == "-p") && i + 1 < args.size()) {
+        goal = std::string(args[++i]);
+      }
+    }
+
+    qorvix::agents::WorkflowPattern pattern = qorvix::agents::parseWorkflowPattern(workflowType);
+    qorvix::agents::WorkflowOrchestrator orch;
+
+    std::cout << "Executing Multi-Agent Workflow [" << qorvix::agents::workflowPatternName(pattern) << "]...\n"
+              << "Goal: " << goal << "\n\n";
+
+    auto wf = orch.createSoftwareDevTeam(pattern);
+    auto res = wf->run(goal, [](const qorvix::agents::WorkflowTraceItem& item) {
+      std::cout << "[" << item.stepNumber << "] Agent (" << item.agentName << " - " << item.role << ") "
+                << item.action << ":\n" << item.output << "\n\n";
+    });
+
+    if (res.success) {
+      std::cout << "========================================\n"
+                << "WORKFLOW COMPLETED SUCCESSFULLY\n"
+                << "========================================\n"
+                << res.finalAnswer << "\n";
+      if (!res.artifacts.empty()) {
+        std::cout << "\nGenerated Artifacts (" << res.artifacts.size() << "):\n";
+        for (const auto& a : res.artifacts) {
+          std::cout << "  - " << a.name() << " (v" << a.currentVersion() << ", "
+                    << qorvix::agents::artifactTypeName(a.type()) << ")\n";
+        }
+      }
+      return 0;
+    } else {
+      std::cerr << "Workflow failed: " << res.error << "\n";
+      return 1;
+    }
+  }
+
+  std::cerr << "Unknown agent subcommand: " << sub << "\n";
+  return 1;
+}
+
 namespace {
 qorvix::scheduler::RequestParams toRequestParams(const qorvix::api::SamplingRequest& s) {
   qorvix::scheduler::RequestParams rp;
@@ -3951,10 +4263,12 @@ int printUsage() {
             << "  vlm-check <file> [--mmproj <clip.gguf> --image <f.png>]   Gate the image/text\n"
             << "                      input-embedding splice (no reference capture needed)\n"
             << "  rag index <dir> --embed-model <f.gguf> --store <out.qvx>\n"
-            << "                      Chunk, embed and index documents (.txt/.md/.csv/.tsv)\n"
-            << "                      [--chunk-tokens N] [--overlap N]\n"
             << "  rag search --store <x.qvx> --embed-model <f.gguf> --query \"...\"\n"
             << "                      Hybrid dense + BM25 retrieval  [--k N] [--alpha A]\n"
+            << "  agent run [--workflow <seq|supervisor|blackboard|consensus>] [--goal \"...\"]\n"
+            << "                      Run multi-agent workflow with specialized personas\n"
+            << "  agent roles|tools   List built-in agent roles and tool definitions\n"
+            << "  agent-check         Run the Phase 11b multi-agent correctness gate\n"
             << "  plugins [dir]       Load and list architecture plugins in a directory\n"
             << "  version             Print the version\n"
             << "  help                Show this help\n";
@@ -3992,6 +4306,8 @@ int main(int argc, char** argv) {
   if (command == "vision-check") return cmdVisionCheck(args);
   if (command == "vlm-check") return cmdVlmCheck(args);
   if (command == "rag") return cmdRag(args);
+  if (command == "agent") return cmdAgent(args);
+  if (command == "agent-check") return cmdAgentCheck(args);
   if (command == "serve") return cmdServe(args);
   if (command == "gpu") return cmdGpu();
   if (command == "vulkan") return cmdVulkan();

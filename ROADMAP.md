@@ -809,7 +809,22 @@ consumed exactly.
   block-quantized kernels need a row length that is a multiple of 32 (Q8_0) or 256 (K-quants), and a
   conv row is `in_channels * 9` — 36 for the first convolution. A quantized SD file is a per-tensor
   mixture, which is a feature and not a flag.
-- **A GPU backend.** Same status as Whisper and the CLIP tower — see Phase 11c.
+### Phase 11b-4 — Multi-agent runtime (`agents/`) ✅
+
+**Native zero-dependency C++23 multi-agent orchestration and reasoning system.**
+- **Role System & Personas (`agents/include/qorvix/agents/role.hpp`):** Predefined roles (`Coordinator`, `Planner`, `Researcher`, `Coder`, `Critic`, `Executor`, `Synthesizer`, `Custom`) with tailored system prompts, sampling parameters, tool permission boundaries, and maximum reasoning step limits. Fully serializable to/from JSON.
+- **Tool System & Registry (`agents/include/qorvix/agents/tool.hpp`, `tool_registry.hpp`):** Extensible `ITool` interface and functional wrappers. Built-in `calculator` (safe recursive-descent math parser), `file_ops` (safe workspace reading/writing/listing), `blackboard` (state inspection/mutation), `rag_search` (hybrid dense + BM25 retrieval bridge), `system_info` (CPU telemetry & runtime info), and `mcp_bridge` (Anthropic Model Context Protocol bridge). Generates standard OpenAI Function Definitions and Anthropic MCP tool schemas.
+- **Shared Blackboard Memory Architecture (`agents/include/qorvix/agents/blackboard.hpp`):** Centralized, thread-safe state store for collaborative multi-agent execution. Features dynamic key-value state, task dependency graphs with `readyTasks()` topological resolution, message timelines with sender attribution, named artifact storage, live pub/sub change observers, and full JSON snapshot persistence.
+- **Agent Reasoning Engine (`agents/include/qorvix/agents/agent.hpp`):** ReAct reasoning loop (Thought -> Action -> Observation -> Final Answer) supporting XML `<tool_call>`, Markdown codeblocks, and standard OpenAI function calls. Flexible inference callback binding compatible with QorVix inference engines and mock test runners.
+- **Multi-Agent Workflow Orchestration (`agents/include/qorvix/agents/workflow.hpp`, `orchestrator.hpp`):**
+  1. *Sequential Pipeline:* Chains specialized agent outputs in order (`Planner -> Coder -> Critic -> Synthesizer`).
+  2. *Hierarchical Supervisor:* Supervisor agent creates strategic subtasks, delegates to specialist workers, and synthesizes the final response.
+  3. *Round-Robin Blackboard:* Agents autonomously claim ready tasks from the blackboard graph until the goal converges.
+  4. *Consensus Voting:* Independent proposer agents draft competing solutions; a Judge/Critic evaluates and synthesizes the optimal consensus.
+- **Agent Skills System (`agents/include/qorvix/agents/skill.hpp`, `skill_registry.hpp`, `skill_loader.hpp`, `builtin_skills.hpp`):** Composable domain playbooks, few-shot examples, parameter validation, and dynamic prompt injection. Built-in skills for `code-review`, `rag-search`, `math-solver`, `cpp-refactor`, and `git-workflow`. Dynamic discovery from disk packages (`skills/<name>/SKILL.md`) and meta-tool bridging (`skill_<name>`).
+- **Agent Artifacts System (`agents/include/qorvix/agents/artifact.hpp`, `artifact_store.hpp`, `artifact_tools.hpp`):** First-class digital object management across multi-agent workflows. Includes typed artifacts (`Code`, `Markdown`, `Document`, `Diff`, `Table`, `Json`, `Image`), multi-version immutable history snapshots (`ArtifactVersion`), unified line-by-line diff engine (`ArtifactDiff`), thread-safe `ArtifactStore` with filesystem directory synchronization, and native agent tools (`artifact_create`, `artifact_read`, `artifact_update`, `artifact_list`, `artifact_diff`).
+- **CLI & Correctness Gate:** `qorvix agent run`, `qorvix agent roles`, `qorvix agent tools`, `qorvix agent skills`, `qorvix agent artifacts`, and `qorvix agent-check` (7-tiered verification gate testing roles, tools, blackboard graphs, ReAct loops, multi-agent workflows, skills system, and artifact management).
+- **Unit Suite:** `tests/agent_test.cpp` validating all components under Catch2.
 
 ### Phase 11c — GPU embedding + vision backends ✅🖥️
 
@@ -820,8 +835,6 @@ consumed exactly.
 - **Unified Factories & Honest Reporting:** `createEmbeddingEngine` and `createClipVisionModel` in `backend.hpp` bridge GGUF weights to CUDA/Vulkan descriptors and return `nullptr` with clear error messages when the requested GPU backend is unavailable, preventing silent fallbacks.
 - **CLI Integration:** `embed-check`, `vision-check`, `vlm-check`, `image-embed`, `generate`, and `serve` accept `--gpu`/`--cuda`/`--vulkan` flags and dispatch through unified factories.
 - **Vulkan Stubs:** Factory stubs and headers prepared for Vulkan compute shader implementation.
-`agents/` is still 0 files. SPEC's agent runtime — roles, tool calls, a shared blackboard — is the
-last unstarted item of Phase 11b.
 
 ## Phase 12 — Web UI ✅🖥️
 Modern React 19 + TypeScript + Vite + Tailwind CSS dashboard (`webUI/`) with zero bloated external UI runtime dependencies:

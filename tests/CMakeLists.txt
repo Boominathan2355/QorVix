@@ -38,10 +38,11 @@ if(Catch2_FOUND)
     json_test.cpp
     multipart_test.cpp
     openai_test.cpp
+    agent_test.cpp
   )
   target_link_libraries(qorvix_tests PRIVATE
     qorvix_core qorvix_gguf qorvix_memory qorvix_cuda qorvix_runtime qorvix_tokenizer
-    qorvix_scheduler qorvix_api qorvix_embeddings qorvix_rag qorvix_vision qorvix_audio
+    qorvix_scheduler qorvix_api qorvix_embeddings qorvix_rag qorvix_agents qorvix_vision qorvix_audio
     qorvix_image
     Catch2::Catch2WithMain)
 
